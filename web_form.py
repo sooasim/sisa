@@ -45,9 +45,9 @@ HEADERS: List[str] = [
 app = Flask(__name__)
 app.secret_key = "worldsisa-form-secret"
 
-# 약관 파일 경로 (상위 폴더의 terms.html)
+# 약관 파일 경로 (프로젝트 루트의 terms.html)
 BASE_DIR = Path(__file__).resolve().parent
-TERMS_FILE = BASE_DIR.parent / "terms.html"
+TERMS_FILE = BASE_DIR / "terms.html"
 
 
 FORM_TEMPLATE = """
@@ -782,6 +782,12 @@ def last_result_api():
         except Exception:
             pass
     return jsonify(payload)
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """간단 헬스 체크 엔드포인트."""
+    return jsonify({"status": "ok"}), 200
 
 
 def _load_hq_state() -> dict:
