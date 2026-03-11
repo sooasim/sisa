@@ -11,6 +11,8 @@
         }
     </script>
     <title>SISA - Society of International Specialized Auctioneers</title>
+    <!-- SISA 브랜드 파비콘 (딥블루 배경의 둥근 지구본) -->
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%232f4b9f'/><circle cx='50' cy='50' r='28' fill='none' stroke='%23ffffff' stroke-width='6'/><ellipse cx='50' cy='50' rx='12' ry='28' fill='none' stroke='%23ffffff' stroke-width='4'/><line x1='22' y1='50' x2='78' y2='50' stroke='%23ffffff' stroke-width='4'/></svg>">
     <!-- Fonts & Icons -->
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;900&display=swap"
         rel="stylesheet">
@@ -104,13 +106,13 @@
             <!-- Central Menu -->
             <nav class="hidden md:flex bg-white/10 rounded-full p-1 border border-white/10 text-sm font-medium">
                 <a href="/" class="px-5 py-2 rounded-full bg-white/20 text-white transition">HOME</a>
-                <a href="/payment" class="px-5 py-2 rounded-full hover:bg-white/10 text-white/80 transition">GLOBAL
+                <a href="/" class="px-5 py-2 rounded-full hover:bg-white/10 text-white/80 transition">GLOBAL
                     AUCTION</a>
-                <a href="/payment"
+                <a href="/"
                     class="px-5 py-2 rounded-full hover:bg-white/10 text-white/80 transition flex items-center gap-1">
                     <i class="fa-solid fa-lock text-xs"></i> SISA VAULT
                 </a>
-                <a href="login.html" class="px-5 py-2 rounded-full hover:bg-white/10 text-white/80 transition">MY
+                <a id="auth-nav-link" href="login.html" class="px-5 py-2 rounded-full hover:bg-white/10 text-white/80 transition">MY
                     SISA</a>
             </nav>
 
@@ -149,8 +151,8 @@
                         </ul>
                     </div>
                 </div>
-                <!-- Small Login Button -->
-                <button onclick="window.location.href='login.html'"
+                <!-- Login / Logout (로그인 시 로그아웃으로 전환) -->
+                <button id="auth-btn" onclick="window.location.href='login.html'"
                     class="flex items-center gap-2 bg-white text-brand-blue px-4 py-2 rounded-lg hover:bg-brand-accent transition shadow-md text-sm font-bold">
                     <span>Login</span>
                     <i class="fa-solid fa-arrow-right-to-bracket"></i>
@@ -158,6 +160,22 @@
             </div>
         </div>
     </header>
+    <script>
+      (function(){
+        fetch('/api/auth/status', { credentials: 'same-origin' }).then(function(r){ return r.json(); }).then(function(d){
+          if (d && d.logged_in) {
+            var nav = document.getElementById('auth-nav-link');
+            var btn = document.getElementById('auth-btn');
+            if (nav) { nav.href = '/logout'; nav.textContent = '로그아웃'; }
+            if (btn) {
+              btn.onclick = function(){ window.location.href = '/logout'; };
+              var s = btn.querySelector('span'); if (s) s.textContent = '로그아웃';
+              var i = btn.querySelector('i'); if (i) i.className = 'fa-solid fa-arrow-right-from-bracket';
+            }
+          }
+        }).catch(function(){});
+      })();
+    </script>
 
     <!-- Main Content Wrapper -->
     <main class="pt-20">
@@ -314,7 +332,7 @@
                     Safe and transparent global luxury trading with SISA-certified auctioneers.
                 </p>
                 <div class="flex flex-col sm:flex-row justify-center gap-4">
-                    <button onclick="window.location.href='/payment'"
+                    <button onclick="window.location.href='/'"
                         class="px-8 py-4 bg-brand-accent text-brand-blue font-bold rounded-xl hover:bg-white transition shadow-lg shadow-white/10">Start
                         Bidding Now</button>
                     <button onclick="window.location.href='/agency-register.html'"

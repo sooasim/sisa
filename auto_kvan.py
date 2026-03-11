@@ -1,3 +1,4 @@
+import os
 import time
 import json
 from dataclasses import dataclass
@@ -8,10 +9,15 @@ from datetime import datetime
 from openpyxl import load_workbook, Workbook
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
+
+# 서버(Railway 등)에서 실행 시 헤드리스 + 자동 종료
+def _is_server_env() -> bool:
+    return bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RUN_HEADLESS"))
 
 
 SIGN_IN_URL = "https://store.k-van.app/sign-in"
@@ -201,13 +207,43 @@ def load_order_from_json(path: str) -> PaymentRow:
     )
 
 
-def create_driver(headless: bool = False) -> webdriver.Chrome:
+def _get_chromedriver_path() -> str | None:
+    """로컬 tool 폴더 또는 환경변수에 지정된 ChromeDriver 경로."""
+    env_path = os.environ.get("CHROMEDRIVER_PATH", "").strip()
+    if env_path and Path(env_path).exists():
+        return env_path
+    base = Path(__file__).resolve().parent / "tool"
+    for name in ("chromedriver.exe", "chromedriver"):
+        p = base / name
+        if p.exists():
+            return str(p)
+    return None
+
+
+def create_driver(headless: bool | None = None) -> webdriver.Chrome:
+    if headless is None:
+        headless = _is_server_env()
     options = webdriver.ChromeOptions()
     if headless:
         options.add_argument("--headless=new")
-    options.add_argument("--start-maximized")
-
-    driver = webdriver.Chrome(options=options)
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-setuid-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
+    else:
+        options.add_argument("--start-maximized")
+    # Railway 등 서버: 시스템에 설치된 Chrome 사용
+    if _is_server_env():
+        for binary in ("/usr/bin/google-chrome-stable", "/usr/bin/google-chrome", "/usr/bin/chromium"):
+            if Path(binary).exists():
+                options.binary_location = binary
+                break
+    service = None
+    driver_path = _get_chromedriver_path()
+    if driver_path:
+        service = Service(executable_path=driver_path)
+    driver = webdriver.Chrome(service=service, options=options) if service else webdriver.Chrome(options=options)
     driver.implicitly_wait(5)
     return driver
 
@@ -717,7 +753,7 @@ def main() -> None:
         print(f"입력 데이터 오류: {e}")
         return
 
-    driver = create_driver(headless=False)
+    driver = create_driver()
     try:
         print("K-VAN 가맹점 페이지에 로그인 중...")
         sign_in(driver, row)
@@ -787,7 +823,8 @@ def main() -> None:
                     except OSError:
                         pass
         print(f"결과가 {RESULT_EXCEL_PATH} 파일에 기록되었습니다.")
-        input("브라우저를 확인한 뒤, 종료하려면 Enter 키를 누르세요...")
+        if not _is_server_env():
+            input("브라우저를 확인한 뒤, 종료하려면 Enter 키를 누르세요...")
     finally:
         driver.quit()
 

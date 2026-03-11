@@ -1,0 +1,22 @@
+# 한국 호스팅에 업로드할 파일 목록
+# (venv, .git, __pycache__ 폴더는 제외하고 아래 파일만 업로드하세요)
+
+web_form.py
+auto_kvan.py
+requirements.txt
+Dockerfile
+.dockerignore
+index.html
+login.html
+terms.html
+agency-register.html
+run_linux.sh
+install_chrome_ubuntu.sh
+DEPLOY_KR.md
+업로드_파일_목록.txt
+
+# 아래는 없어도 됨 (실행 시 생성됨). 초기값이 필요하면 프로젝트에서 복사
+# admin_state.json
+# hq_state.json
+# current_order.json
+# last_result.json

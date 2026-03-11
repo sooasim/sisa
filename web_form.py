@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import List
 from pathlib import Path
 from datetime import datetime
@@ -84,6 +85,48 @@ app.secret_key = "worldsisa-form-secret"
 BASE_DIR = Path(__file__).resolve().parent
 TERMS_FILE = BASE_DIR / "terms.html"
 
+# 차단할 IP (공인 IP만). 환경변수 BLOCKED_IPS 로 지정 (쉼표 구분). 100.64.x.x 같은 CGN 대역은 넣지 말 것.
+_BLOCKED_IPS: set[str] = set()
+_env_blocked = os.environ.get("BLOCKED_IPS", "").strip()
+if _env_blocked:
+    _BLOCKED_IPS.update(ip.strip() for ip in _env_blocked.split(",") if ip.strip())
+
+# 봇/스캐너가 찾는 경로 → 최소 응답으로 즉시 404 ("찾는 정보 없음", 트래픽 절약)
+_SCAN_PATH_PREFIXES = (
+    "/.env", "/.git", "/wp-", "/phpinfo", "/info.php", "/admin/.env",
+    "/debugbar", "/_debugbar", "/aws-config", "/aws.config", "/backend/.env",
+    "/xmlrpc", "/.aws",
+)
+
+
+@app.before_request
+def block_bad_ips():
+    """차단 목록에 있는 공인 IP만 403 반환."""
+    if not _BLOCKED_IPS:
+        return None
+    client_ip = request.remote_addr or ""
+    if request.headers.get("X-Forwarded-For"):
+        client_ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+    if client_ip in _BLOCKED_IPS:
+        return "Forbidden", 403
+    return None
+
+
+@app.before_request
+def reject_scan_paths():
+    """스캔/봇이 찾는 경로는 짧은 404로 즉시 반환 (트래픽 절약)."""
+    path = (request.path or "").strip().lower()
+    if not path or path == "/":
+        return None
+    if path in ("/robots.txt", "/favicon.ico", "/favicon.png", "/health"):
+        return None
+    for prefix in _SCAN_PATH_PREFIXES:
+        if path.startswith(prefix):
+            return "Not Found", 404
+    if ".php" in path or path.startswith("/.env") or "/.git" in path:
+        return "Not Found", 404
+    return None
+
 
 @app.route("/login.html", methods=["GET"])
 @app.route("/login", methods=["GET"])
@@ -139,6 +182,25 @@ def portal_login():
     </body>
     </html>
     """
+
+
+@app.route("/api/auth/status", methods=["GET"])
+def auth_status():
+    """로그인 여부 반환 (헤더에서 Login/로그아웃 전환용)."""
+    if session.get("hq_logged_in"):
+        return jsonify({"logged_in": True, "type": "hq"})
+    if session.get("agency_id"):
+        return jsonify({"logged_in": True, "type": "agency"})
+    return jsonify({"logged_in": False, "type": None})
+
+
+@app.route("/logout", methods=["GET", "POST"])
+def logout():
+    """세션 초기화 후 홈으로 리다이렉트."""
+    session.pop("hq_logged_in", None)
+    session.pop("agency_id", None)
+    session.pop("agency_name", None)
+    return redirect(url_for("home"))
 
 
 FORM_TEMPLATE = """
@@ -731,6 +793,28 @@ def home():
     return "<h1>World SISA</h1>", 200
 
 
+@app.route("/favicon.ico", methods=["GET"])
+@app.route("/favicon.png", methods=["GET"])
+@app.route("/favicon.svg", methods=["GET"])
+def favicon():
+    """SISA 브랜드 파비콘 (SVG) 반환."""
+    svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'>"
+        "<rect width='100' height='100' rx='22' fill='%232f4b9f'/>"
+        "<circle cx='50' cy='50' r='28' fill='none' stroke='%23ffffff' stroke-width='6'/>"
+        "<ellipse cx='50' cy='50' rx='12' ry='28' fill='none' stroke='%23ffffff' stroke-width='4'/>"
+        "<line x1='22' y1='50' x2='78' y2='50' stroke='%23ffffff' stroke-width='4'/></svg>"
+    )
+    return svg, 200, {"Content-Type": "image/svg+xml; charset=utf-8"}
+
+
+@app.route("/robots.txt", methods=["GET"])
+def robots_txt():
+    """검색엔진·봇용 robots.txt (불필요한 크롤링 완화)."""
+    body = "User-agent: *\nDisallow: /admin\nDisallow: /hq-admin\nDisallow: /agency-admin\nDisallow: /pay/\nAllow: /\n"
+    return body, 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
 @app.route("/payment", methods=["GET", "POST"])
 def payment():
     defaults = {
@@ -910,9 +994,49 @@ def pay(session_id: str):
     )
 
 
+def _is_same_origin_referer() -> bool:
+    """Referer가 우리 사이트에서 온 경우만 True (외부 봇/직접 접근 차단)."""
+    ref = (request.headers.get("Referer") or "").strip()
+    if not ref:
+        return True  # Referer 없으면 허용 (일부 브라우저/환경에서 생략)
+    try:
+        from urllib.parse import urlparse
+        ref_host = urlparse(ref).netloc.split(":")[0].lower()
+        req_host = (request.host or "").split(":")[0].lower()
+        if not req_host:
+            return True
+        return ref_host == req_host or ref_host.endswith("." + req_host) or req_host.endswith("." + ref_host)
+    except Exception:
+        return True
+
+
+# /last-result 호출 횟수 제한 (IP당 분당 60회 = 2초 폴링 여유)
+_last_result_requests: dict[str, list[float]] = {}
+_LAST_RESULT_LIMIT = 60
+_LAST_RESULT_WINDOW = 60.0  # 초
+
+
 @app.route("/last-result", methods=["GET"])
 def last_result_api():
-    """자동 결제 결과를 JSON 으로 반환 (폼에서 폴링용)."""
+    """자동 결제 결과를 JSON 으로 반환 (폼에서 폴링용). 우리 사이트에서 온 요청만 허용."""
+    same_origin = _is_same_origin_referer()
+    if not same_origin:
+        return "Forbidden", 403
+    # Referer 없이 직접 반복 호출하는 경우만 IP당 분당 60회 제한 (봇/스캔 완화)
+    ref = (request.headers.get("Referer") or "").strip()
+    if not ref and _LAST_RESULT_LIMIT > 0:
+        now = time.time()
+        client_ip = request.remote_addr or ""
+        if request.headers.get("X-Forwarded-For"):
+            client_ip = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        if client_ip:
+            if client_ip not in _last_result_requests:
+                _last_result_requests[client_ip] = []
+            times = _last_result_requests[client_ip]
+            times[:] = [t for t in times if now - t < _LAST_RESULT_WINDOW]
+            if len(times) >= _LAST_RESULT_LIMIT:
+                return "Too Many Requests", 429
+            times.append(now)
     payload = {"status": "unknown", "message": ""}
     session_id = request.args.get("session_id", "").strip()
     if session_id:
@@ -1589,25 +1713,39 @@ def agency_login():
         }
       </script>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+      <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
       <script src="https://cdn.tailwindcss.com"></script>
+      <script>
+        tailwind.config = {
+          theme: {
+            extend: {
+              fontFamily: { sans: ['Inter', 'sans-serif'] },
+              colors: {
+                brand: { blue: '#2f4b9f', dark: '#1e326b', accent: '#e6edf7' }
+              }
+            }
+          }
+        }
+      </script>
+      <style>body { background-color: #2f4b9f; }</style>
     </head>
-    <body class="bg-brand-blue text-white font-[Inter] min-h-screen flex items-center justify-center">
-      <div class="bg-white/10 border border-white/20 rounded-2xl px-8 py-10 max-w-sm w-full shadow-2xl">
-        <h1 class="text-xl font-bold mb-2 text-center">SISA Agency Admin</h1>
-        <p class="text-xs text-white/70 text-center mb-6">승인된 대행사 전용 어드민 로그인</p>
+    <body class="bg-brand-blue text-white font-sans antialiased min-h-screen flex items-center justify-center">
+      <div class="bg-white/10 backdrop-blur border border-white/20 rounded-2xl px-8 py-10 max-w-sm w-full shadow-2xl">
+        <h1 class="text-xl font-bold mb-2 text-center text-white">SISA Agency Admin</h1>
+        <p class="text-xs text-white/80 text-center mb-6">승인된 대행사 전용 어드민 로그인</p>
         <form method="post" class="space-y-4">
           <div>
-            <label class="block text-xs font-semibold text-white/70 mb-1">대행사 아이디</label>
+            <label class="block text-xs font-semibold text-white/80 mb-1">대행사 아이디</label>
             <input name="username" type="text" required class="w-full bg-black/20 border border-white/20 rounded-lg py-2.5 px-3 text-sm text-white placeholder-white/40 focus:outline-none focus:border-blue-300" placeholder="agency id" />
           </div>
           <div>
-            <label class="block text-xs font-semibold text-white/70 mb-1">비밀번호</label>
+            <label class="block text-xs font-semibold text-white/80 mb-1">비밀번호</label>
             <input name="password" type="password" required class="w-full bg-black/20 border border-white/20 rounded-lg py-2.5 px-3 text-sm text-white placeholder-white/40 focus:outline-none focus:border-blue-300" placeholder="********" />
           </div>
           {% if error %}
           <p class="text-xs text-red-200">{{ error }}</p>
           {% endif %}
-          <button type="submit" class="w-full mt-2 bg-white text-brand-blue font-bold py-2.5 rounded-lg hover:bg-brand-accent transition">
+          <button type="submit" class="w-full mt-2 bg-white text-brand-blue font-bold py-2.5 rounded-lg hover:opacity-90 transition" style="color: #2f4b9f;">
             로그인
           </button>
         </form>
@@ -1730,11 +1868,16 @@ def hq_admin():
               <span class="text-xs text-white/80">Global Agency & Settlement Admin</span>
             </div>
           </div>
-          <div class="text-[11px] text-white/70">
-            대행사 신청 URL:
-            <span class="font-mono bg-white/10 px-2 py-1 rounded-full border border-white/20">
-              https://worldsisa.com/agency-register.html
-            </span>
+          <div class="flex items-center gap-3 flex-wrap">
+            <div class="text-[11px] text-white/70">
+              대행사 신청 URL:
+              <span class="font-mono bg-white/10 px-2 py-1 rounded-full border border-white/20">
+                https://worldsisa.com/agency-register.html
+              </span>
+            </div>
+            <a href="{{ url_for('logout') }}" class="px-3 py-1.5 rounded-lg bg-white/10 border border-white/20 text-white text-sm font-medium hover:bg-white/20 transition">
+              로그아웃
+            </a>
           </div>
         </div>
       </header>
@@ -2030,7 +2173,7 @@ def agency_admin():
         session.pop("agency_id", None)
         return redirect(url_for("agency_login"))
 
-    # 세션/히스토리는 admin_state.json 에서 agency_id 기준으로 필터
+    # 세션/히스토리는 admin_state.json 에서 agency_id 기준으로만 필터 (비어있으면 표시 안 함)
     sessions: list[dict] = []
     history: list[dict] = []
     if Path(ADMIN_STATE_PATH).exists():
@@ -2039,8 +2182,9 @@ def agency_admin():
                 saved = json.load(f)
             all_sessions = saved.get("sessions") or []
             all_history = saved.get("history") or []
-            sessions = [s for s in all_sessions if str(s.get("agency_id")) == str(agency_id)]
-            history = [h for h in all_history if str(h.get("agency_id")) == str(agency_id)]
+            aid = (agency_id or "").strip()
+            sessions = [s for s in all_sessions if aid and str(s.get("agency_id") or "").strip() == aid]
+            history = [h for h in all_history if aid and str(h.get("agency_id") or "").strip() == aid]
         except Exception:
             sessions, history = [], []
 
@@ -2112,7 +2256,24 @@ def agency_admin():
         }, 300000);
       </script>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+      <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
       <script src="https://cdn.tailwindcss.com"></script>
+      <script>
+        tailwind.config = {
+          theme: {
+            extend: {
+              fontFamily: { sans: ['Inter', 'sans-serif'] },
+              colors: {
+                brand: { blue: '#2f4b9f', dark: '#1e326b', accent: '#e6edf7' }
+              }
+            }
+          }
+        }
+      </script>
+      <style>
+        body { background-color: #2f4b9f; }
+        .glass-card { background: rgba(30, 50, 107, 0.6); backdrop-filter: blur(12px); }
+      </style>
     </head>
     <body class="bg-brand-blue text-white font-sans overflow-x-hidden antialiased min-h-screen flex flex-col">
       <header class="fixed top-0 left-0 right-0 z-30 bg-brand-dark/80 backdrop-blur border-b border-white/10">
@@ -2124,11 +2285,16 @@ def agency_admin():
               <span class="text-[11px] text-white/60">SISA 대행사 결제 어드민</span>
             </div>
           </div>
-          <div class="text-[11px] text-white/70">
-            결제요청 링크 예시:
-            <span class="font-mono bg-white/10 px-2 py-1 rounded-full border border-white/20">
-              {{ base_url }}/pay/&lt;SESSION_ID&gt;
-            </span>
+          <div class="flex items-center gap-3 flex-wrap">
+            <div class="text-[11px] text-white/70">
+              결제요청 링크 예시:
+              <span class="font-mono bg-white/10 px-2 py-1 rounded-full border border-white/20">
+                {{ base_url }}/pay/&lt;SESSION_ID&gt;
+              </span>
+            </div>
+            <a href="{{ url_for('logout') }}" class="px-3 py-1.5 rounded-lg bg-white/10 border border-white/20 text-white text-sm font-medium hover:bg-white/20 transition">
+              로그아웃
+            </a>
           </div>
         </div>
       </header>
