@@ -553,12 +553,21 @@ FORM_TEMPLATE = """
             {% set _is_success = (_status == 'success') %}
             <div class="result-backdrop" id="result-modal">
               <div class="result-card">
-                <div class="result-icon {{ 'success' if _is_success else 'fail' }}">
-                  {% if _is_success %}✓{% else %}!{% endif %}
-                </div>
-                <div class="result-badge {{ 'success' if _is_success else 'fail' }}">
-                  {% if _is_success %}결제 성공{% else %}결제 실패{% endif %}
-                </div>
+                {% if _is_success %}
+                  <div class="result-icon success">
+                    ✓
+                  </div>
+                  <div class="result-badge success">
+                    결제 성공
+                  </div>
+                {% else %}
+                  <div class="result-icon fail">
+                    !
+                  </div>
+                  <div class="result-badge fail">
+                    결제 실패
+                  </div>
+                {% endif %}
                 <div class="result-title">
                   {% if _is_success %}결제가 완료되었습니다.{% else %}결제가 실패했습니다.{% endif %}
                 </div>
