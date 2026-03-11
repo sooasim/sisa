@@ -2429,7 +2429,7 @@ def hq_admin():
                         data-agency-id="{{ t.agency_id or '' }}"
                         data-amount="{{ amount }}"
                         data-fee-percent="{{ ag_fee }}"
-                        data-date="{{ (t.created_at.strftime('%Y-%m-%d') if t.created_at) else '' }}"
+                        data-date="{{ t.created_at.strftime('%Y-%m-%d') if t.created_at else '' }}"
                         data-status="{{ t.status or '' }}">
                       <td class="px-3 py-2 text-center">
                         <input type="checkbox" class="tx-check" name="tx_ids" value="{{ t.id }}" onclick="updateSelectionSummary()">
@@ -3232,7 +3232,7 @@ def agency_admin():
                   {% for t in agency_transactions|sort(attribute="created_at", reverse=True) %}
                   {% set amount = t.amount or 0 %}
                   <tr class="bg-black/20 hover:bg-black/30 transition align-top"
-                      data-date="{{ (t.created_at.strftime('%Y-%m-%d') if t.created_at) else '' }}"
+                      data-date="{{ t.created_at.strftime('%Y-%m-%d') if t.created_at else '' }}"
                       data-status="{{ t.status or '' }}">
                     <td class="px-3 py-2 whitespace-nowrap">{{ t.created_at }}</td>
                     <td class="px-3 py-2 text-right">{{ amount }} 원</td>

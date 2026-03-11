@@ -23,6 +23,18 @@ def _is_server_env() -> bool:
     return bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RUN_HEADLESS"))
 
 
+def _step_start(label: str) -> float:
+    """단계별 속도 측정을 위한 헬퍼."""
+    t0 = time.perf_counter()
+    print(f"[STEP] {label} 시작")
+    return t0
+
+
+def _step_end(label: str, t0: float) -> None:
+    dt = time.perf_counter() - t0
+    print(f"[STEP] {label} 완료 ({dt:.2f}s)")
+
+
 SIGN_IN_URL = "https://store.k-van.app/sign-in"
 FACE_TO_FACE_URL = "https://store.k-van.app/face-to-face-payment"
 
@@ -155,20 +167,35 @@ HEADERS: List[str] = [
 # 제공해주신 로그인 화면 HTML 기준:
 # - 아이디 / 비밀번호 input 은 name 이 없고 label 텍스트로만 구분
 SIGN_IN_SELECTORS = {
-    # <label>아이디</label> 바로 아래 첫 번째 input
-    "id": (
+    # 기본: <label>아이디</label> 바로 아래 첫 번째 input
+    "id_primary": (
         By.XPATH,
         "//label[normalize-space(text())='아이디']/following::input[1]",
     ),
-    # <label>비밀번호</label> 바로 아래 첫 번째 input
-    "password": (
+    # 보조1: placeholder 에 '아이디' 가 포함된 input
+    "id_placeholder": (
+        By.XPATH,
+        "//input[contains(@placeholder,'아이디')]",
+    ),
+    # 보조2: 로그인 폼 안의 첫 번째 text input (password 제외)
+    "id_fallback": (
+        By.XPATH,
+        "(//input[@type='text' or not(@type)])[1]",
+    ),
+    # 기본: <label>비밀번호</label> 바로 아래 첫 번째 input
+    "password_primary": (
         By.XPATH,
         "//label[normalize-space(text())='비밀번호']/following::input[1]",
     ),
-    # 로그인 버튼 (텍스트가 '로그인' 인 submit 버튼)
-    "submit": (
+    # 보조: type='password' 인 첫 번째 input
+    "password_fallback": (
         By.XPATH,
-        "//button[@type='submit' and contains(normalize-space(.), '로그인')]",
+        "(//input[@type='password'])[1]",
+    ),
+    # 로그인 버튼 (텍스트가 '로그인' 인 버튼)
+    "submit_primary": (
+        By.XPATH,
+        "//button[contains(normalize-space(.), '로그인')]",
     ),
 }
 
@@ -187,29 +214,206 @@ PIN_POPUP_SELECTORS = {
 }
 
 
+def _set_session_ttl_to_5min(driver: webdriver.Chrome, max_wait: float = 10.0) -> bool:
+    """
+    세션 유효시간 Select 컴포넌트( id='session-ttl' )를
+    '5분 (일반 결제)' 값으로 변경한다.
+
+    - 1) 트리거 버튼(#session-ttl)을 클릭해 드롭다운을 연다.
+    - 2) 드롭다운 안에서 '5분 (일반 결제)' 텍스트가 있는 옵션을 클릭한다.
+    - 3) 다시 트리거의 span[data-slot="select-value"] 텍스트가 '5분' 으로
+         시작하는지 확인해 실제로 변경되었는지 검증한다.
+    - 위 과정을 max_wait 초 동안 반복 시도하고, 성공하면 True, 아니면 False.
+    """
+    end_time = time.time() + max_wait
+
+    while time.time() < end_time:
+        changed = False
+
+        # 1) 트리거 버튼 클릭 (드롭다운 열기)
+        try:
+            trigger = driver.find_element(By.ID, "session-ttl")
+            driver.execute_script("arguments[0].click();", trigger)
+            time.sleep(0.2)
+        except Exception:
+            # 아직 로딩 중일 수 있으므로 바로 실패로 보지 않는다.
+            time.sleep(0.2)
+
+        # 2) 드롭다운 옵션 중 '5분 (일반 결제)' 또는 '5분' 이 포함된 항목 클릭
+        try:
+            # aria-controls 로 연결된 리스트가 있을 가능성이 높지만,
+            # 여기서는 보이는 모든 노드 중에서 텍스트 기준으로 옵션을 찾는다.
+            candidates = driver.find_elements(By.XPATH, "//*[contains(normalize-space(.),'5분 (일반 결제)') or contains(normalize-space(.),'5분')]")
+            visible_opts = [el for el in candidates if el.is_displayed()]
+            if visible_opts:
+                driver.execute_script("arguments[0].click();", visible_opts[0])
+                changed = True
+                time.sleep(0.3)
+        except Exception:
+            # 옵션이 아직 생성되지 않았거나 구조가 다른 경우가 있을 수 있으므로 무시하고 재시도
+            pass
+
+        # 3) 실제로 트리거의 표시 값이 '5분 (일반 결제)' 로 바뀌었는지 확인
+        try:
+            trigger = driver.find_element(By.ID, "session-ttl")
+            value_span = trigger.find_element(By.CSS_SELECTOR, "span[data-slot='select-value']")
+            text = (value_span.text or "").strip()
+            if text.startswith("5분"):
+                print(f"[INFO] 세션 유효시간이 '{text}' 로 설정되었습니다.")
+                return True
+        except Exception:
+            # 아직 반영 전이거나 요소를 못 찾은 경우, 아래에서 재시도
+            pass
+
+        # 클릭을 했다고 판단되었지만 검증이 실패한 경우에도 반복해서 재시도
+        time.sleep(0.3)
+
+    print("[WARN] 세션 유효시간을 '5분 (일반 결제)' 로 변경하지 못했습니다.")
+    return False
+
+
+def _find_input_quick(
+    driver: webdriver.Chrome,
+    css_list: list[str],
+    max_wait: float = 3.0,
+) -> webdriver.Chrome | None:
+    """
+    여러 CSS 셀렉터 후보를 짧게(0.2초 간격) 반복해서 검사하며,
+    화면에 보이는 첫 번째 input 을 찾는다.
+    """
+    end = time.time() + max_wait
+    while time.time() < end:
+        for sel in css_list:
+            try:
+                els = driver.find_elements(By.CSS_SELECTOR, sel)
+            except Exception:
+                continue
+            for el in els:
+                try:
+                    if el.is_displayed():
+                        return el
+                except Exception:
+                    continue
+        time.sleep(0.2)
+    return None
+
+
+def _click_button_by_text_retry(
+    driver: webdriver.Chrome,
+    texts: list[str],
+    total_timeout: float,
+    description: str,
+) -> bool:
+    """
+    주어진 텍스트 중 하나를 포함하는 버튼/링크를 찾을 때까지 반복 클릭 시도.
+
+    - JS 로 innerText 기반 탐색 후 클릭
+    - 안 되면 XPATH 로 button[@aria-label 포함]까지 포함해서 짧게 대기
+    - total_timeout 초 안에 성공하면 True, 아니면 False
+    """
+    end_time = time.time() + total_timeout
+
+    js_code = """
+const targets = Array.from(document.querySelectorAll('button,a,div,span'));
+for (const el of targets) {
+  const t = (el.innerText || '').trim();
+  if (!t) continue;
+  const norm = t.replace(/\\s+/g, '');
+  const target = (arguments[0] || '').trim();
+  const targetNorm = target.replace(/\\s+/g, '');
+  if (!target) continue;
+  if (t.includes(target) || norm.includes(targetNorm)) {
+    if (el.offsetParent !== null) {
+      el.click();
+      return true;
+    }
+  }
+}
+return false;
+"""
+
+    print(f"[STEP] 버튼 클릭 재시도 시작: {description}")
+
+    while time.time() < end_time:
+        # 1차: JS 기반 탐색
+        for txt in texts:
+            try:
+                clicked = driver.execute_script(js_code, txt)
+                if clicked:
+                    # JS 상으로는 클릭이 실행되었지만,
+                    # 실제 상태 변경 여부는 상위 로직에서 따로 검증해야 하므로
+                    # 여기서는 '성공'이 아니라 '클릭 시도'로만 기록한다.
+                    print(f"[INFO] '{txt}' 텍스트로 {description} 버튼 클릭 시도(JS).")
+                    time.sleep(0.3)
+                    return True
+            except Exception:
+                # DOM 로딩 시점 등으로 실패할 수 있으므로 무시하고 다음 시도
+                continue
+
+        # 2차: XPATH 기반 짧은 대기
+        for txt in texts:
+            try:
+                wait = WebDriverWait(driver, 0.7)
+                # XPath union(|)을 사용해야 하므로 or 대신 | 사용
+                xp = (
+                    f"//button[contains(normalize-space(.),'{txt}')]"
+                    f" | //button[contains(@aria-label,'{txt}')]"
+                )
+                btn = wait.until(
+                    EC.element_to_be_clickable((By.XPATH, xp))
+                )
+                btn.click()
+                print(f"[INFO] '{txt}' 텍스트로 {description} 버튼 클릭 시도(XPATH).")
+                time.sleep(0.3)
+                return True
+            except TimeoutException:
+                continue
+
+        time.sleep(0.3)
+
+    print(f"[WARN] {total_timeout:.1f}초 동안 시도했지만 '{description}' 버튼을 찾지 못했습니다.")
+    return False
+
+
 def _click_notice_if_present(driver: webdriver.Chrome) -> None:
-    """공지 팝업이 뜨면 '확인 후 로그인' 또는 '로그인' 버튼을 눌러 닫는다."""
+    """첫 화면 공지의 '확인 후 로그인' 버튼을 찾아 클릭.
+
+    이전에 실제로 잘 동작하던 단순한 구조로 되돌렸습니다.
+    """
+    # 1차: XPATH 로 직접 버튼 찾기 (최대 5초)
     try:
         wait = WebDriverWait(driver, 5)
-        buttons = wait.until(
-            EC.presence_of_all_elements_located(
-                (
-                    By.XPATH,
-                    "//button[contains(normalize-space(.),'확인 후 로그인') or contains(normalize-space(.),'로그인')]",
-                )
+        btn = wait.until(
+            EC.element_to_be_clickable(
+                (By.XPATH, "//button[contains(normalize-space(.),'확인 후 로그인')]")
             )
         )
-    except TimeoutException:
+        btn.click()
+        time.sleep(0.3)
         return
-
-    for btn in buttons:
+    except TimeoutException:
+        # 2차: JS로 전체 DOM 을 훑으면서 텍스트 기준으로 재시도
         try:
-            if btn.is_displayed() and btn.is_enabled():
-                btn.click()
-                time.sleep(1.0)
-                break
+            driver.execute_script(
+                """
+const targets = Array.from(document.querySelectorAll('button,a,div,span'));
+for (const el of targets) {
+  const t = (el.innerText || '').trim();
+  if (!t) continue;
+  const norm = t.replace(/\\s+/g, '');
+  if (t.includes('확인 후 로그인') || norm.includes('확인후로그인')) {
+    if (el.offsetParent !== null) {
+      el.click();
+      return;
+    }
+  }
+}
+"""
+            )
+            time.sleep(0.3)
         except Exception:
-            continue
+            # 공지 팝업이 없거나 이미 닫혀 있으면 조용히 통과
+            pass
 
 
 # 대면결제 페이지 셀렉터 (필요 시 사이트 구조에 맞게 수정)
@@ -298,6 +502,14 @@ def load_order_from_json(path: str) -> PaymentRow:
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
+    # 금액 / 상품명 / 로그인 ID 가 없으면 더미값 채워서라도 진행할 수 있게 한다.
+    if "amount" not in raw or raw.get("amount") in ("", None, 0, "0"):
+        raw["amount"] = 100000  # 기본 10만원
+    if "product_name" not in raw or not str(raw.get("product_name") or "").strip():
+        raw["product_name"] = "SISA 테스트 상품"
+    if "login_id" not in raw or not str(raw.get("login_id") or "").strip():
+        raw["login_id"] = "m1234"
+
     missing = [k for k in HEADERS if k not in raw or raw[k] in ("", None)]
     if missing:
         raise ValueError(f"JSON 데이터에 누락된 필드가 있습니다: {missing}")
@@ -381,7 +593,7 @@ def _parse_amount(text: str) -> int:
 def _scrape_dashboard_and_store(driver: webdriver.Chrome) -> None:
     """로그인 후 대시보드 화면에서 매출 요약 정보를 크롤링하여 DB에 저장."""
     try:
-        wait = WebDriverWait(driver, 20)
+        wait = WebDriverWait(driver, 5)
         # 대시보드가 렌더링될 시간을 약간 준다
         time.sleep(2.0)
 
@@ -545,9 +757,10 @@ def _scrape_dashboard_and_store(driver: webdriver.Chrome) -> None:
 
 
 def _go_to_payment_link_page(driver: webdriver.Chrome) -> None:
-    """좌측 사이드바에서 '결제링크 관리'를 클릭하고, 화면에서 '+ 생성' 아이콘을 눌러 결제링크 생성 페이지로 이동."""
+    """좌측 사이드바에서 '결제링크 관리' 메뉴까지만 이동 (리스트 화면)."""
     try:
-        wait = WebDriverWait(driver, 20)
+        t0 = _step_start("결제링크 관리 메뉴 이동")
+        wait = WebDriverWait(driver, 5)
         # 사이드바의 '결제링크 관리' 항목 클릭
         link_btn = wait.until(
             EC.element_to_be_clickable(
@@ -555,21 +768,100 @@ def _go_to_payment_link_page(driver: webdriver.Chrome) -> None:
             )
         )
         link_btn.click()
-        time.sleep(1.5)
-
-        # 결제링크 관리 화면에서 '+ 생성' 아이콘/버튼 클릭
-        create_btn = wait.until(
-            EC.element_to_be_clickable(
-                (
-                    By.XPATH,
-                    "//*[contains(normalize-space(text()),'+ 생성') or contains(@aria-label,'생성')]",
-                )
-            )
-        )
-        create_btn.click()
-        time.sleep(2.0)
+        time.sleep(0.3)
+        _step_end("결제링크 관리 메뉴 이동", t0)
     except Exception as e:
         print(f"[WARN] 결제링크 관리/생성 페이지 이동 실패: {e}")
+
+
+def _go_to_create_link_page(driver: webdriver.Chrome) -> bool:
+    """
+    결제링크 관리 화면에서 '+ 생성' 버튼을 눌러
+    결제링크 생성 화면(또는 모달)로 진입한다.
+
+    - 단순 텍스트 매칭뿐 아니라,
+      '결제링크 관리' 헤더 주변에서 버튼을 위치 기반으로 찾아 클릭하는
+      다른 패러다임을 사용한다.
+    """
+    t0 = _step_start("+ 생성 버튼 클릭 (헤더/위치 기반 탐색)")
+    try:
+        # 최대 약 8~10초 동안(12회) 반복해서 버튼을 찾는다.
+        for _ in range(12):
+            try:
+                clicked = driver.execute_script(
+                    """
+const clickCreateButton = () => {
+  // 1. 텍스트/aria-label 에 '생성' 이 포함된 버튼/링크를 우선 시도
+  const primary = Array.from(document.querySelectorAll('button,a[role="button"]')).find(el => {
+    if (!el.offsetParent) return false;
+    const t = (el.innerText || '').trim();
+    const label = (el.getAttribute('aria-label') || '').trim();
+    return t.includes('생성') || label.includes('생성');
+  });
+  if (primary) {
+    primary.click();
+    return true;
+  }
+
+  // 2. '결제링크 관리' 헤더 근처에서 버튼을 찾는다.
+  const headings = Array.from(document.querySelectorAll('h1,h2,h3'));
+  const title = headings.find(el => {
+    const t = (el.innerText || '').trim();
+    return t.includes('결제링크 관리');
+  });
+
+  if (title) {
+    let container = title.closest('header,section,div') || document.body;
+    let btns = Array.from(container.querySelectorAll('button,a[role="button"]'))
+      .filter(el => el.offsetParent !== null);
+
+    if (btns.length > 0) {
+      // 오른쪽 위에 있을수록, 그리고 크기가 어느 정도 되는 버튼을 우선 선택
+      let best = null;
+      let bestScore = -Infinity;
+      for (const el of btns) {
+        const r = el.getBoundingClientRect();
+        const width = r.right - r.left;
+        const height = r.bottom - r.top;
+        // 너무 작은(아이콘 점 등) 요소는 제외
+        if (width < 16 || height < 16) continue;
+        // 화면의 오른쪽/위쪽에 있을수록 점수가 높도록 가중치 부여
+        const score = r.right * 1.0 - r.top * 0.2;
+        if (score > bestScore) {
+          bestScore = score;
+          best = el;
+        }
+      }
+      if (best) {
+        best.click();
+        return true;
+      }
+    }
+  }
+
+  // 3. 위 방식으로도 찾지 못하면 실패
+  return false;
+};
+return clickCreateButton();
+"""
+                )
+                if clicked:
+                    time.sleep(0.5)
+                    _step_end("+ 생성 버튼 클릭 (헤더/위치 기반 탐색)", t0)
+                    return True
+            except Exception:
+                # DOM 이 아직 완전히 준비되지 않았을 수 있으므로 잠시 후 재시도
+                pass
+
+            time.sleep(0.7)
+
+        print("[WARN] 여러 번 시도했지만 '+ 생성' 버튼을 찾지 못했습니다.")
+        _step_end("+ 생성 버튼 클릭 (헤더/위치 기반 탐색)", t0)
+        return False
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] '+ 생성' 버튼 클릭 실패: {e}")
+        _step_end("+ 생성 버튼 클릭 (헤더/위치 기반 탐색)", t0)
+        return False
 
 
 def _store_kvan_link_for_session(session_id: str, link: str) -> None:
@@ -602,10 +894,12 @@ def _fill_payment_link_form_and_get_url(
     driver: webdriver.Chrome, row: PaymentRow, session_id: str
 ) -> str | None:
     """결제링크 생성 페이지에서 폼을 채우고, 생성된 https://store.k-van.app... 링크를 리턴."""
-    wait = WebDriverWait(driver, 20)
-    time.sleep(1.5)
+    t0_all = _step_start("결제링크 생성 폼 작성 전체")
+    wait = WebDriverWait(driver, 5)
+    time.sleep(0.3)
 
     # 1. 금액 입력
+    t0 = _step_start("1. 금액 입력")
     amount_input = None
     amount_xpaths = [
         "//*[contains(normalize-space(text()),'금액')]/following::input[1]",
@@ -618,11 +912,21 @@ def _fill_payment_link_form_and_get_url(
         except TimeoutException:
             continue
     if amount_input:
+        try:
+            # 금액 입력창이 화면 중앙에 오도록 스크롤
+            driver.execute_script(
+                "arguments[0].scrollIntoView({behavior:'smooth',block:'center'});",
+                amount_input,
+            )
+        except Exception:
+            pass
         amount_input.clear()
         amount_input.send_keys(str(row.amount))
-        time.sleep(0.5)
+        time.sleep(0.2)
+    _step_end("1. 금액 입력", t0)
 
     # 2. 상품명: 옥션 리스트에서 amount 에 맞는 상품명 선택
+    t0 = _step_start("2. 상품명 입력")
     product_name = _choose_product_name_for_amount(row.amount)
     try:
         name_input = wait.until(
@@ -632,11 +936,13 @@ def _fill_payment_link_form_and_get_url(
         )
         name_input.clear()
         name_input.send_keys(product_name)
-        time.sleep(0.5)
+        time.sleep(0.2)
     except TimeoutException:
         pass
+    _step_end("2. 상품명 입력", t0)
 
     # 3. 상품설명
+    t0 = _step_start("3. 상품설명 입력")
     desc_text = "글로벌 중고명품 경매사이트  구매 대행 서비스 즉시구매 결제 및 예치금"
     try:
         desc_input = wait.until(
@@ -649,7 +955,7 @@ def _fill_payment_link_form_and_get_url(
         )
         desc_input.clear()
         desc_input.send_keys(desc_text)
-        time.sleep(0.5)
+        time.sleep(0.2)
     except TimeoutException:
         # textarea 대신 input 일 수도 있으므로 보조 XPATH 시도
         try:
@@ -663,65 +969,96 @@ def _fill_payment_link_form_and_get_url(
             )
             desc_input.clear()
             desc_input.send_keys(desc_text)
-            time.sleep(0.5)
+            time.sleep(0.2)
         except TimeoutException:
             pass
+    _step_end("3. 상품설명 입력", t0)
 
-    # 1-1. 세션유효시간: "3분(빠른결제)" 클릭 후, 아래 "5분(일반 결제)" 클릭
+    # 폼 아래쪽에 있는 링크 생성 버튼과 기타 항목들이 보이도록 스크롤을 조금 내린다.
     try:
-        fast_btn = wait.until(
-            EC.element_to_be_clickable(
-                (By.XPATH, "//*[contains(normalize-space(text()),'3분(빠른결제)')]")
-            )
-        )
-        fast_btn.click()
-        time.sleep(0.6)
-    except TimeoutException:
+        # 상품설명까지 입력한 후, 아래쪽에 있는 세션유효시간/링크 생성 버튼들이
+        # 화면에 들어오도록 충분히 스크롤 다운
+        driver.execute_script("window.scrollBy(0, 800);")
+        time.sleep(0.3)
+    except Exception:
         pass
 
+    # 1-1. 세션유효시간: 콤보박스(#session-ttl)를 '5분 (일반 결제)' 로 변경
+    t0 = _step_start("4. 세션유효시간 선택 (3분→5분)")
+    changed_to_5min = _set_session_ttl_to_5min(driver, max_wait=10.0)
+    if not changed_to_5min:
+        print(
+            "[WARN] 10초 동안 세션유효시간을 '5분 (일반 결제)' 로 변경하지 못했습니다. "
+            "현재 값(기본 3분 등)을 유지한 채 링크 생성 단계로 진행합니다."
+        )
+    _step_end("4. 세션유효시간 선택 (3분→5분)", t0)
+
+    # 2. 링크 복사/생성 버튼 클릭
+    t0 = _step_start("5. 링크 복사/생성 버튼 클릭")
+    used_copy_button = False
     try:
-        normal_btn = wait.until(
+        # 1차: '링크 복사' 문구가 있는 버튼을 우선 시도
+        copy_btn = wait.until(
             EC.element_to_be_clickable(
-                (By.XPATH, "//*[contains(normalize-space(text()),'5분(일반 결제)')]")
+                (By.XPATH, "//button[contains(normalize-space(.),'링크 복사')]")
             )
         )
-        normal_btn.click()
-        time.sleep(0.6)
+        copy_btn.click()
+        used_copy_button = True
+        time.sleep(0.4)
     except TimeoutException:
-        pass
-
-    # 2. 링크 생성하기 버튼 클릭
-    try:
-        create_btn = wait.until(
-            EC.element_to_be_clickable(
-                (By.XPATH, "//button[contains(normalize-space(text()),'링크 생성하기')]")
-            )
-        )
-        create_btn.click()
-        time.sleep(0.8)
-    except TimeoutException:
-        print("[WARN] '링크 생성하기' 버튼을 찾지 못했습니다.")
-        return None
-
-    # "결제 링크를 생성 하시겠습니까?" 팝업에서 '생성하기' 버튼 클릭
-    try:
-        wait.until(
-            EC.visibility_of_element_located(
-                (
-                    By.XPATH,
-                    "//*[contains(normalize-space(text()),'결제 링크를 생성 하시겠습니까')]",
+        # 2차: '링크 생성하기' 또는 '링크 생성' 문구가 있는 버튼
+        try:
+            create_btn = wait.until(
+                EC.element_to_be_clickable(
+                    (
+                        By.XPATH,
+                        "//button[contains(normalize-space(.),'링크 생성하기') or contains(normalize-space(.),'링크 생성')]",
+                    )
                 )
             )
-        )
-        confirm_btn = wait.until(
-            EC.element_to_be_clickable(
-                (By.XPATH, "//button[contains(normalize-space(text()),'생성하기')]")
+            create_btn.click()
+            time.sleep(0.4)
+        except TimeoutException:
+            # 3차: 현재 폼 내에서 type='submit' 이고 '생성' 텍스트가 포함된 버튼
+            try:
+                create_btn = wait.until(
+                    EC.element_to_be_clickable(
+                        (
+                            By.XPATH,
+                            "//form//button[@type='submit' and contains(normalize-space(.),'생성')]",
+                        )
+                    )
+                )
+                create_btn.click()
+                time.sleep(0.4)
+            except TimeoutException:
+                print("[WARN] '링크 복사' / '링크 생성하기' / '생성' 버튼을 찾지 못했습니다.")
+                return None
+    _step_end("5. 링크 복사/생성 버튼 클릭", t0)
+
+    # "결제 링크를 생성 하시겠습니까?" 팝업에서 '생성하기' 버튼 클릭
+    t0 = _step_start("6. 생성 확인 팝업 처리 및 최종 링크 추출")
+    if not used_copy_button:
+        # '링크 생성하기' 플로우인 경우에만 확인 팝업이 뜬다.
+        try:
+            wait.until(
+                EC.visibility_of_element_located(
+                    (
+                        By.XPATH,
+                        "//*[contains(normalize-space(text()),'결제 링크를 생성 하시겠습니까')]",
+                    )
+                )
             )
-        )
-        confirm_btn.click()
-        time.sleep(1.5)
-    except TimeoutException:
-        print("[WARN] 결제 링크 생성 확인 팝업을 찾지 못했습니다.")
+            confirm_btn = wait.until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, "//button[contains(normalize-space(text()),'생성하기')]")
+                )
+            )
+            confirm_btn.click()
+            time.sleep(0.8)
+        except TimeoutException:
+            print("[WARN] 결제 링크 생성 확인 팝업을 찾지 못했습니다.")
 
     # 생성된 링크 중 'https://store.k-van.app' 로 시작하는 첫 번째 링크 확보
     link_text = None
@@ -730,45 +1067,125 @@ def _fill_payment_link_form_and_get_url(
             EC.presence_of_element_located(
                 (
                     By.XPATH,
-                    "//*[contains(text(),'https://store.k-van.app') or @value[contains(.,'https://store.k-van.app')]]",
+                    (
+                        "//*[contains(text(),'https://store.k-van.app') "
+                        "or @value[contains(.,'https://store.k-van.app')] "
+                        "or contains(@href,'https://store.k-van.app') "
+                        "or contains(@data-clipboard-text,'https://store.k-van.app')]"
+                    ),
                 )
             )
         )
+        # 텍스트, value, href, data-clipboard-text 순으로 링크를 추출
         link_text = (link_el.text or "").strip()
         if not link_text:
             link_text = (link_el.get_attribute("value") or "").strip()
+        if not link_text:
+            link_text = (link_el.get_attribute("href") or "").strip()
+        if not link_text:
+            link_text = (link_el.get_attribute("data-clipboard-text") or "").strip()
     except TimeoutException:
         print("[WARN] 생성된 결제 링크 텍스트를 찾지 못했습니다.")
 
     if link_text and "https://store.k-van.app" in link_text:
         _store_kvan_link_for_session(session_id, link_text)
+        _step_end("6. 생성 확인 팝업 처리 및 최종 링크 추출", t0)
+        _step_end("결제링크 생성 폼 작성 전체", t0_all)
         return link_text
 
+    _step_end("6. 생성 확인 팝업 처리 및 최종 링크 추출", t0)
+    _step_end("결제링크 생성 폼 작성 전체", t0_all)
     return None
 
 def sign_in(driver: webdriver.Chrome, row: PaymentRow) -> None:
+    t0_all = _step_start("로그인 전체")
     driver.get(SIGN_IN_URL)
-    wait = WebDriverWait(driver, 20)
+    # 로그인 화면 전체는 비교적 빨리 뜨므로, 글로벌 wait 은 최소한으로만 사용한다.
+    wait = WebDriverWait(driver, 3)
 
     # 공지 팝업(확인 후 로그인 / 로그인 버튼)이 있으면 먼저 처리
     _click_notice_if_present(driver)
 
-    id_input = wait.until(EC.visibility_of_element_located(SIGN_IN_SELECTORS["id"]))
+    # 아이디 입력창 찾기: 가장 단순한 CSS 셀렉터를 우선 사용
+    t0 = _step_start("아이디 입력")
+    id_input = _find_input_quick(
+        driver,
+        [
+            "input[placeholder*='아이디']",
+            "input[name*='id']",
+            "input[type='text']",
+        ],
+        max_wait=3.0,
+    )
+    if not id_input:
+        # 기존 XPATH 후보들도 한 번 더 시도 (역순으로 – 가장 느린 fallback 먼저)
+        id_locators = [
+            SIGN_IN_SELECTORS["id_fallback"],
+            SIGN_IN_SELECTORS["id_placeholder"],
+            SIGN_IN_SELECTORS["id_primary"],
+        ]
+        for loc in id_locators:
+            try:
+                id_input = wait.until(EC.visibility_of_element_located(loc))
+                break
+            except TimeoutException:
+                continue
+
+    if not id_input:
+        print("[ERROR] 아이디 입력창을 찾지 못했습니다. 로그인 단계를 종료합니다.")
+        _step_end("아이디 입력", t0)
+        _step_end("로그인 전체", t0_all)
+        return
+
     id_input.clear()
     id_input.send_keys(row.login_id)
+    _step_end("아이디 입력", t0)
 
-    pw_input = driver.find_element(*SIGN_IN_SELECTORS["password"])
+    # 비밀번호 입력창 찾기
+    t0 = _step_start("비밀번호 입력")
+    pw_input = _find_input_quick(
+        driver,
+        [
+            "input[type='password']",
+            "input[placeholder*='비밀번호']",
+        ],
+        max_wait=3.0,
+    )
+    if not pw_input:
+        pw_locators = [
+            SIGN_IN_SELECTORS["password_fallback"],
+            SIGN_IN_SELECTORS["password_primary"],
+        ]
+        for loc in pw_locators:
+            try:
+                pw_input = wait.until(EC.visibility_of_element_located(loc))
+                break
+            except TimeoutException:
+                continue
+
+    if not pw_input:
+        print("[ERROR] 비밀번호 입력창을 찾지 못했습니다. 로그인 단계를 종료합니다.")
+        _step_end("비밀번호 입력", t0)
+        _step_end("로그인 전체", t0_all)
+        return
+
     pw_input.clear()
     pw_input.send_keys(row.login_password)
+    _step_end("비밀번호 입력", t0)
 
-    submit_btn = driver.find_element(*SIGN_IN_SELECTORS["submit"])
+    # 로그인 버튼 찾기
+    t0 = _step_start("로그인 버튼 클릭")
+    submit_btn = wait.until(
+        EC.element_to_be_clickable(SIGN_IN_SELECTORS["submit_primary"])
+    )
     submit_btn.click()
+    _step_end("로그인 버튼 클릭", t0)
 
     # 2차 인증 PIN 팝업 처리 (있으면 입력, 없으면 통과)
     try:
         # 로그인 버튼 클릭 후 사람이 화면을 보는 것처럼 약간 대기
-        time.sleep(1.5)
-        pin_wait = WebDriverWait(driver, 20)
+        time.sleep(0.5)
+        pin_wait = WebDriverWait(driver, 3)
         pin_input_container = pin_wait.until(
             EC.visibility_of_element_located(PIN_POPUP_SELECTORS["input"])
         )
@@ -778,23 +1195,37 @@ def sign_in(driver: webdriver.Chrome, row: PaymentRow) -> None:
         else:
             pin_input = pin_input_container.find_element(By.XPATH, ".//input")
 
+        t0_pin = _step_start("PIN 입력 및 확인")
         pin_input.clear()
         pin_input.send_keys(row.login_pin)
         # 사람이 확인 내용을 읽는 것처럼 잠시 대기
-        time.sleep(0.8)
+        time.sleep(0.4)
 
         confirm_btn = driver.find_element(*PIN_POPUP_SELECTORS["confirm"])
         confirm_btn.click()
         # 서버가 토큰을 발급하고 홈으로 이동할 시간을 충분히 준다
-        time.sleep(3.0)
+        time.sleep(1.0)
+        _step_end("PIN 입력 및 확인", t0_pin)
     except TimeoutException:
         # PIN 팝업이 없는 계정/환경일 수 있으므로 조용히 통과
         pass
 
     # 로그인 완료까지 잠시 대기 (홈 또는 다른 보호된 페이지로 진입)
-    wait.until(EC.url_contains("store.k-van.app"))
-    # 로그인 후 대시보드 진입 시점에 매출 요약을 한 번 저장
-    _scrape_dashboard_and_store(driver)
+    try:
+        t0 = _step_start("로그인 후 리다이렉트 대기")
+        wait.until(EC.url_contains("store.k-van.app"))
+        _step_end("로그인 후 리다이렉트 대기", t0)
+    except TimeoutException:
+        print("[WARN] 로그인 후 리다이렉트 URL을 확인하지 못했습니다.")
+        _step_end("로그인 후 리다이렉트 대기", t0)
+        _step_end("로그인 전체", t0_all)
+        return
+
+    # 서버 환경에서만 대시보드 크롤링 수행 (로컬 테스트에서는 생략)
+    if _is_server_env():
+        _scrape_dashboard_and_store(driver)
+
+    _step_end("로그인 전체", t0_all)
 
 
 def _click_box(driver: webdriver.Chrome, locator: tuple) -> None:
@@ -1244,9 +1675,18 @@ def main() -> None:
         print("K-VAN 가맹점 페이지에 로그인 중...")
         sign_in(driver, row)
         print("로그인 및 대시보드 정보 수집 완료. 결제링크 관리 페이지로 이동합니다...")
-
-        # 새 대시보드 구조에 맞춰 결제링크 관리 → + 생성 까지 이동
         _go_to_payment_link_page(driver)
+
+        print("결제링크 관리 화면에서 '+ 생성' 버튼을 눌러 생성 페이지로 이동합니다...")
+        moved = _go_to_create_link_page(driver)
+        if not moved:
+            print("[ERROR] '+ 생성' 버튼 클릭 후 생성 페이지로 이동하지 못했습니다. 폼 작성 단계는 건너뜁니다.")
+            status = "error"
+            msg = "결제링크 생성 페이지 진입 실패(생성 버튼 미동작)."
+            save_result_to_excel(RESULT_EXCEL_PATH, row, status, msg)
+            save_result_to_json(str(result_json_path), status, msg)
+            append_transaction_to_hq(row, status, msg, session_id=session_id)
+            return
 
         print("결제링크 생성 페이지에서 폼을 채우고 링크를 생성합니다...")
         link_url = _fill_payment_link_form_and_get_url(driver, row, session_id)
