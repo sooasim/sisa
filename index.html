@@ -1010,72 +1010,9 @@
                 </h2>
                 <p class="text-[11px] md:text-xs text-white/60">Tap any item to sign in and join bidding.</p>
             </div>
-            <div class="glass-card rounded-2xl p-4 border border-white/10 shadow-2xl">
-                <div class="flex gap-4 overflow-x-auto pb-2" style="scrollbar-width: none;">
-                    <!-- 슬라이드 카드들: 클릭 시 로그인 페이지로 이동 -->
-                    <button onclick="window.location.href='login.html'"
-                        class="min-w-[180px] max-w-[180px] bg-white/5 hover:bg-white/15 rounded-2xl overflow-hidden border border-white/15 flex-shrink-0 text-left">
-                        <div class="h-28 bg-cover bg-center"
-                            style="background-image:url('https://images.unsplash.com/photo-1523170335258-f5ed11844a49?auto=format&fit=crop&w=400&q=80');">
-                            <div class="h-full w-full bg-black/40 flex items-start justify-between p-2 text-[10px]">
-                                <span class="bg-yellow-400 text-black px-2 py-0.5 rounded-full font-bold">LIVE</span>
-                                <span class="bg-black/50 text-white px-2 py-0.5 rounded-full font-mono">Ends in 02:14</span>
-                            </div>
-                        </div>
-                        <div class="p-3 space-y-1">
-                            <p class="text-[11px] text-white/70">Hermès Birkin 30 Togo</p>
-                            <p class="text-xs font-bold text-blue-300">₩3,200,000</p>
-                            <p class="text-[10px] text-white/50">Christie's · Handbags</p>
-                        </div>
-                    </button>
-
-                    <button onclick="window.location.href='login.html'"
-                        class="min-w-[180px] max-w-[180px] bg-white/5 hover:bg-white/15 rounded-2xl overflow-hidden border border-white/15 flex-shrink-0 text-left">
-                        <div class="h-28 bg-cover bg-center"
-                            style="background-image:url('https://images.unsplash.com/photo-1524805444758-089113d48a6d?auto=format&fit=crop&w=400&q=80');">
-                            <div class="h-full w-full bg-black/40 flex items-start justify-between p-2 text-[10px]">
-                                <span class="bg-emerald-400 text-black px-2 py-0.5 rounded-full font-bold">BUY NOW</span>
-                                <span class="bg-black/50 text-white px-2 py-0.5 rounded-full font-mono">New York</span>
-                            </div>
-                        </div>
-                        <div class="p-3 space-y-1">
-                            <p class="text-[11px] text-white/70">Rolex Submariner Date</p>
-                            <p class="text-xs font-bold text-blue-300">₩9,800,000</p>
-                            <p class="text-[10px] text-white/50">Sotheby's · Watches</p>
-                        </div>
-                    </button>
-
-                    <button onclick="window.location.href='login.html'"
-                        class="min-w-[180px] max-w-[180px] bg-white/5 hover:bg-white/15 rounded-2xl overflow-hidden border border-white/15 flex-shrink-0 text-left">
-                        <div class="h-28 bg-cover bg-center"
-                            style="background-image:url('https://images.unsplash.com/photo-1515562141207-7a88fb7ce338?auto=format&fit=crop&w=400&q=80');">
-                            <div class="h-full w-full bg-black/40 flex items-start justify-between p-2 text-[10px]">
-                                <span class="bg-red-400 text-black px-2 py-0.5 rounded-full font-bold">HOT</span>
-                                <span class="bg-black/50 text-white px-2 py-0.5 rounded-full font-mono">12 Bids</span>
-                            </div>
-                        </div>
-                        <div class="p-3 space-y-1">
-                            <p class="text-[11px] text-white/70">Chanel Classic Flap</p>
-                            <p class="text-xs font-bold text-blue-300">₩5,450,000</p>
-                            <p class="text-[10px] text-white/50">eBay · Couture</p>
-                        </div>
-                    </button>
-
-                    <button onclick="window.location.href='login.html'"
-                        class="min-w-[180px] max-w-[180px] bg-white/5 hover:bg-white/15 rounded-2xl overflow-hidden border border-white/15 flex-shrink-0 text-left">
-                        <div class="h-28 bg-cover bg-center"
-                            style="background-image:url('https://images.unsplash.com/photo-1600003014755-ba31aa59c4b6?auto=format&fit=crop&w=400&q=80');">
-                            <div class="h-full w-full bg-black/40 flex items-start justify-between p-2 text-[10px]">
-                                <span class="bg-blue-400 text-black px-2 py-0.5 rounded-full font-bold">RESERVE</span>
-                                <span class="bg-black/50 text-white px-2 py-0.5 rounded-full font-mono">EU · Online</span>
-                            </div>
-                        </div>
-                        <div class="p-3 space-y-1">
-                            <p class="text-[11px] text-white/70">Patek Philippe Nautilus</p>
-                            <p class="text-xs font-bold text-blue-300">₩85,000,000</p>
-                            <p class="text-[10px] text-white/50">Phillips · Watches</p>
-                        </div>
-                    </button>
+            <div class="glass-card rounded-2xl p-4 border border-white/10 shadow-2xl overflow-hidden">
+                <div id="footer-auction-slider" class="flex items-stretch justify-start gap-3 transition-transform duration-500 ease-out">
+                    <!-- JS에서 글로벌 옥션 상품을 순차적으로 렌더링 -->
                 </div>
             </div>
         </section>
@@ -1127,49 +1064,142 @@
         </footer>
     </main>
 
-    <!-- Number Counter Animation Script -->
+    <!-- Number Counter Animation + Footer Auction Slider -->
     <script>
         document.addEventListener("DOMContentLoaded", () => {
+            // 숫자 카운터 애니메이션
             const counters = document.querySelectorAll('.counter');
-            const speed = 150;
+            if (counters.length) {
+                const speed = 150;
 
-            const animateCounters = (entries, observer) => {
-                entries.forEach(entry => {
-                    if (entry.isIntersecting) {
-                        const counter = entry.target;
-                        const target = parseFloat(counter.getAttribute('data-target'));
-                        const prefix = counter.getAttribute('data-prefix') || '';
-                        const suffix = counter.getAttribute('data-suffix') || '';
-                        const decimals = parseInt(counter.getAttribute('data-decimals')) || 0;
-                        const useComma = counter.getAttribute('data-comma') === 'true';
+                const animateCounters = (entries, observer) => {
+                    entries.forEach(entry => {
+                        if (entry.isIntersecting) {
+                            const counter = entry.target;
+                            const target = parseFloat(counter.getAttribute('data-target'));
+                            const prefix = counter.getAttribute('data-prefix') || '';
+                            const suffix = counter.getAttribute('data-suffix') || '';
+                            const decimals = parseInt(counter.getAttribute('data-decimals')) || 0;
+                            const useComma = counter.getAttribute('data-comma') === 'true';
 
-                        let count = 0;
-                        const increment = target / speed;
+                            let count = 0;
+                            const increment = target / speed;
 
-                        const updateCount = () => {
-                            count += increment;
-                            if (count < target) {
-                                let displayValue = decimals > 0 ? count.toFixed(decimals) : Math.floor(count);
-                                if (useComma) displayValue = Number(displayValue).toLocaleString();
-                                counter.innerText = prefix + displayValue + suffix;
-                                requestAnimationFrame(updateCount);
-                            } else {
-                                let finalValue = decimals > 0 ? target.toFixed(decimals) : target;
-                                if (useComma) finalValue = Number(finalValue).toLocaleString();
-                                counter.innerText = prefix + finalValue + suffix;
-                            }
-                        };
-                        updateCount();
-                        observer.unobserve(counter);
-                    }
+                            const updateCount = () => {
+                                count += increment;
+                                if (count < target) {
+                                    let displayValue = decimals > 0 ? count.toFixed(decimals) : Math.floor(count);
+                                    if (useComma) displayValue = Number(displayValue).toLocaleString();
+                                    counter.innerText = prefix + displayValue + suffix;
+                                    requestAnimationFrame(updateCount);
+                                } else {
+                                    let finalValue = decimals > 0 ? target.toFixed(decimals) : target;
+                                    if (useComma) finalValue = Number(finalValue).toLocaleString();
+                                    counter.innerText = prefix + finalValue + suffix;
+                                }
+                            };
+                            updateCount();
+                            observer.unobserve(counter);
+                        }
+                    });
+                };
+
+                const observer = new IntersectionObserver(animateCounters, {
+                    threshold: 0.5
                 });
-            };
 
-            const observer = new IntersectionObserver(animateCounters, {
-                threshold: 0.5
-            });
+                counters.forEach(counter => observer.observe(counter));
+            }
 
-            counters.forEach(counter => observer.observe(counter));
+            // Footer Auction Slider: 글로벌 옥션 페이지와 동일한 상품 데이터 일부 사용
+            const sliderEl = document.getElementById('footer-auction-slider');
+            if (sliderEl) {
+                // 옥션 페이지 csvData 와 동일한 구조 (상위 일부만 사용)
+                const csvData = `가격(KRW),브랜드,모델명,경매거래소
+100000,Gucci,GG 캔버스 카드지갑 (B급),야후옥션(Japan)
+200000,Louis Vuitton,다미에 에벤 키홀더,다이코쿠야(Japan)
+300000,Prada,사피아노 레더 장지갑,베스티에르 콜렉티브
+400000,Balenciaga,스피드러너 스니커즈 (B급),더리얼리얼
+500000,Chanel,까멜리아 레더 브로치,야후옥션(Japan)
+600000,Hermes,클리퍼 쿼츠 시계 (여성용, 콤비),다이코쿠야(Japan)
+700000,Goyard,생수피 카드지갑,더리얼리얼
+800000,Louis Vuitton,네버풀 MM (파우치 없음, 태닝 진행),세컨스트리트(Japan)
+900000,Gucci,재키 1961 호보백 (빈티지 복각),코메효(Japan)
+1000000,Rolex,오이스터 데이트 6694 (수동),야후옥션(Japan)`;
+
+                const imgUrls = [
+                    'https://images.unsplash.com/photo-1523170335258-f5ed11844a49?auto=format&fit=crop&w=400&q=80',
+                    'https://images.unsplash.com/photo-1524805444758-089113d48a6d?auto=format&fit=crop&w=400&q=80',
+                    'https://images.unsplash.com/photo-1515562141207-7a88fb7ce338?auto=format&fit=crop&w=400&q=80',
+                    'https://images.unsplash.com/photo-1600003014755-ba31aa59c4b6?auto=format&fit=crop&w=400&q=400&q=80'
+                ];
+
+                const rows = csvData.trim().split('\n').slice(1);
+                const items = rows.map((row) => {
+                    const cols = row.split(',');
+                    const price = parseInt(cols[0], 10) || 0;
+                    const brand = cols[1] || '';
+                    const model = cols[2] || '';
+                    const exchange = cols[3] || '';
+
+                    // 랜덤 뱃지/태그 생성
+                    const badges = [
+                        { badge: 'LIVE', color: 'bg-yellow-400', tag: 'Ends in 02:14' },
+                        { badge: 'BUY NOW', color: 'bg-emerald-400', tag: 'New York' },
+                        { badge: 'HOT', color: 'bg-red-400', tag: '12 Bids' },
+                        { badge: 'RESERVE', color: 'bg-blue-400', tag: 'EU · Online' }
+                    ];
+                    const b = badges[Math.floor(Math.random() * badges.length)];
+
+                    const img = imgUrls[Math.floor(Math.random() * imgUrls.length)];
+
+                    return {
+                        img,
+                        badge: b.badge,
+                        badgeColor: b.color,
+                        tag: b.tag,
+                        title: `${brand} ${model}`,
+                        price: `₩${price.toLocaleString('ko-KR')}`,
+                        meta: exchange
+                    };
+                });
+
+                let startIndex = 0;
+                const visibleCount = 4;
+
+                function renderSlider() {
+                    // 현재 startIndex 기준으로 4개 카드 생성
+                    let html = '';
+                    for (let i = 0; i < visibleCount; i++) {
+                        const item = items[(startIndex + i) % items.length];
+                        html += `
+                        <button onclick="window.location.href='login.html'"
+                            class="min-w-0 flex-1 bg-white/5 hover:bg-white/15 rounded-2xl overflow-hidden border border-white/15 text-left flex flex-col">
+                            <div class="h-28 md:h-32 bg-cover bg-center"
+                                style="background-image:url('${item.img}');">
+                                <div class="h-full w-full bg-black/40 flex items-start justify-between p-2 text-[9px] md:text-[10px]">
+                                    <span class="${item.badgeColor} text-black px-2 py-0.5 rounded-full font-bold">${item.badge}</span>
+                                    <span class="bg-black/50 text-white px-2 py-0.5 rounded-full font-mono">${item.tag}</span>
+                                </div>
+                            </div>
+                            <div class="p-2.5 md:p-3 space-y-0.5 md:space-y-1 flex-1">
+                                <p class="text-[10px] md:text-[11px] text-white/70 truncate">${item.title}</p>
+                                <p class="text-[11px] md:text-xs font-bold text-blue-300">${item.price}</p>
+                                <p class="text-[9px] md:text-[10px] text-white/50 truncate">${item.meta}</p>
+                            </div>
+                        </button>`;
+                    }
+                    sliderEl.innerHTML = html;
+                }
+
+                if (items.length) {
+                    renderSlider();
+                    setInterval(function () {
+                        startIndex = (startIndex + 1) % items.length; // 한 칸씩 오른쪽으로 이동
+                        renderSlider();
+                    }, 4000);
+                }
+            }
         });
     </script>
 </body>

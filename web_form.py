@@ -290,6 +290,33 @@ def portal_login():
           로그인 페이지로 돌아가기
         </a>
       </div>
+    <script>
+      function filterAgencyTransactions() {
+        var startInput = document.getElementById('agencyTxStart');
+        var endInput = document.getElementById('agencyTxEnd');
+        var statusSel = document.getElementById('agencyTxStatus');
+        var startDate = startInput && startInput.value ? startInput.value : '';
+        var endDate = endInput && endInput.value ? endInput.value : '';
+        var statusVal = statusSel ? (statusSel.value || 'all') : 'all';
+
+        var rows = document.querySelectorAll('#agencyTxBody tr');
+        rows.forEach(function (row) {
+          var date = row.getAttribute('data-date') || '';
+          var status = (row.getAttribute('data-status') || '').toLowerCase();
+          var show = true;
+          if (startDate && (!date || date < startDate)) show = false;
+          if (show && endDate && (!date || date > endDate)) show = false;
+          if (show && statusVal !== 'all') {
+            if (statusVal === 'other') {
+              if (status === 'success' || status === 'fail') show = false;
+            } else if (status !== statusVal) {
+              show = false;
+            }
+          }
+          row.style.display = show ? '' : 'none';
+        });
+      }
+    </script>
     </body>
     </html>
     """
@@ -2107,6 +2134,25 @@ def hq_admin():
                 _save_hq_state(state)
                 message = "선택한 거래 내역이 삭제되었습니다."
 
+    # 대행사 관리 페이징 (20개씩)
+    try:
+        page = int(request.args.get("page", "1"))
+    except ValueError:
+        page = 1
+    page_size = 20
+    total_agencies = len(agencies)
+    total_pages = (total_agencies + page_size - 1) // page_size if total_agencies else 1
+    if page < 1:
+        page = 1
+    if page > total_pages:
+        page = total_pages
+    start_idx = (page - 1) * page_size
+    end_idx = start_idx + page_size
+    paged_agencies = agencies[start_idx:end_idx]
+
+    # 전체 거래 기본 날짜(오늘) 문자열
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+
     template = """
     <!DOCTYPE html>
     <html lang="ko">
@@ -2250,14 +2296,16 @@ def hq_admin():
 
           <!-- 2. 전체 거래 내역 리스트 -->
           <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
-            <div class="flex items-center justify-between mb-3">
-              <h2 class="text-lg font-semibold flex items-center gap-2">
-                <i class="fa-solid fa-list-ul text-brand-accent"></i> 전체 거래 내역
-              </h2>
-              <div class="flex items-center gap-3">
+            <div class="flex flex-col md:flex-row items-start md:items-center justify-between mb-3 gap-2">
+              <div>
+                <h2 class="text-lg font-semibold flex items-center gap-2">
+                  <i class="fa-solid fa-list-ul text-brand-accent"></i> 전체 거래 내역
+                </h2>
                 <p class="text-[11px] text-white/60 hidden sm:block">시간순으로 성사된 주문 결제 건을 확인하고, 정산 상태를 관리합니다.</p>
-                <div class="flex items-center gap-1 text-[11px]">
-                  <span class="text-white/70">업체 선택:</span>
+              </div>
+              <div class="flex flex-wrap items-center gap-2 text-[11px]">
+                <div class="flex items-center gap-1">
+                  <span class="text-white/70">업체:</span>
                   <select id="txAgencyFilter" onchange="filterTransactions()" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]">
                     <option value="all">전체</option>
                     {% for ag in agencies %}
@@ -2265,6 +2313,25 @@ def hq_admin():
                     {% endfor %}
                   </select>
                 </div>
+                <div class="flex items-center gap-1">
+                  <span class="text-white/70">날짜:</span>
+                  <input id="txStartDate" type="date" value="{{ today_str }}" onchange="filterTransactions()" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]" />
+                  <span class="text-white/50">~</span>
+                  <input id="txEndDate" type="date" value="{{ today_str }}" onchange="filterTransactions()" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]" />
+                </div>
+                <div class="flex items-center gap-1">
+                  <span class="text-white/70">상태:</span>
+                  <select id="txStatusFilter" onchange="filterTransactions()" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]">
+                    <option value="all">전체</option>
+                    <option value="success">성공</option>
+                    <option value="fail">실패</option>
+                    <option value="other">기타</option>
+                  </select>
+                </div>
+                <a href="{{ url_for('hq_export_excel', scope='transactions') }}"
+                   class="ml-auto px-3 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25">
+                  엑셀
+                </a>
               </div>
             </div>
             {% if transactions %}
@@ -2308,7 +2375,9 @@ def hq_admin():
                         data-tx-row="1"
                         data-agency-id="{{ t.agency_id or '' }}"
                         data-amount="{{ amount }}"
-                        data-fee-percent="{{ ag_fee }}">
+                        data-fee-percent="{{ ag_fee }}"
+                        data-date="{{ (t.created_at.strftime('%Y-%m-%d') if t.created_at) else '' }}"
+                        data-status="{{ t.status or '' }}">
                       <td class="px-3 py-2 text-center">
                         <input type="checkbox" class="tx-check" name="tx_ids" value="{{ t.id }}" onclick="updateSelectionSummary()">
                       </td>
@@ -2391,7 +2460,13 @@ def hq_admin():
               <h2 class="text-lg font-semibold flex items-center gap-2">
                 <i class="fa-solid fa-building text-brand-accent"></i> 대행사별 거래 내역 및 정산
               </h2>
-              <p class="text-[11px] text-white/60">업체별 수수료 % 설정과 미정산/정산완료 금액을 확인합니다. (수정은 아래 대행사 관리 박스에서 가능합니다.)</p>
+              <div class="flex items-center gap-2 text-[11px]">
+                <p class="text-white/60 hidden sm:block">업체별 수수료 % 설정과 미정산/정산완료 금액을 확인합니다. (수정은 아래 대행사 관리 박스에서 가능합니다.)</p>
+                <a href="{{ url_for('hq_export_excel', scope='agency_summary') }}"
+                   class="px-3 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25">
+                  엑셀
+                </a>
+              </div>
             </div>
             {% if agencies %}
             <div class="overflow-x-auto">
@@ -2455,9 +2530,15 @@ def hq_admin():
               <h2 class="text-lg font-semibold flex items-center gap-2">
                 <i class="fa-solid fa-user-gear text-brand-accent"></i> 대행사 관리
               </h2>
-              <p class="text-[11px] text-white/60">대행사 정보, 수수료 %, 미정산 금액을 확인하고 수정/정산할 수 있습니다.</p>
+              <div class="flex items-center gap-2 text-[11px]">
+                <p class="text-white/60 hidden sm:block">대행사 정보, 수수료 %, 미정산 금액을 확인하고 수정/정산할 수 있습니다.</p>
+                <a href="{{ url_for('hq_export_excel', scope='agency_manage') }}"
+                   class="px-3 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25">
+                  엑셀
+                </a>
+              </div>
             </div>
-            {% if agencies %}
+            {% if paged_agencies %}
             <div class="overflow-x-auto">
               <table class="min-w-full text-sm border-separate border-spacing-y-2">
                 <thead class="text-xs text-white/70">
@@ -2475,7 +2556,7 @@ def hq_admin():
                   </tr>
                 </thead>
                 <tbody>
-                  {% for ag in agencies %}
+                  {% for ag in paged_agencies %}
                   {% set total_amount = 0 %}
                   {% set unsettled_amount = 0 %}
                   {% for t in transactions %}
@@ -2553,6 +2634,15 @@ def hq_admin():
                 </tbody>
               </table>
             </div>
+            <div class="mt-3 flex justify-center gap-1 text-[11px]">
+              {% for p in range(1, total_pages + 1) %}
+                {% if p == page %}
+                  <span class="px-2 py-1 rounded-full bg-white/80 text-brand-blue font-semibold">{{ p }}</span>
+                {% else %}
+                  <a href="{{ url_for('hq_admin', page=p) }}" class="px-2 py-1 rounded-full bg-white/10 text-white hover:bg-white/30">{{ p }}</a>
+                {% endif %}
+              {% endfor %}
+            </div>
             {% else %}
               <p class="text-xs text-white/60">아직 승인된 대행사가 없습니다.</p>
             {% endif %}
@@ -2572,13 +2662,39 @@ def hq_admin():
       </main>
       <script>
         function filterTransactions() {
-          var sel = document.getElementById('txAgencyFilter');
-          if (!sel) return;
-          var value = sel.value || 'all';
+          var selAgency = document.getElementById('txAgencyFilter');
+          var selStatus = document.getElementById('txStatusFilter');
+          var startInput = document.getElementById('txStartDate');
+          var endInput = document.getElementById('txEndDate');
+          var agencyVal = selAgency ? (selAgency.value || 'all') : 'all';
+          var statusVal = selStatus ? (selStatus.value || 'all') : 'all';
+          var startDate = startInput && startInput.value ? startInput.value : '';
+          var endDate = endInput && endInput.value ? endInput.value : '';
+
           var rows = document.querySelectorAll('tr[data-tx-row="1"]');
           rows.forEach(function(row) {
             var ag = row.getAttribute('data-agency-id') || '';
-            var show = (value === 'all' || ag === value);
+            var date = row.getAttribute('data-date') || '';
+            var status = (row.getAttribute('data-status') || '').toLowerCase();
+
+            var show = true;
+            if (agencyVal !== 'all' && ag !== agencyVal) {
+              show = false;
+            }
+            if (show && startDate && (!date || date < startDate)) {
+              show = false;
+            }
+            if (show && endDate && (!date || date > endDate)) {
+              show = false;
+            }
+            if (show && statusVal !== 'all') {
+              if (statusVal === 'other') {
+                if (status === 'success' || status === 'fail') show = false;
+              } else if (status !== statusVal) {
+                show = false;
+              }
+            }
+
             row.style.display = show ? '' : 'none';
             var detail = row.nextElementSibling;
             if (detail && detail.getAttribute('data-tx-detail') === '1') {
@@ -2926,9 +3042,28 @@ def agency_admin():
 
           <!-- 거래 내역 (본사 DB 연동) -->
           <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
-            <h2 class="text-lg font-semibold mb-3 flex items-center gap-2">
-              <i class="fa-solid fa-list-ul text-brand-accent"></i> 거래 내역 (본사 DB 연동)
-            </h2>
+            <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-3 gap-2">
+              <h2 class="text-lg font-semibold flex items-center gap-2">
+                <i class="fa-solid fa-list-ul text-brand-accent"></i> 거래 내역 (본사 DB 연동)
+              </h2>
+              <div class="flex flex-wrap items-center gap-2 text-[11px]">
+                <div class="flex items-center gap-1">
+                  <span class="text-white/70">날짜:</span>
+                  <input id="agencyTxStart" type="date" onchange="filterAgencyTransactions()" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]" />
+                  <span class="text-white/50">~</span>
+                  <input id="agencyTxEnd" type="date" onchange="filterAgencyTransactions()" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]" />
+                </div>
+                <div class="flex items-center gap-1">
+                  <span class="text-white/70">상태:</span>
+                  <select id="agencyTxStatus" onchange="filterAgencyTransactions()" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]">
+                    <option value="all">전체</option>
+                    <option value="success">성공</option>
+                    <option value="fail">실패</option>
+                    <option value="other">기타</option>
+                  </select>
+                </div>
+              </div>
+            </div>
             {% if agency_transactions %}
             <div class="overflow-x-auto">
               <table class="min-w-full text-xs border-separate border-spacing-y-2">
@@ -2941,10 +3076,12 @@ def agency_admin():
                     <th class="px-3 py-1 text-center">정산상태</th>
                   </tr>
                 </thead>
-                <tbody>
+                <tbody id="agencyTxBody">
                   {% for t in agency_transactions|sort(attribute="created_at", reverse=True) %}
                   {% set amount = t.amount or 0 %}
-                  <tr class="bg-black/20 hover:bg-black/30 transition align-top">
+                  <tr class="bg-black/20 hover:bg-black/30 transition align-top"
+                      data-date="{{ (t.created_at.strftime('%Y-%m-%d') if t.created_at) else '' }}"
+                      data-status="{{ t.status or '' }}">
                     <td class="px-3 py-2 whitespace-nowrap">{{ t.created_at }}</td>
                     <td class="px-3 py-2 text-right">{{ "{:,}".format(amount) }} 원</td>
                     <td class="px-3 py-2 whitespace-nowrap">{{ t.customer_name }}</td>
@@ -2990,9 +3127,11 @@ def agency_admin():
 
 @app.route("/hq-export-excel", methods=["GET"])
 def hq_export_excel():
-    """본사용 전체 거래/정산 엑셀 다운로드."""
+    """본사용 전체 거래/정산 엑셀 다운로드 (섹션별 분기)."""
     if not session.get("hq_logged_in"):
         return redirect(url_for("hq_login"))
+
+    section = request.args.get("scope", "").strip() or "all"
 
     state = _load_hq_state()
     transactions = state.get("transactions") or []
@@ -3000,48 +3139,151 @@ def hq_export_excel():
     name_map = {str(ag.get("id")): ag.get("company_name", "") for ag in agencies}
 
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Transactions"
-    headers = [
-        "시간",
-        "대행사ID",
-        "대행사명",
-        "금액",
-        "이름",
-        "카드구분",
-        "생년월일(앞6)",
-        "전화번호(뒷자리)",
-        "결제상태",
-        "정산상태",
-        "메모",
-    ]
-    ws.append(headers)
 
-    for t in transactions:
-        aid = str(t.get("agency_id") or "")
-        ws.append(
-            [
-                t.get("created_at", ""),
-                aid,
-                name_map.get(aid, ""),
-                t.get("amount", 0),
-                t.get("customer_name", ""),
-                t.get("card_type", ""),
-                t.get("resident_front", ""),
-                t.get("phone_number", ""),
-                t.get("status", ""),
-                t.get("settlement_status", ""),
-                t.get("message", ""),
-            ]
-        )
+    if section in ("all", "transactions"):
+        ws = wb.active
+        ws.title = "Transactions"
+        headers = [
+            "시간",
+            "대행사ID",
+            "대행사명",
+            "금액",
+            "이름",
+            "카드구분",
+            "생년월일(앞6)",
+            "전화번호(뒷자리)",
+            "결제상태",
+            "정산상태",
+            "메모",
+        ]
+        ws.append(headers)
+        for t in transactions:
+            aid = str(t.get("agency_id") or "")
+            ws.append(
+                [
+                    t.get("created_at", ""),
+                    aid,
+                    name_map.get(aid, ""),
+                    t.get("amount", 0),
+                    t.get("customer_name", ""),
+                    t.get("card_type", ""),
+                    t.get("resident_front", ""),
+                    t.get("phone_number", ""),
+                    t.get("status", ""),
+                    t.get("settlement_status", ""),
+                    t.get("message", ""),
+                ]
+            )
+    else:
+        # 필요 시 새 워크시트 생성
+        ws = wb.active
 
+    if section in ("all", "agency_summary"):
+        if section == "all":
+            ws2 = wb.create_sheet(title="AgencySummary")
+        else:
+            ws2 = wb
+            ws2.title = "AgencySummary"
+        headers2 = [
+            "업체ID",
+            "업체명",
+            "도메인",
+            "수수료%",
+            "총 거래금액",
+            "미정산 금액",
+            "입금 예정액",
+            "상태",
+        ]
+        ws2.append(headers2)
+        for ag in agencies:
+            total_amount = 0
+            unsettled_amount = 0
+            for t in transactions:
+                amt = t.get("amount") or 0
+                if t.get("agency_id") == ag.get("id") and t.get("status") == "success" and amt > 0:
+                    total_amount += amt
+                    if t.get("settlement_status") != "정산완료":
+                        unsettled_amount += amt
+            fee = ag.get("fee_percent") or 0
+            net_amount = unsettled_amount * (100 - fee) // 100
+            ws2.append(
+                [
+                    ag.get("id", ""),
+                    ag.get("company_name", ""),
+                    ag.get("domain", ""),
+                    fee,
+                    total_amount,
+                    unsettled_amount,
+                    net_amount,
+                    ag.get("status", ""),
+                ]
+            )
+
+    if section in ("all", "agency_manage"):
+        if section == "all":
+            ws3 = wb.create_sheet(title="AgencyManage")
+        else:
+            ws3 = wb
+            ws3.title = "AgencyManage"
+        headers3 = [
+            "업체ID",
+            "업체명",
+            "연락처",
+            "은행",
+            "계좌번호",
+            "이메일/구글시트",
+            "수수료%",
+            "총 거래금액",
+            "미정산 금액",
+            "입금 예정액",
+            "상태",
+            "로그인ID",
+            "로그인PW",
+        ]
+        ws3.append(headers3)
+        for ag in agencies:
+            total_amount = 0
+            unsettled_amount = 0
+            for t in transactions:
+                amt = t.get("amount") or 0
+                if t.get("agency_id") == ag.get("id") and t.get("status") == "success" and amt > 0:
+                    total_amount += amt
+                    if t.get("settlement_status") != "정산완료":
+                        unsettled_amount += amt
+            fee = ag.get("fee_percent") or 0
+            net_amount = unsettled_amount * (100 - fee) // 100
+            ws3.append(
+                [
+                    ag.get("id", ""),
+                    ag.get("company_name", ""),
+                    ag.get("phone", ""),
+                    ag.get("bank_name", ""),
+                    ag.get("account_number", ""),
+                    ag.get("email_or_sheet", ""),
+                    fee,
+                    total_amount,
+                    unsettled_amount,
+                    net_amount,
+                    ag.get("status", ""),
+                    ag.get("login_id", ""),
+                    ag.get("login_password", ""),
+                ]
+            )
     buf = BytesIO()
     wb.save(buf)
     buf.seek(0)
+    filename = "sisa_hq.xlsx"
+    if section == "transactions":
+        filename = "sisa_hq_transactions.xlsx"
+    elif section == "agency_summary":
+        filename = "sisa_hq_agency_summary.xlsx"
+    elif section == "agency_manage":
+        filename = "sisa_hq_agency_manage.xlsx"
+
     return send_file(
         buf,
         as_attachment=True,
-        download_name="sisa_hq_transactions.xlsx",
+        download_name=filename,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
