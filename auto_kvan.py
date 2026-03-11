@@ -23,17 +23,24 @@ def _is_server_env() -> bool:
 SIGN_IN_URL = "https://store.k-van.app/sign-in"
 FACE_TO_FACE_URL = "https://store.k-van.app/face-to-face-payment"
 
+# 코드와 데이터 경로 분리: SISA_DATA_DIR (없으면 ./data)
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ.get("SISA_DATA_DIR") or (BASE_DIR / "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 # 입력 데이터 JSON 파일 (web_form.py 가 생성)
-ORDER_JSON_PATH = "current_order.json"
+ORDER_JSON_PATH = DATA_DIR / "current_order.json"
 
 # 결제 결과를 저장할 엑셀 / JSON 파일
-RESULT_EXCEL_PATH = "kvan_results.xlsx"
-RESULT_JSON_PATH = "last_result.json"
-HQ_STATE_PATH = "hq_state.json"
+RESULT_EXCEL_PATH = DATA_DIR / "kvan_results.xlsx"
+RESULT_JSON_PATH = DATA_DIR / "last_result.json"
+HQ_STATE_PATH = DATA_DIR / "hq_state.json"
 
 # 세션별 주문/결과 디렉토리 (동시 여러 세션용)
-SESSION_ORDER_DIR = Path("sessions") / "orders"
-SESSION_RESULT_DIR = Path("sessions") / "results"
+SESSION_ORDER_DIR = DATA_DIR / "sessions" / "orders"
+SESSION_RESULT_DIR = DATA_DIR / "sessions" / "results"
+SESSION_ORDER_DIR.mkdir(parents=True, exist_ok=True)
+SESSION_RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
 # JSON / 결과 엑셀에서 공통으로 사용하는 필드 목록
 HEADERS: List[str] = [

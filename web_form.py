@@ -26,12 +26,19 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from openpyxl import Workbook
 
-ORDER_JSON_PATH = "current_order.json"
-RESULT_JSON_PATH = "last_result.json"
-ADMIN_STATE_PATH = "admin_state.json"
-HQ_STATE_PATH = "hq_state.json"
-SESSION_ORDER_DIR = Path("sessions") / "orders"
-SESSION_RESULT_DIR = Path("sessions") / "results"
+# 코드와 데이터 경로 분리: SISA_DATA_DIR (없으면 ./data)
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ.get("SISA_DATA_DIR") or (BASE_DIR / "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+ORDER_JSON_PATH = str(DATA_DIR / "current_order.json")
+RESULT_JSON_PATH = str(DATA_DIR / "last_result.json")
+ADMIN_STATE_PATH = str(DATA_DIR / "admin_state.json")
+HQ_STATE_PATH = str(DATA_DIR / "hq_state.json")
+SESSION_ORDER_DIR = DATA_DIR / "sessions" / "orders"
+SESSION_RESULT_DIR = DATA_DIR / "sessions" / "results"
+SESSION_ORDER_DIR.mkdir(parents=True, exist_ok=True)
+SESSION_RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def trigger_auto_kvan_async(session_id: str | None = None) -> None:
@@ -82,7 +89,6 @@ app = Flask(__name__)
 app.secret_key = "worldsisa-form-secret"
 
 # 약관 파일 경로 (프로젝트 루트의 terms.html)
-BASE_DIR = Path(__file__).resolve().parent
 TERMS_FILE = BASE_DIR / "terms.html"
 
 # 차단할 IP (공인 IP만). 환경변수 BLOCKED_IPS 로 지정 (쉼표 구분). 100.64.x.x 같은 CGN 대역은 넣지 말 것.
@@ -175,7 +181,7 @@ def portal_login():
       <div class="bg-white/10 border border-white/20 rounded-2xl px-8 py-10 max-w-sm w-full text-center shadow-2xl">
         <h1 class="text-xl font-bold mb-3">로그인에 실패했습니다.</h1>
         <p class="text-sm text-white/70 mb-6">아이디 또는 비밀번호를 다시 확인해 주세요.</p>
-        <a href="/login.html" class="inline-flex items-center justify-center px-4 py-2 rounded-lg bg-white text-brand-blue font-semibold text-sm hover:bg-brand-accent transition">
+        <a href="/login.html" class="inline-flex items-center justify-center px-4 py-2 rounded-lg bg-white text-[#1e326b] font-semibold text-sm hover:bg-brand-accent transition">
           로그인 페이지로 돌아가기
         </a>
       </div>
