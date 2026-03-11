@@ -190,11 +190,11 @@ app.secret_key = "worldsisa-form-secret"
 # 약관 파일 경로 (프로젝트 루트의 terms.html)
 TERMS_FILE = BASE_DIR / "terms.html"
 
-
-@app.before_first_request
-def _ensure_db_schema() -> None:
-    """첫 요청 시점에 한 번만 DB 스키마를 확인/생성."""
+# 애플리케이션 로드 시점에 한 번 DB 스키마 확인 (실패해도 앱은 계속 동작)
+try:
     init_db()
+except Exception as e:  # noqa: BLE001
+    print(f"[WARN] init_db at import 실패: {e}")
 
 # 차단할 IP (공인 IP만). 환경변수 BLOCKED_IPS 로 지정 (쉼표 구분). 100.64.x.x 같은 CGN 대역은 넣지 말 것.
 _BLOCKED_IPS: set[str] = set()
@@ -1293,6 +1293,7 @@ def agency_apply():
     app_id = datetime.utcnow().strftime("AG%Y%m%d%H%M%S%f")
 
     # MySQL applications 테이블에 직접 INSERT (DB 기준 진짜 저장)
+    db_ok = False
     try:
         conn = get_db()
         with conn.cursor() as cur:
@@ -1320,11 +1321,17 @@ def agency_apply():
             )
         conn.commit()
         conn.close()
+        db_ok = True
     except Exception as e:  # noqa: BLE001
         print(f"[ERROR] agency_apply DB insert 실패: {e}")
 
+    if db_ok:
+        status_message = "대행사 신청 정보가 데이터베이스에 정상 저장되었습니다. SISA 본사에서 검토 후 개별 연락을 드립니다."
+    else:
+        status_message = "신청 접수 과정에서 오류가 발생했을 수 있습니다. 잠시 후 다시 시도하시거나 본사에 문의해 주세요."
+
     # 간단한 접수 완료 페이지 반환 (SISA 스타일)
-    return """
+    return f"""
 <!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -1340,10 +1347,7 @@ def agency_apply():
       <span class="text-2xl text-emerald-300">✓</span>
     </div>
     <h1 class="text-2xl font-bold mb-2">대행사 등록 신청이 접수되었습니다.</h1>
-    <p class="text-sm text-white/70 mb-4 leading-relaxed">
-      SISA 본사 어드민에서 신청 내용을 검토한 후,<br/>
-      담당자가 개별적으로 연락을 드립니다.
-    </p>
+    <p class="text-sm text-white/70 mb-4 leading-relaxed">{status_message}</p>
     <p class="text-[11px] text-white/60 mb-6">
       아래 버튼을 누르시면 SISA 메인 페이지로 이동합니다.
     </p>
