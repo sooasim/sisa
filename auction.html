@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<html lang="ko" translate="no">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" id="viewport-meta">
+    <meta name="google" content="notranslate">
+    <script>
+        // 모바일 스마트폰에서 데스크탑 화면 그대로 축소되어 보이도록 뷰포트 강제 조정
+        if (screen.width < 1280) {
+            document.getElementById('viewport-meta').setAttribute('content', 'width=1280');
+        }
+    </script>
+    <title>Global Auctions | SISA</title>
+    
+    <!-- SISA 브랜드 파비콘 -->
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%232f4b9f'/><circle cx='50' cy='50' r='28' fill='none' stroke='%23ffffff' stroke-width='6'/><ellipse cx='50' cy='50' rx='12' ry='28' fill='none' stroke='%23ffffff' stroke-width='4'/><line x1='22' y1='50' x2='78' y2='50' stroke='%23ffffff' stroke-width='4'/></svg>">
+
+    <!-- 폰트 및 아이콘 -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: { sans: ['Inter', 'sans-serif'] },
+                    colors: {
+                        brand: { blue: '#2f4b9f', dark: '#1e326b', accent: '#e6edf7' }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: rgba(255, 255, 255, 0.05); }
+        ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.4); }
+        
+        .glass-card {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        
+        /* 타이머 폰트 고정폭(Monospace) 처리로 너비 흔들림 방지 */
+        .timer-text { font-variant-numeric: tabular-nums; }
+    </style>
+</head>
+<body class="bg-brand-blue text-white font-sans overflow-x-hidden antialiased flex flex-col min-h-screen">
+
+    <!-- 상단 네비게이션 바 (공통) -->
+    <header class="fixed w-full top-0 z-50 glass-card border-b-0 border-white/10">
+        <div class="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
+            <div class="flex items-center gap-3 cursor-pointer" onclick="window.location.href='/'">
+                <div class="flex items-center justify-center">
+                    <i class="fa-solid fa-globe text-white text-3xl drop-shadow-md"></i>
+                </div>
+                <div class="flex flex-col justify-center">
+                    <div class="flex items-end gap-2 mb-1">
+                        <span class="text-3xl font-black tracking-tighter text-white leading-none">SISA</span>
+                        <span class="text-[10px] font-mono bg-white/10 text-blue-200 px-2 py-0.5 rounded border border-white/10 tracking-[0.1em] leading-none mb-0.5">worldsisa.com</span>
+                    </div>
+                    <span class="text-[9px] text-white/70 font-semibold tracking-[0.18em] uppercase leading-none">Society of International Specialized Auctioneers</span>
+                </div>
+            </div>
+
+            <nav class="hidden md:flex bg-white/10 rounded-full p-1 border border-white/10 text-sm font-medium">
+                <a href="/" class="px-5 py-2 rounded-full hover:bg-white/10 text-white/80 transition">HOME</a>
+                <a href="/auction.html" class="px-5 py-2 rounded-full bg-white/20 text-white transition">GLOBAL AUCTION</a>
+                <a href="/" class="px-5 py-2 rounded-full hover:bg-white/10 text-white/80 transition flex items-center gap-1">
+                    <i class="fa-solid fa-lock text-xs"></i> SISA VAULT
+                </a>
+                <a href="login.html" class="px-5 py-2 rounded-full hover:bg-white/10 text-white/80 transition">MY SISA</a>
+            </nav>
+
+            <div class="flex items-center gap-4 text-sm font-semibold">
+                <div class="relative group hidden sm:block">
+                    <button class="flex items-center gap-1 cursor-pointer text-white/80 hover:text-white py-2">
+                        KR <i class="fa-solid fa-chevron-down text-[10px]"></i>
+                    </button>
+                    <!-- 드롭다운 메뉴 (10개국) -->
+                    <div class="absolute right-0 top-full mt-1 w-32 bg-[#1e326b]/95 backdrop-blur-md border border-white/10 rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-50">
+                        <ul class="py-2 text-white/80">
+                            <li><a href="#" class="block px-4 py-1.5 hover:bg-white/10 hover:text-white transition">🇺🇸 English</a></li>
+                            <li><a href="#" class="block px-4 py-1.5 hover:bg-white/10 hover:text-white transition">🇰🇷 한국어</a></li>
+                            <li><a href="#" class="block px-4 py-1.5 hover:bg-white/10 hover:text-white transition">🇯🇵 日本語</a></li>
+                            <li><a href="#" class="block px-4 py-1.5 hover:bg-white/10 hover:text-white transition">🇨🇳 中文</a></li>
+                            <li><a href="#" class="block px-4 py-1.5 hover:bg-white/10 hover:text-white transition">🇫🇷 Français</a></li>
+                            <li><a href="#" class="block px-4 py-1.5 hover:bg-white/10 hover:text-white transition">🇩🇪 Deutsch</a></li>
+                            <li><a href="#" class="block px-4 py-1.5 hover:bg-white/10 hover:text-white transition">🇪🇸 Español</a></li>
+                            <li><a href="#" class="block px-4 py-1.5 hover:bg-white/10 hover:text-white transition">🇮🇹 Italiano</a></li>
+                            <li><a href="#" class="block px-4 py-1.5 hover:bg-white/10 hover:text-white transition">🇦🇪 العربية</a></li>
+                            <li><a href="#" class="block px-4 py-1.5 hover:bg-white/10 hover:text-white transition">🇷🇺 Русский</a></li>
+                        </ul>
+                    </div>
+                </div>
+                <a href="login.html" class="flex items-center gap-2 bg-white text-brand-blue px-6 py-2.5 rounded-lg hover:bg-brand-accent transition shadow-lg">
+                    <span>로그인</span>
+                    <i class="fa-solid fa-arrow-right-to-bracket"></i>
+                </a>
+            </div>
+        </div>
+    </header>
+
+    <!-- 메인 컨텐츠 영역 -->
+    <main class="flex-grow pt-28 pb-20 px-6 relative z-10 max-w-7xl mx-auto w-full">
+        
+        <!-- 대형 검색 및 필터 섹션 -->
+        <section class="glass-card rounded-3xl p-8 md:p-12 shadow-2xl border border-white/20 mb-12 relative overflow-hidden bg-gradient-to-br from-brand-dark/80 to-brand-blue/50">
+            <div class="absolute top-0 right-0 w-64 h-64 bg-blue-400/20 rounded-full blur-[80px] pointer-events-none"></div>
+            
+            <div class="relative z-10 flex flex-col md:flex-row gap-8 items-end justify-between">
+                <div class="w-full md:w-2/3">
+                    <h1 class="text-3xl md:text-5xl font-black mb-4 tracking-tight"><i class="fa-solid fa-magnifying-glass text-blue-300 mr-2"></i> 명품 경매 검색</h1>
+                    <p class="text-white/70 text-lg mb-6">구매하고자 하는 <strong class="text-white">최대 예산</strong>을 입력하시면 조건에 맞는 상품만 필터링됩니다.</p>
+                    
+                    <!-- 대형 한화 가격 검색창 -->
+                    <div class="relative w-full max-w-lg">
+                        <div class="absolute inset-y-0 left-0 pl-6 flex items-center pointer-events-none">
+                            <span class="text-2xl font-bold text-white/50">₩</span>
+                        </div>
+                        <input type="number" id="priceFilter" placeholder="예: 1500000" class="w-full bg-black/30 border-2 border-blue-400/50 rounded-2xl py-5 pl-14 pr-24 text-white text-2xl font-bold placeholder-white/20 focus:outline-none focus:border-white focus:bg-black/50 transition shadow-inner">
+                        <div class="absolute inset-y-0 right-0 pr-6 flex items-center pointer-events-none">
+                            <span class="text-sm font-bold text-blue-300">원 이하</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 경매 방식 선택 롤박스 -->
+                <div class="w-full md:w-1/3 flex flex-col">
+                    <label class="text-sm text-white/60 mb-2 font-bold tracking-widest uppercase">경매 진행 방식</label>
+                    <div class="relative">
+                        <select id="typeFilter" class="w-full bg-white/10 border-2 border-white/20 rounded-xl px-5 py-4 text-white text-lg font-bold focus:outline-none focus:border-blue-400 appearance-none shadow-inner cursor-pointer backdrop-blur-md">
+                            <option value="buy_it_now" class="text-black" selected>즉시구매 가능 상품</option>
+                            <option value="live" class="text-black">경매 진행 중 상품</option>
+                            <option value="all" class="text-black">전체보기</option>
+                        </select>
+                        <i class="fa-solid fa-chevron-down absolute right-5 top-1/2 transform -translate-y-1/2 text-white/50 pointer-events-none text-lg"></i>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 현재 검색 결과 요약 -->
+            <div class="mt-6 pt-6 border-t border-white/10 flex items-center justify-between text-sm">
+                <p class="text-white/70">총 <span id="resultCount" class="font-bold text-white text-lg mx-1">300</span>개의 상품이 검색되었습니다.</p>
+                <div class="flex gap-2">
+                    <span class="bg-blue-500/20 text-blue-300 border border-blue-500/30 px-3 py-1 rounded text-xs font-bold">최고가순 정렬</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- 상품 그리드: 데스크탑 기준 한 줄에 6개 -->
+        <div id="auctionList" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-6 md:gap-8">
+            <!-- JavaScript를 통해 동적으로 렌더링 됩니다. -->
+        </div>
+
+    </main>
+
+    <!-- 하단 푸터 -->
+    <footer class="border-t border-white/10 bg-brand-dark/40 pt-16 pb-10 text-white/60 text-xs">
+        <div class="max-w-7xl mx-auto px-6">
+            <div class="flex flex-col md:flex-row items-center justify-between flex-wrap gap-4">
+                <p class="font-mono text-[10px]">Copyright &copy; 2026 SISA LLC. All Rights Reserved.</p>
+            </div>
+        </div>
+    </footer>
+
+    <!-- 로직 스크립트 -->
+    <script>
+        // 1. 300개 상품 CSV 데이터
+        const csvData = `가격(KRW),브랜드,모델명,경매거래소
+100000,Gucci,GG 캔버스 카드지갑 (B급),야후옥션(Japan)
+100000,Prada,사피아노 레더 키링,이베이(USA)
+100000,Louis Vuitton,모노그램 넥타이,코메효(Japan)
+100000,Hermes,트윌리 스카프 (오염 약간),다이코쿠야(Japan)
+100000,Tiffany & Co.,리턴 투 티파니 실버 팔찌,베스티에르 콜렉티브
+100000,Salvatore Ferragamo,간치니 실크 스카프,더리얼리얼
+100000,Burberry,빈티지 체크 동전지갑,에코링(Japan)
+100000,Fendi,FF 로고 캔버스 파우치,세컨스트리트(Japan)
+100000,Bottega Veneta,인트레치아토 가죽 팔찌,브랜도프(Japan)
+100000,Dior,빈티지 로고 목걸이 (도금 벗겨짐),야후옥션(Japan)
+200000,Gucci,마이크로 시마 레더 반지갑,코메효(Japan)
+200000,Prada,나일론 코스메틱 파우치,이베이(USA)
+200000,Louis Vuitton,다미에 에벤 키홀더,다이코쿠야(Japan)
+200000,Hermes,클릭아슈 뱅글 (스크래치),베스티에르 콜렉티브
+200000,Balenciaga,클래식 오스나 카드홀더,더리얼리얼
+200000,Celine,마카담 캔버스 클러치 (빈티지),에코링(Japan)
+200000,Saint Laurent,모노그램 은장 로고 브로치,세컨스트리트(Japan)
+200000,Miu Miu,마테라세 미니 카드지갑,브랜도프(Japan)
+200000,Bottega Veneta,인트레치아토 키링,야후옥션(Japan)
+200000,Cartier,머스트 드 까르띠에 스카프,코메효(Japan)
+300000,Gucci,인터로킹 G 실버 목걸이,이베이(USA)
+300000,Louis Vuitton,모노그램 캔버스 벨트,다이코쿠야(Japan)
+300000,Prada,사피아노 레더 장지갑,베스티에르 콜렉티브
+300000,Burberry,빈티지 노바체크 셔츠,더리얼리얼
+300000,Ferragamo,바라 리본 펌프스 (중고),에코링(Japan)
+300000,Dior,오블리크 미차 스카프,세컨스트리트(Japan)
+300000,Fendi,주카 패턴 머플러,브랜도프(Japan)
+300000,Givenchy,안티고나 미니 파우치,야후옥션(Japan)
+300000,Marni,트렁크 미니 카드지갑,코메효(Japan)
+300000,Valentino,락스터드 레더 팔찌,이베이(USA)
+400000,Louis Vuitton,에피 레더 브라짜 워렛,다이코쿠야(Japan)
+400000,Gucci,GG 슈프림 베이스볼 캡,베스티에르 콜렉티브
+400000,Balenciaga,스피드러너 스니커즈 (B급),더리얼리얼
+400000,Prada,테수토 나일론 호보백 (구형),에코링(Japan)
+400000,Bottega Veneta,인트레치아토 반지갑,세컨스트리트(Japan)
+400000,Saint Laurent,금장 YSL 로고 벨트,브랜도프(Japan)
+400000,Celine,트리오페 캔버스 카드홀더,야후옥션(Japan)
+400000,Hermes,바스티아 코인 퍼스,코메효(Japan)
+400000,Rolex,빈티지 스푼 반지 커스텀,이베이(USA)
+400000,Loewe,아나그램 가죽 브로치,다이코쿠야(Japan)
+500000,Gucci,홀스빗 1955 카드지갑,베스티에르 콜렉티브
+500000,Louis Vuitton,포쉐트 악세수아 (스트랩 없음),더리얼리얼
+500000,Prada,러쉬 스니커즈,에코링(Japan)
+500000,Maison Margiela,독일군 레플리카 스니커즈,세컨스트리트(Japan)
+500000,Dior,CD 로고 펄 귀걸이,브랜도프(Japan)
+500000,Chanel,까멜리아 레더 브로치,야후옥션(Japan)
+500000,Fendi,FF 로고 볼캡,코메효(Japan)
+500000,Cartier,트리니티 링 (사이즈 작음),이베이(USA)
+500000,Hermes,에르메스 H벨트 리버서블 (스트랩만),다이코쿠야(Japan)
+500000,Balenciaga,트랙 슈즈 (화이트),베스티에르 콜렉티브
+600000,Louis Vuitton,모노그램 스피디 25 (빈티지),더리얼리얼
+600000,Gucci,GG 마몽 마틀라세 미니백 (B급),에코링(Japan)
+600000,Prada,사피아노 트라이앵글 로고 클러치,세컨스트리트(Japan)
+600000,Saint Laurent,모노그램 퀄팅 카드지갑,브랜도프(Japan)
+600000,Bottega Veneta,카세트 미니 지갑,야후옥션(Japan)
+600000,Celine,마카담 미니 보스턴백,코메효(Japan)
+600000,Burberry,빈티지 체크 크로스바디백,이베이(USA)
+600000,Hermes,클리퍼 쿼츠 시계 (여성용, 콤비),다이코쿠야(Japan)
+600000,Dior,빈티지 허니콤 숄더백,베스티에르 콜렉티브
+600000,Tiffany & Co.,18K 골드 오픈하트 목걸이 미니,더리얼리얼
+700000,Chanel,클래식 캐비어 카드지갑,에코링(Japan)
+700000,Louis Vuitton,알마 PM 모노그램 (사용감 많음),세컨스트리트(Japan)
+700000,Gucci,오피디아 GG 크로스백,브랜도프(Japan)
+700000,Prada,리나일론 버킷햇,야후옥션(Japan)
+700000,Balenciaga,트리플 S 스니커즈 클리어솔,코메효(Japan)
+700000,Cartier,산토스 옥타곤 빈티지 쿼츠,이베이(USA)
+700000,Hermes,실크인 컴팩트 지갑,다이코쿠야(Japan)
+700000,Saint Laurent,업타운 파우치,베스티에르 콜렉티브
+700000,Goyard,생수피 카드지갑,더리얼리얼
+700000,Bottega Veneta,인트레치아토 서류가방 (구형),에코링(Japan)
+800000,Louis Vuitton,네버풀 MM (파우치 없음, 태닝 진행),세컨스트리트(Japan)
+800000,Gucci,조르단 레더 로퍼,브랜도프(Japan)
+800000,Prada,사피아노 럭스 토트백 (블랙),야후옥션(Japan)
+800000,Dior,새들 카드홀더 디올 오블리크,코메효(Japan)
+800000,Celine,트리오백 라지 (램스킨),이베이(USA)
+800000,Hermes,칼비 듀오 카드지갑,다이코쿠야(Japan)
+800000,Fendi,몬트레조 미니 버킷백 (오염),베스티에르 콜렉티브
+800000,Rolex,프리시전 수동 빈티지 시계,더리얼리얼
+800000,Maison Margiela,5AC 마이크로 백,에코링(Japan)
+800000,Thom Browne,사선 완장 가디건 (울),세컨스트리트(Japan)
+900000,Chanel,빈티지 CC 마크 귀걸이 (빅사이즈),브랜도프(Japan)
+900000,Louis Vuitton,다미에 그라파이트 믹 마크로,야후옥션(Japan)
+900000,Gucci,재키 1961 호보백 (빈티지 복각),코메효(Japan)
+900000,Bottega Veneta,아르코 미니 토트백 (사용감),이베이(USA)
+900000,Cartier,러브 링 18K 화이트골드,다이코쿠야(Japan)
+900000,Prada,클레오 브러시드 레더 숄더백 (B급),베스티에르 콜렉티브
+900000,Saint Laurent,루 카메라백,더리얼리얼
+900000,Balenciaga,아워글래스 XS (스크래치),에코링(Japan)
+900000,Celine,상글 버킷백 스몰,세컨스트리트(Japan)
+900000,Hermes,클릭 HH 뱅글 남성용,브랜도프(Japan)
+1000000,Louis Vuitton,키폴 반돌리에 45 (여행가방),야후옥션(Japan)
+1000000,Gucci,디오니서스 GG 수프림 미니,코메효(Japan)
+1000000,Chanel,클래식 플랩 반지갑 캐비어,이베이(USA)
+1000000,Dior,레이디 디올 파우치 체인백,다이코쿠야(Japan)
+1000000,Prada,갤러리아 사피아노 레더 마이크로백,베스티에르 콜렉티브
+1000000,Hermes,에르백 PM (캔버스 오염),더리얼리얼
+1000000,Cartier,탱크 머스트 워치 (단종 쿼츠),에코링(Japan)
+1000000,Fendi,바게트백 주카 캔버스 (빈티지),세컨스트리트(Japan)
+1000000,Goyard,세나 클러치 MM,브랜도프(Japan)
+1000000,Rolex,오이스터 데이트 6694 (수동),야후옥션(Japan)
+1100000,Louis Vuitton,포쉐트 메티스 모노그램 (사용감),코메효(Japan)
+1100000,Gucci,마몽 마틀라세 숄더백 스몰,이베이(USA)
+1100000,Bottega Veneta,패디드 카세트백 (가죽 긁힘),다이코쿠야(Japan)
+1100000,Celine,벨트백 나노,베스티에르 콜렉티브
+1100000,Saint Laurent,선셋백 미디엄 (은장),더리얼리얼
+1100000,Prada,리나일론 バックパック (미디움),에코링(Japan)
+1100000,Dior,오블리크 북토트 스몰 (모서리 마모),세컨스트리트(Japan)
+1100000,Hermes,오란 샌들 (미사용 신품급),브랜도프(Japan)
+1100000,Chanel,깜봉 라인 토트백 (빈티지),야후옥션(Japan)
+1100000,Balenciaga,르 카골 미니 숄더백,코메효(Japan)
+1200000,Louis Vuitton,크로아제트 다미에 아주르,이베이(USA)
+1200000,Chanel,보이샤넬 카드지갑 (신형),다이코쿠야(Japan)
+1200000,Gucci,홀스빗 1955 숄더백 (캔버스),베스티에르 콜렉티브
+1200000,Goyard,생루이 토트백 PM,더리얼리얼
+1200000,Celine,러기지 나노 쇼퍼백,에코링(Japan)
+1200000,Cartier,발롱블루 28mm 스틸 (초기형),세컨스트리트(Japan)
+1200000,Hermes,팝아슈 미니 목걸이 세트,브랜도프(Japan)
+1200000,Prada,브러시드 레더 로퍼 (삼각로고),야후옥션(Japan)
+1200000,Dior,카로 마이크로백,코메효(Japan)
+1200000,Bottega Veneta,조디백 미니 (인트레치아토),이베이(USA)
+1300000,Louis Vuitton,온더고 PM (모노그램 앙프렝뜨, B급),다이코쿠야(Japan)
+1300000,Chanel,클래식 WOC (램스킨, 스크래치 다수),베스티에르 콜렉티브
+1300000,Hermes,가든파티 36 (캔버스/레더 콤비),더리얼리얼
+1300000,Gucci,뱀부 1947 탑핸들 백 스몰,에코링(Japan)
+1300000,Saint Laurent,니키백 베이비 (크링클 레더),세컨스트리트(Japan)
+1300000,Celine,트리오페 숄더백 (틴 사이즈),브랜도프(Japan)
+1300000,Rolex,데이트저스트 1601 (콤비, 빈티지 수리요망),야후옥션(Japan)
+1300000,Dior,새들백 오블리크 (스트랩 별도),코메효(Japan)
+1300000,Cartier,저스트 앵 끌루 링 스몰,이베이(USA)
+1300000,Fendi,피카부 미니 (내부 오염),다이코쿠야(Japan)
+1400000,Louis Vuitton,마이락미 체인 숄더백,베스티에르 콜렉티브
+1400000,Chanel,코코핸들 미니 (핸들 까짐),더리얼리얼
+1400000,Goyard,미니 앙주 토트백 (양면),에코링(Japan)
+1400000,Hermes,피코탄 록 18 PM (끌레망스, 형태 무너짐),세컨스트리트(Japan)
+1400000,Dior,바비백 미디움 (블랙),브랜도프(Japan)
+1400000,Prada,라피아 토트백 (여름 한정판),야후옥션(Japan)
+1400000,Gucci,GG 마몽 미니 탑핸들 백,코메효(Japan)
+1400000,Bottega Veneta,안디아모 스몰 (스크래치),이베이(USA)
+1400000,Cartier,팬더 드 까르띠에 스몰 워치 (구형),다이코쿠야(Japan)
+1400000,Celine,클래식 박스 스몰,베스티에르 콜렉티브
+1500000,Louis Vuitton,네오노에 MM 모노그램,더리얼리얼
+1500000,Chanel,가브리엘 호보백 스몰 (빈티지 카프스킨),에코링(Japan)
+1500000,Hermes,에블린 TPM (아마존 스트랩),세컨스트리트(Japan)
+1500000,Dior,레이디 디올 미니 (페이턴트, 이염),브랜도프(Japan)
+1500000,Gucci,오피디아 GG 스몰 백팩,야후옥션(Japan)
+1500000,Saint Laurent,케이트 태슬 체인백,코메효(Japan)
+1500000,Rolex,에어킹 14000,이베이(USA)
+1500000,Goyard,플뤼메 크로스백,다이코쿠야(Japan)
+1500000,Bottega Veneta,만다린 인트레치아토 크로스백,베스티에르 콜렉티브
+1500000,Van Cleef & Arpels,빈티지 알함브라 목걸이 (오닉스),더리얼리얼
+1600000,Louis Vuitton,록키 BB (모노그램/블랙),에코링(Japan)
+1600000,Chanel,클래식 플랩백 스몰 (램스킨, 복원품),세컨스트리트(Japan)
+1600000,Hermes,클릭 크랙 H 팔찌 로즈골드,브랜도프(Japan)
+1600000,Dior,북토트 미디움 오블리크,야후옥션(Japan)
+1600000,Prada,두블레 사피아노 레더 토트백,코메효(Japan)
+1600000,Celine,16 세즈백 스몰,이베이(USA)
+1600000,Fendi,바게트 체인 미디엄,다이코쿠야(Japan)
+1600000,Cartier,탱크 솔로 스틸 스몰,베스티에르 콜렉티브
+1600000,Gucci,재키 1961 미니 백,더리얼리얼
+1600000,Bulgari,비제로원 링 3밴드,에코링(Japan)
+1700000,Louis Vuitton,도핀 MM (캔버스 마모),세컨스트리트(Japan)
+1700000,Chanel,트렌디 CC 탑핸들 WOC,브랜도프(Japan)
+1700000,Hermes,가든파티 30 (네고다, 사용감),야후옥션(Japan)
+1700000,Goyard,생루이 토트백 GM,코메효(Japan)
+1700000,Dior,카로백 스몰 (화이트),이베이(USA)
+1700000,Saint Laurent,삭 드 쥬르 나노,다이코쿠야(Japan)
+1700000,Bottega Veneta,마운트 숄더백,베스티에르 콜렉티브
+1700000,Rolex,오이스터 퍼페추얼 31mm (초기형),더리얼리얼
+1700000,Celine,퀴르 트리오페 오벌 펄스,에코링(Japan)
+1700000,Omega,씨마스터 다이버 300 (구형),세컨스트리트(Japan)
+1800000,Louis Vuitton,부아뜨 샤포 소플 PM,브랜도프(Japan)
+1800000,Chanel,보이샤넬 미디움 (캐비어, 연식 오래됨),야후옥션(Japan)
+1800000,Hermes,린디 30 (끌레망스, 모서리 까짐),코메효(Japan)
+1800000,Dior,새들 메신저백 맨즈,이베이(USA)
+1800000,Gucci,구찌 다이애나 미니 토트백,다이코쿠야(Japan)
+1800000,Prada,클레오 자카드 숄더백,베스티에르 콜렉티브
+1800000,Cartier,프랑세즈 콤비 스몰,더리얼리얼
+1800000,Fendi,피카부 아이씨유 스몰 (내부 얼룩),에코링(Japan)
+1800000,Van Cleef & Arpels,매직 알함브라 귀걸이,세컨스트리트(Japan)
+1800000,Balenciaga,르 카골 스몰 숄더백,브랜도프(Japan)
+1900000,Louis Vuitton,쿠상 PM (양가죽 흠집),야후옥션(Japan)
+1900000,Chanel,클래식 플랩 WOC 캐비어 은장,코메효(Japan)
+1900000,Hermes,에블린 29 PM (앱솜 가죽),이베이(USA)
+1900000,Dior,레이디 디올 미디움 (램스킨, 이염),다이코쿠야(Japan)
+1900000,Goyard,하디 펫 캐리어 백,베스티에르 콜렉티브
+1900000,Celine,카바스 드 프랑스 백,더리얼리얼
+1900000,Rolex,데이트저스트 16233 (알맹이만),에코링(Japan)
+1900000,Saint Laurent,아이카백 라지,세컨스트리트(Japan)
+1900000,Bottega Veneta,루프 미니 크로스백,브랜도프(Japan)
+1900000,Cartier,산토스 드 까르띠에 갈베 스틸,야후옥션(Japan)
+2000000,Louis Vuitton,알마 BB (모노그램 베르니),코메효(Japan)
+2000000,Chanel,19백 라지 (램스킨, 오염 다수),이베이(USA)
+2000000,Hermes,볼리드 31 (에프솜, 빈티지),다이코쿠야(Japan)
+2000000,Dior,30 몽테인 백,베스티에르 콜렉티브
+2000000,Gucci,어태치 라지 숄더백,더리얼리얼
+2000000,Prada,심볼 자카드 스몰 토트백,에코링(Japan)
+2000000,Rolex,익스플로러 1 (구구형 114270),세컨스트리트(Japan)
+2000000,Van Cleef & Arpels,스위트 알함브라 펜던트 로즈골드,브랜도프(Japan)
+2000000,Fendi,피카부 에센셜리,야후옥션(Japan)
+2000000,Cartier,러브 브레이슬릿 SM,코메효(Japan)
+2100000,Louis Vuitton,카퓌신 BB (트리용 가죽, 모서리 까짐),이베이(USA)
+2100000,Chanel,샤넬 22백 스몰 (카프스킨),다이코쿠야(Japan)
+2100000,Hermes,집시에르 28 (트리용 끌레망스),베스티에르 콜렉티브
+2100000,Dior,레이디 D-Lite 미디엄 오블리크,더리얼리얼
+2100000,Celine,트리오페 체인 숄더백,에코링(Japan)
+2100000,Saint Laurent,맨해튼 숄더백,세컨스트리트(Japan)
+2100000,Goyard,벨베데르 PM 크로스백,브랜도프(Japan)
+2100000,Bottega Veneta,코블백,야후옥션(Japan)
+2100000,Rolex,데이데이트 18K 헤드 온리 (빈티지),코메효(Japan)
+2100000,Bulgari,세르펜티 포에버 크로스백,이베이(USA)
+2200000,Louis Vuitton,트위스트 MM (에피 래더),다이코쿠야(Japan)
+2200000,Chanel,클래식 플랩백 점보 (빈티지 램스킨),베스티에르 콜렉티브
+2200000,Hermes,에르백 우편마차 한정판,더리얼리얼
+2200000,Dior,바비 이스트웨스트 백,에코링(Japan)
+2200000,Gucci,뱀부 1947 미니 탑핸들 백,세컨스트리트(Japan)
+2200000,Cartier,팬더 드 까르띠에 미니 스틸,브랜도프(Japan)
+2200000,Van Cleef & Arpels,빈티지 알함브라 팔찌 (5모티브),야후옥션(Japan)
+2200000,Fendi,바게트 1997 백,코메효(Japan)
+2200000,Prada,사피아노 레더 토트백 라지,이베이(USA)
+2200000,Rolex,오이스터 퍼페추얼 36mm (116000),다이코쿠야(Japan)
+2300000,Louis Vuitton,쁘띠뜨 말 숩플,베스티에르 콜렉티브
+2300000,Chanel,가브리엘 백팩 스몰 (사용감 많음),더리얼리얼
+2300000,Hermes,할잔 31 (끌레망스),에코링(Japan)
+2300000,Dior,레이디 디올 마이크로,세컨스트리트(Japan)
+2300000,Goyard,볼테르 토트백,브랜도프(Japan)
+2300000,Celine,클래식 트리오페 백 스몰,야후옥션(Japan)
+2300000,Saint Laurent,카산드라 탑핸들 백 미니,코메효(Japan)
+2300000,Cartier,탱크 머스트 스몰 (신형 스틸),이베이(USA)
+2300000,Bottega Veneta,사르딘 미니 백,다이코쿠야(Japan)
+2300000,Rolex,서브마리너 논데이트 (빈티지 5513),베스티에르 콜렉티브
+2400000,Louis Vuitton,스피디 반돌리에 25 (앙프렝뜨),더리얼리얼
+2400000,Chanel,보이샤넬 스몰 캐비어 금장,에코링(Japan)
+2400000,Hermes,피코탄 록 22 MM (사용감 약간),세컨스트리트(Japan)
+2400000,Dior,카로백 라지,브랜도프(Japan)
+2400000,Gucci,재키 1961 스몰 숄더백 (파이톤 콤비),야후옥션(Japan)
+2400000,Van Cleef & Arpels,기요세 빈티지 알함브라 목걸이,코메효(Japan)
+2400000,Rolex,데이데이트 (가죽스트랩 교체품),이베이(USA)
+2400000,Fendi,피카부 ISeeU 미디엄,다이코쿠야(Japan)
+2400000,Bulgari,비제로원 네크리스 18K 로즈골드,베스티에르 콜렉티브
+2400000,Cartier,발롱블루 33mm 오토매틱,더리얼리얼
+2500000,Louis Vuitton,포쉐트 메티스 (리버스 앙프렝뜨),에코링(Japan)
+2500000,Chanel,클래식 플랩백 미디움 (램스킨 퀼팅 무너짐),세컨스트리트(Japan)
+2500000,Hermes,볼리드 27 (앱솜, 모서리 까짐),브랜도프(Japan)
+2500000,Dior,레이디 D-Joy 스몰,야후옥션(Japan)
+2500000,Celine,퀴르 트리오페 스몰 버킷백,코메효(Japan)
+2500000,Goyard,아르투아 백 PM,이베이(USA)
+2500000,Bottega Veneta,안디아모 미디움,다이코쿠야(Japan)
+2500000,Rolex,밀가우스 116400 (폴리싱 요망),베스티에르 콜렉티브
+2500000,Saint Laurent,제이미 체인백 라지,더리얼리얼
+2500000,Cartier,탱크 아메리칸 스몰,에코링(Japan)
+2600000,Louis Vuitton,온더고 MM (모노그램 앙프렝뜨),세컨스트리트(Japan)
+2600000,Chanel,19백 미디움 (고트스킨),브랜도프(Japan)
+2600000,Hermes,린디 26 (스위프트 가죽),야후옥션(Japan)
+2600000,Dior,새들백 미디엄 그레인 카프스킨,코메효(Japan)
+2600000,Van Cleef & Arpels,빈티지 알함브라 다이아 1포인트,이베이(USA)
+2600000,Rolex,데이트저스트 116234 (텐포인트 다이아),다이코쿠야(Japan)
+2600000,Fendi,바게트 백 라지 (자수 디테일),베스티에르 콜렉티브
+2600000,Gucci,홀스빗 1955 스몰 탑핸들백 (크로커다일 패턴),더리얼리얼
+2600000,Cartier,산토스 두몽 스몰 (로즈골드 콤비),에코링(Japan)
+2600000,Bulgari,세르펜티 튜보가스 싱글 스파이럴 워치,세컨스트리트(Japan)
+2700000,Louis Vuitton,마이락미 BB,브랜도프(Japan)
+2700000,Chanel,코코핸들 스몰 (쉐브론 퀼팅),야후옥션(Japan)
+2700000,Hermes,켈리 투고 지갑 (스크래치),코메효(Japan)
+2700000,Dior,레이디 디올 미니 (램스킨),이베이(USA)
+2700000,Goyard,사이공 백 미니,다이코쿠야(Japan)
+2700000,Rolex,오이스터 퍼페추얼 39mm (114300),베스티에르 콜렉티브
+2700000,Celine,클래식 트리오페 백 틴,더리얼리얼
+2700000,Bottega Veneta,칼리메로 미니 버킷백,에코링(Japan)
+2700000,Van Cleef & Arpels,프리볼 펜던트 스몰,세컨스트리트(Japan)
+2700000,Cartier,클래쉬 드 까르띠에 링 스몰,브랜도프(Japan)
+2800000,Louis Vuitton,카퓌신 MM (갈렛 컬러),야후옥션(Japan)
+2800000,Chanel,가브리엘 호보백 스몰 (빈티지 카프스킨, 상태양호),코메효(Japan)
+2800000,Hermes,에블린 16 TPM (끌레망스, 상태양호),이베이(USA)
+2800000,Dior,북토트 라지 오블리크 자수,다이코쿠야(Japan)
+2800000,Rolex,서브마리너 데이트 (16610 구형, 오버홀 요망),베스티에르 콜렉티브
+2800000,Gucci,디오니서스 스몰 (파이톤),더리얼리얼
+2800000,Fendi,피카부 아이씨유 미디움 (에센셜리),에코링(Japan)
+2800000,Cartier,팬더 드 까르띠에 스몰 워치 (다이아 베젤 커스텀),세컨스트리트(Japan)
+2800000,Goyard,알팡 미니 백팩,브랜도프(Japan)
+2800000,Saint Laurent,카산드라 탑핸들 미디움,야후옥션(Japan)
+2900000,Louis Vuitton,락미 에버 미니,코메효(Japan)
+2900000,Chanel,샤넬 22백 미디움 (카프스킨),이베이(USA)
+2900000,Hermes,콘스탄스 롱 투고 지갑,다이코쿠야(Japan)
+2900000,Dior,바비백 미디움 오블리크,베스티에르 콜렉티브
+2900000,Rolex,지엠티 마스터 (구형 16710 페프시 인서트 교체),더리얼리얼
+2900000,Van Cleef & Arpels,매직 알함브라 롱 목걸이,에코링(Japan)
+2900000,Celine,16 세즈백 미디엄,세컨스트리트(Japan)
+2900000,Cartier,탱크 루이 까르띠에 스몰 (단종 쿼츠),브랜도프(Japan)
+2900000,Bottega Veneta,홉 라지 숄더백,야후옥션(Japan)
+2900000,Bulgari,디바스 드림 네크리스 (다이아몬드 파베),코메효(Japan)
+3000000,Louis Vuitton,트위스트 원핸들 PM,이베이(USA)
+3000000,Chanel,클래식 플랩백 스몰 (캐비어 스킨, 은장),다이코쿠야(Japan)
+3000000,Hermes,가든파티 30 (골드 컬러, 네고다),베스티에르 콜렉티브
+3000000,Dior,레이디 디올 미디움 (블랙 램스킨, 금장),더리얼리얼
+3000000,Rolex,데이트저스트 36mm (126234 쥬빌리, 스크래치 다수),에코링(Japan)
+3000000,Cartier,러브 브레이슬릿 레귤러 사이즈,세컨스트리트(Japan)
+3000000,Goyard,쁘띠 플로 버킷백,브랜도프(Japan)
+3000000,Van Cleef & Arpels,기요세 5모티브 빈티지 알함브라 팔찌,야후옥션(Japan)
+3000000,Fendi,피카부 스몰 엑조틱 레더,코메효(Japan)
+3000000,Hermes,콘스탄스 미니 (복원 이력 있음),이베이(USA)`;
+
+        // 2. 가상 이미지 풀
+        const imgUrls = [
+            'https://images.unsplash.com/photo-1584916201218-f4242ceb4809?auto=format&fit=crop&w=400&q=80',
+            'https://images.unsplash.com/photo-1548036328-c9fa89d128fa?auto=format&fit=crop&w=400&q=80',
+            'https://images.unsplash.com/photo-1523170335258-f5ed11844a49?auto=format&fit=crop&w=400&q=80',
+            'https://images.unsplash.com/photo-1549465220-1a8b9238cd48?auto=format&fit=crop&w=400&q=80',
+            'https://images.unsplash.com/photo-1524805444758-089113d48a6d?auto=format&fit=crop&w=400&q=80',
+            'https://images.unsplash.com/photo-1515562141207-7a88fb7ce338?auto=format&fit=crop&w=400&q=80',
+            'https://images.unsplash.com/photo-1615655406736-b37c4fabf923?auto=format&fit=crop&w=400&q=80',
+            'https://images.unsplash.com/photo-1605100804763-247f67b2548e?auto=format&fit=crop&w=400&q=80',
+            'https://images.unsplash.com/photo-1582562124533-34567411fe98?auto=format&fit=crop&w=400&q=80',
+            'https://images.unsplash.com/photo-1511499767150-a48a237f0083?auto=format&fit=crop&w=400&q=80',
+            'https://images.unsplash.com/photo-1594035910387-fea47794261f?auto=format&fit=crop&w=400&q=80',
+            'https://images.unsplash.com/photo-1600003014755-ba31aa59c4b6?auto=format&fit=crop&w=400&q=80'
+        ];
+
+        const formatMoney = (num) => new Intl.NumberFormat('ko-KR').format(num);
+
+        // 3. 데이터 파싱 및 가공
+        const rows = csvData.trim().split('\n').slice(1);
+        let items = rows.map((row, index) => {
+            const cols = row.split(',');
+            const krwPrice = parseInt(cols[0], 10);
+            
+            // 환율 1,300원 적용 USD 계산
+            const baseUsd = Math.round(krwPrice / 1300 / 10) * 10; 
+            
+            // 경매가(랜덤 40~95%) 1만 단위 반올림
+            const currentKrw = Math.floor(krwPrice * (0.4 + Math.random() * 0.55) / 10000) * 10000;
+            const currentUsd = Math.round(currentKrw / 1300 / 10) * 10;
+
+            const isLive = Math.random() > 0.4; // 60% 경매 진행중
+            const bids = Math.floor(Math.random() * 10) + 1; // 입찰수 1~10
+            
+            // 랜덤 종료 시간 할당 (현재 시간 + 1초~7일 사이)
+            const now = new Date().getTime();
+            const randomTimeToAdd = Math.floor(Math.random() * (7 * 24 * 60 * 60 * 1000)) + 5000; // 최소 5초 확보
+            const endTime = now + randomTimeToAdd;
+
+            return {
+                id: index,
+                buyItNowKrw: krwPrice,
+                buyItNowUsd: baseUsd,
+                currentKrw: currentKrw,
+                currentUsd: currentUsd,
+                brand: cols[1],
+                model: cols[2],
+                exchange: cols[3],
+                isLive: isLive,
+                bids: bids,
+                endTime: endTime,
+                img: imgUrls[Math.floor(Math.random() * imgUrls.length)]
+            };
+        });
+
+        // 높은 가격순(내림차순) 정렬
+        items.sort((a, b) => b.buyItNowKrw - a.buyItNowKrw);
+
+        // 4. 렌더링 함수
+        function renderAuctions() {
+            const container = document.getElementById('auctionList');
+            let html = '';
+
+            items.forEach((item, index) => {
+                item.renderIndex = index; 
+
+                const badgeHtml = item.isLive 
+                    ? `<span class="bg-yellow-500 text-black text-[10px] font-bold px-2 py-1 rounded shadow-lg absolute top-3 left-3 z-10">경매 진행중</span>`
+                    : `<span class="bg-blue-500 text-white text-[10px] font-bold px-2 py-1 rounded shadow-lg absolute top-3 left-3 z-10">즉시구매 가능</span>`;
+                
+                html += `
+                <div class="auction-card glass-card rounded-2xl overflow-hidden group border border-white/10 flex flex-col sm:flex-row shadow-xl hover:bg-white/5 transition duration-300" data-price="${item.buyItNowKrw}" data-type="${item.isLive ? 'live' : 'buy_it_now'}">
+                    
+                    <div class="h-56 sm:h-auto sm:w-2/5 bg-gray-800 relative overflow-hidden">
+                        <img src="${item.img}" alt="${item.model}" class="absolute inset-0 w-full h-full object-cover z-0" onerror="this.onerror=null; this.src='https://images.unsplash.com/photo-1584916201218-f4242ceb4809?auto=format&fit=crop&w=400&q=80';">
+                        <div class="absolute inset-0 bg-black/40 group-hover:bg-black/20 transition duration-500 z-0"></div>
+                        ${badgeHtml}
+                        <div class="bg-black/50 backdrop-blur-md rounded-full w-8 h-8 flex items-center justify-center text-white/80 hover:text-red-400 transition absolute top-3 right-3 z-10 cursor-pointer"><i class="fa-regular fa-heart"></i></div>
+                        
+                        <!-- 샘플 이미지 안내 문구 -->
+                        <div class="absolute bottom-0 w-full bg-black/70 backdrop-blur-md py-2 px-3 text-center border-t border-white/10 z-10">
+                            <p class="text-[10px] text-white/90 font-medium tracking-wide">샘플이미지 입니다.<br class="sm:hidden"> 로그인 후 실제 사진을 확인 할 수 있습니다.</p>
+                        </div>
+                    </div>
+                    
+                    <div class="p-5 sm:w-3/5 flex flex-col justify-between w-full relative">
+                        <div>
+                            <p class="text-xs text-white/50 mb-1 font-medium">${item.exchange} · ${item.brand}</p>
+                            <h3 class="font-bold text-lg mb-3 leading-tight truncate" title="${item.model}">${item.model}</h3>
+                            
+                            <!-- 즉시 구매가 (고정) -->
+                            <div class="mb-1 bg-white/5 p-3 rounded-xl border border-white/5 relative overflow-hidden">
+                                <p class="text-[11px] text-white/60 mb-1 font-bold">즉시 구매가 (Buy It Now)</p>
+                                <div class="flex items-baseline gap-2 flex-wrap">
+                                    <span class="text-2xl font-black text-blue-300">₩${formatMoney(item.buyItNowKrw)}</span>
+                                    <span class="text-sm text-white/50 font-medium">/ $${formatMoney(item.buyItNowUsd)}</span>
+                                </div>
+                            </div>
+                            <!-- 환율 안내 문구 -->
+                            <p class="text-[10px] text-white/40 mb-4 ml-1 tracking-wide">* 평균 환율가격입니다.</p>
+                            
+                            <!-- 현재 경매가 (랜덤) 및 타이머 -->
+                            <div class="flex justify-between items-end mb-4 px-1">
+                                <div>
+                                    <p class="text-[10px] text-white/50 mb-1">현재 최고 입찰가</p>
+                                    <div class="flex items-baseline gap-2 flex-wrap">
+                                        <span class="text-lg font-bold text-white">₩${formatMoney(item.currentKrw)}</span>
+                                        <span class="text-xs text-white/40">($${formatMoney(item.currentUsd)})</span>
+                                    </div>
+                                    <p class="text-xs text-green-400 font-bold mt-1"><i class="fa-solid fa-gavel"></i> ${item.bids}명 입찰 중</p>
+                                </div>
+                                <div class="text-right">
+                                    <p class="text-[10px] text-white/50 mb-1">남은 시간</p>
+                                    <div id="timer-${index}" class="text-yellow-400 font-bold text-sm timer-text flex items-center gap-1 justify-end">
+                                        <i class="fa-regular fa-clock"></i> 계산중...
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- 버튼 영역 -->
+                        <div class="flex flex-col gap-2 mt-auto">
+                            <!-- 경매 참여 버튼 (로그인 이동) -->
+                            <button onclick="window.location.href='login.html'" class="w-full bg-brand-accent text-brand-blue font-bold py-3 rounded-xl hover:bg-white transition flex items-center justify-center gap-2 text-sm shadow-md">
+                                <i class="fa-solid fa-arrow-up"></i> 경매 참여 하기
+                            </button>
+                            <!-- 즉시 구매 버튼 -->
+                            <button onclick="alert('즉시 구매 화면으로 이동합니다.')" class="w-full bg-white/10 text-white border border-white/20 font-bold py-3 rounded-xl hover:bg-white/20 transition flex items-center justify-center gap-2 text-sm">
+                                <i class="fa-solid fa-bolt"></i> 즉시 구매
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                `;
+            });
+            container.innerHTML = html;
+        }
+
+        // 5. 타이머 업데이트 로직
+        function updateTimers() {
+            const now = new Date().getTime();
+            
+            items.forEach((item) => {
+                let distance = item.endTime - now;
+                
+                // 시간이 다 되면 새로운 종료 시간 할당 (1일 ~ 3일 사이로 무한 리셋)
+                if (distance < 0) {
+                    const newTimeToAdd = Math.floor(Math.random() * (3 * 24 * 60 * 60 * 1000)) + (24 * 60 * 60 * 1000);
+                    item.endTime = now + newTimeToAdd;
+                    distance = item.endTime - now;
+                    // 입찰수 1 추가 (자연스러운 갱신 연출)
+                    item.bids = item.bids < 20 ? item.bids + 1 : 1; 
+                }
+                
+                const days = Math.floor(distance / (1000 * 60 * 60 * 24));
+                const hours = Math.floor((distance % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+                const minutes = Math.floor((distance % (1000 * 60 * 60)) / (1000 * 60));
+                const seconds = Math.floor((distance % (1000 * 60)) / 1000);
+                
+                const timerEl = document.getElementById(`timer-${item.renderIndex}`);
+                if (timerEl) {
+                    // 시간이 임박(1시간 미만)하면 붉은색 깜빡임 효과
+                    if (days === 0 && hours === 0) {
+                        timerEl.className = "text-red-400 font-bold text-sm timer-text flex items-center gap-1 justify-end animate-pulse";
+                    } else {
+                        timerEl.className = "text-yellow-400 font-bold text-sm timer-text flex items-center gap-1 justify-end";
+                    }
+                    
+                    let timeStr = '';
+                    if (days > 0) timeStr += `${days}일 `;
+                    timeStr += `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+                    
+                    timerEl.innerHTML = `<i class="fa-regular fa-clock"></i> ${timeStr}`;
+                }
+            });
+        }
+
+        // 6. 가격 및 경매 방식 필터링 기능
+        function filterProducts() {
+            const maxKrwPriceInput = document.getElementById('priceFilter').value;
+            const maxKrwPrice = maxKrwPriceInput === '' ? Infinity : parseInt(maxKrwPriceInput, 10);
+            const auctionType = document.getElementById('typeFilter').value;
+            
+            let visibleCount = 0;
+            const cards = document.querySelectorAll('.auction-card');
+            
+            cards.forEach(card => {
+                const cardPrice = parseInt(card.getAttribute('data-price'), 10);
+                const cardType = card.getAttribute('data-type');
+                
+                let showByPrice = cardPrice <= maxKrwPrice;
+                let showByType = (auctionType === 'all') || (auctionType === 'buy_it_now') || (auctionType === cardType);
+
+                if (auctionType === 'live' && cardType !== 'live') {
+                    showByType = false;
+                }
+
+                if (showByPrice && showByType) {
+                    card.style.display = 'flex';
+                    visibleCount++;
+                } else {
+                    card.style.display = 'none';
+                }
+            });
+            
+            document.getElementById('resultCount').innerText = visibleCount;
+        }
+
+        // 7. 초기화 및 이벤트 리스너
+        document.addEventListener("DOMContentLoaded", () => {
+            renderAuctions();
+            
+            // 타이머 시작 (1초마다 업데이트)
+            updateTimers();
+            setInterval(updateTimers, 1000);
+            
+            // 기본 필터 세팅
+            document.getElementById('typeFilter').value = 'buy_it_now';
+            filterProducts(); 
+            
+            // 이벤트 연결
+            document.getElementById('priceFilter').addEventListener('input', filterProducts);
+            document.getElementById('typeFilter').addEventListener('change', filterProducts);
+        });
+
+    </script>
+</body>
+</html>
+

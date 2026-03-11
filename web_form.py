@@ -1315,7 +1315,7 @@ def agency_apply():
                     agency_login_id,
                     agency_login_pw,
                     10,
-                    datetime.utcnow(),
+                    datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                     "pending",
                 ),
             )
