@@ -4,3 +4,4 @@ Flask>=3.0.0
 gunicorn>=21.2.0
 reportlab>=4.0.0
 PyMySQL>=1.1.0
+cryptography>=42.0.0
