@@ -128,6 +128,29 @@ def init_db() -> None:
                 ) CHARACTER SET utf8mb4
                 """
             )
+            # K-VAN 대시보드 요약 정보 저장용 테이블
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS kvan_dashboard (
+                  id                     INT AUTO_INCREMENT PRIMARY KEY,
+                  captured_at            DATETIME,
+                  monthly_sales_amount   BIGINT,
+                  monthly_approved_count INT,
+                  monthly_approved_amount BIGINT,
+                  monthly_canceled_count INT,
+                  monthly_canceled_amount BIGINT,
+                  yesterday_sales_amount BIGINT,
+                  yesterday_approved_count INT,
+                  yesterday_approved_amount BIGINT,
+                  yesterday_canceled_count INT,
+                  yesterday_canceled_amount BIGINT,
+                  settlement_expected_amount BIGINT,
+                  today_settlement_expected_amount BIGINT,
+                  credit_amount          BIGINT,
+                  recent_tx_summary      TEXT
+                ) CHARACTER SET utf8mb4
+                """
+            )
         conn.commit()
         conn.close()
     except Exception as e:  # noqa: BLE001
@@ -137,7 +160,9 @@ def init_db() -> None:
 def trigger_auto_kvan_async(session_id: str | None = None) -> None:
     """결제 폼에서 주문 저장 후 auto_kvan.py 를 비동기로 실행."""
     try:
-        cmd = [sys.executable, "auto_kvan.py"]
+        # wsisa 폴더로 이동된 auto_kvan.py 절대경로
+        script_path = BASE_DIR / "wsisa" / "auto_kvan.py"
+        cmd = [sys.executable, str(script_path)]
         if session_id:
             cmd.append(str(session_id))
         # 백그라운드에서 조용히 실행 (웹 요청을 막지 않도록)
@@ -1507,6 +1532,11 @@ def admin():
                 except Exception as e:  # noqa: BLE001
                     message = f"상태 저장 중 오류가 발생했습니다: {e}"
                 else:
+                    # HQ에서 링크를 생성한 시점에도 자동 결제 매크로를 준비
+                    try:
+                        trigger_auto_kvan_async(session_id=session_id)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"HQ 세션 생성 시 auto_kvan 트리거 실패: {e}")
                     if amount:
                         message = "결제요청 페이지 링크가 생성되었습니다. 링크를 복사하여 고객에게 전달하세요."
                     else:
@@ -1734,7 +1764,8 @@ def admin():
                         결제 요청 링크
                       </div>
                       <div class="link-box">
-                        <div class="link-text" id="pay-link-{{ loop.index }}">{{ base_url }}{{ url_for('pay', session_id=s.id) }}</div>
+                        {% set kvan_link = s.kvan_link or (base_url ~ url_for('pay', session_id=s.id)) %}
+                        <div class="link-text" id="pay-link-{{ loop.index }}">{{ kvan_link }}</div>
                         <button type="button" class="btn-pill btn-secondary" onclick="copyPayLink('pay-link-{{ loop.index }}')">복사</button>
                       </div>
                       <form method="post" action="{{ url_for('admin') }}" style="margin-top:6px; display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
@@ -2008,6 +2039,19 @@ def hq_admin():
     agencies = state.get("agencies") or []
     transactions = state.get("transactions") or []
     message = ""
+
+    # 최신 K-VAN 대시보드 스냅샷 1건 조회
+    latest_dashboard = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM kvan_dashboard ORDER BY captured_at DESC LIMIT 1"
+            )
+            latest_dashboard = cur.fetchone()
+        conn.close()
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] kvan_dashboard 조회 실패: {e}")
 
     if request.method == "POST":
         action = request.form.get("action", "").strip()
@@ -2648,6 +2692,99 @@ def hq_admin():
             {% endif %}
           </section>
 
+          <!-- 5. K-VAN 대시보드 요약 (공유용) -->
+          <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
+            <div class="flex items-center justify-between mb-3">
+              <h2 class="text-lg font-semibold flex items-center gap-2">
+                <i class="fa-solid fa-chart-line text-brand-accent"></i> K-VAN 대시보드 요약
+              </h2>
+              <p class="text-[11px] text-white/60">자동 결제 매크로가 수집한 OneQue 대시보드 요약 정보를 공유합니다.</p>
+            </div>
+            {% if latest_dashboard %}
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+              <div class="bg-black/30 rounded-xl border border-white/10 p-4 space-y-2">
+                <div class="text-[11px] text-white/70 mb-1">
+                  <span class="font-semibold">월 매출</span>
+                  <span class="ml-2 text-white/50">({{ latest_dashboard.captured_at }})</span>
+                </div>
+                <p class="text-lg font-bold text-brand-accent">
+                  {{ latest_dashboard.monthly_sales_amount or 0 }} 원
+                </p>
+                <div class="mt-2 space-y-1">
+                  <p class="text-white/70">
+                    승인:
+                    <span class="font-semibold text-emerald-300">
+                      {{ latest_dashboard.monthly_approved_count or 0 }}건 /
+                      {{ latest_dashboard.monthly_approved_amount or 0 }} 원
+                    </span>
+                  </p>
+                  <p class="text-white/70">
+                    취소:
+                    <span class="font-semibold text-red-300">
+                      {{ latest_dashboard.monthly_canceled_count or 0 }}건 /
+                      {{ latest_dashboard.monthly_canceled_amount or 0 }} 원
+                    </span>
+                  </p>
+                </div>
+              </div>
+              <div class="bg-black/30 rounded-xl border border-white/10 p-4 space-y-2">
+                <div class="text-[11px] text-white/70 mb-1">
+                  <span class="font-semibold">전일 매출</span>
+                </div>
+                <p class="text-lg font-bold text-blue-300">
+                  {{ latest_dashboard.yesterday_sales_amount or 0 }} 원
+                </p>
+                <div class="mt-2 space-y-1">
+                  <p class="text-white/70">
+                    승인:
+                    <span class="font-semibold text-emerald-300">
+                      {{ latest_dashboard.yesterday_approved_count or 0 }}건 /
+                      {{ latest_dashboard.yesterday_approved_amount or 0 }} 원
+                    </span>
+                  </p>
+                  <p class="text-white/70">
+                    취소:
+                    <span class="font-semibold text-red-300">
+                      {{ latest_dashboard.yesterday_canceled_count or 0 }}건 /
+                      {{ latest_dashboard.yesterday_canceled_amount or 0 }} 원
+                    </span>
+                  </p>
+                </div>
+              </div>
+              <div class="bg-black/30 rounded-xl border border-white/10 p-4 space-y-2">
+                <div class="text-[11px] text-white/70 mb-1">
+                  <span class="font-semibold">정산 예정 및 크레딧</span>
+                </div>
+                <p class="text-[11px] text-white/70">
+                  정산 예정 금액:
+                  <span class="font-semibold text-brand-accent">
+                    {{ latest_dashboard.settlement_expected_amount or 0 }} 원
+                  </span>
+                </p>
+                <p class="text-[11px] text-white/70">
+                  금일 정산 예정금:
+                  <span class="font-semibold text-emerald-300">
+                    {{ latest_dashboard.today_settlement_expected_amount or 0 }} 원
+                  </span>
+                </p>
+                <p class="text-[11px] text-white/70">
+                  나의 크레딧:
+                  <span class="font-semibold text-blue-300">
+                    {{ latest_dashboard.credit_amount or 0 }} 원
+                  </span>
+                </p>
+                <div class="mt-2 p-2 bg-black/40 rounded-lg border border-white/10 max-h-24 overflow-y-auto">
+                  <p class="text-[10px] text-white/60 whitespace-pre-line">
+                    {{ latest_dashboard.recent_tx_summary or "최근 거래 내역 정보가 없습니다." }}
+                  </p>
+                </div>
+              </div>
+            </div>
+            {% else %}
+              <p class="text-xs text-white/60">아직 수집된 K-VAN 대시보드 데이터가 없습니다. 매크로가 한 번 이상 실행되면 자동으로 표시됩니다.</p>
+            {% endif %}
+          </section>
+
           <!-- HQ 엑셀 다운로드 -->
           <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-4 flex items-center justify-between text-sm">
             <div class="text-white/70 text-[11px]">
@@ -2824,6 +2961,11 @@ def agency_admin():
                 except Exception as e:  # noqa: BLE001
                     message = f"세션 생성 중 오류가 발생했습니다: {e}"
                 else:
+                    # 대행사가 링크를 생성한 시점에도 자동 결제 매크로를 준비
+                    try:
+                        trigger_auto_kvan_async(session_id=session_id)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"Agency 세션 생성 시 auto_kvan 트리거 실패: {e}")
                     if amount:
                         message = "결제요청 페이지 링크가 생성되었습니다. 링크를 복사하여 고객에게 전달하세요."
                     else:
@@ -2983,12 +3125,13 @@ def agency_admin():
                   <div class="text-white/70">상태: {{ s.status or '결제중' }}</div>
                 </div>
                 <div class="flex flex-col items-end gap-1 text-[11px]">
+                  {% set kvan_link = s.kvan_link or (base_url ~ '/pay/' ~ s.id) %}
                   <button type="button"
-                          onclick="navigator.clipboard && navigator.clipboard.writeText('{{ base_url }}/pay/{{ s.id }}'); alert('링크가 복사되었습니다.');"
+                          onclick="navigator.clipboard && navigator.clipboard.writeText('{{ kvan_link }}'); alert('링크가 복사되었습니다.');"
                           class="px-3 py-1 rounded-full bg-white/10 hover:bg-white/20 border border-white/20">
                     링크 복사
                   </button>
-                  <span class="font-mono text-white/70 text-[10px]">{{ base_url }}/pay/{{ s.id }}</span>
+                  <span class="font-mono text-white/70 text-[10px]">{{ kvan_link }}</span>
                   <form method="post" action="{{ url_for('agency_admin') }}">
                     <input type="hidden" name="action" value="delete_session">
                     <input type="hidden" name="session_id" value="{{ s.id }}">
