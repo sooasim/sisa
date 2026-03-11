@@ -64,6 +64,7 @@ def get_db():
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=False,
+        connect_timeout=5,
     )
 
 
@@ -189,8 +190,11 @@ app.secret_key = "worldsisa-form-secret"
 # 약관 파일 경로 (프로젝트 루트의 terms.html)
 TERMS_FILE = BASE_DIR / "terms.html"
 
-# 애플리케이션 시작 시 DB 스키마 보장
-init_db()
+
+@app.before_first_request
+def _ensure_db_schema() -> None:
+    """첫 요청 시점에 한 번만 DB 스키마를 확인/생성."""
+    init_db()
 
 # 차단할 IP (공인 IP만). 환경변수 BLOCKED_IPS 로 지정 (쉼표 구분). 100.64.x.x 같은 CGN 대역은 넣지 말 것.
 _BLOCKED_IPS: set[str] = set()
