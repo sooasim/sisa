@@ -320,7 +320,7 @@ FORM_TEMPLATE = """
 <head>
   <meta charset="UTF-8" />
   <meta name="google" content="notranslate" />
-  <title>구매대행 계약서 및 청구서</title>
+  <title>구매 계약서 및 청구서</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" id="viewport-meta" />
   <script>
     if (screen.width < 1280) {
@@ -491,7 +491,7 @@ FORM_TEMPLATE = """
     <div class="kv-container">
       <div class="glass-card rounded-[2rem] border border-white/20 shadow-2xl">
         <div class="kv-inner">
-          <h1 class="mb-1">구매대행 계약서 및 청구서</h1>
+          <h1 class="mb-1">구매 계약서 및 청구서</h1>
           <p class="text-xs text-gray-500 mb-4">
             아래 정보는 SISA 해외 경매 구매대행 계약 및 대면 결제 청구서 작성에 사용됩니다.
           </p>
@@ -2659,6 +2659,12 @@ def agency_admin():
         except Exception:
             sessions, history = [], []
 
+    # DB 기반 거래 내역 (본사와 동일한 소스)
+    all_transactions = state.get("transactions") or []
+    agency_transactions = [
+        t for t in all_transactions if str(t.get("agency_id") or "") == str(agency_id)
+    ]
+
     message = ""
     base_url = request.url_root.rstrip("/")
 
@@ -2708,6 +2714,25 @@ def agency_admin():
                         message = "금액이 고정되지 않은 결제요청 링크가 생성되었습니다. 링크를 복사하여 고객에게 전달하세요."
                 # 로컬 세션 리스트도 갱신
                 sessions.append(new_session)
+                # 새로고침 시 중복 생성 방지
+                return redirect(url_for("agency_admin"))
+        elif action == "delete_session":
+            sid = (request.form.get("session_id") or "").strip()
+            if sid:
+                # admin_state.json 전체에서 해당 세션 제거
+                if Path(ADMIN_STATE_PATH).exists():
+                    try:
+                        with open(ADMIN_STATE_PATH, "r", encoding="utf-8") as f:
+                            saved = json.load(f)
+                        all_sessions = saved.get("sessions") or []
+                        all_history = saved.get("history") or []
+                        all_sessions = [s for s in all_sessions if str(s.get("id")) != sid]
+                        with open(ADMIN_STATE_PATH, "w", encoding="utf-8") as f:
+                            json.dump({"sessions": all_sessions, "history": all_history}, f, ensure_ascii=False, indent=2)
+                    except Exception:
+                        pass
+                sessions = [s for s in sessions if str(s.get("id")) != sid]
+            return redirect(url_for("agency_admin"))
 
     template = """
     <!DOCTYPE html>
@@ -2839,6 +2864,7 @@ def agency_admin():
                     금액: {{ s.amount or '고객 입력' }} / 할부: {{ s.installment or '일시불' }}
                   </div>
                   <div class="text-white/60">생성일: {{ s.created_at }}</div>
+                  <div class="text-white/70">상태: {{ s.status or '결제중' }}</div>
                 </div>
                 <div class="flex flex-col items-end gap-1 text-[11px]">
                   <button type="button"
@@ -2847,6 +2873,13 @@ def agency_admin():
                     링크 복사
                   </button>
                   <span class="font-mono text-white/70 text-[10px]">{{ base_url }}/pay/{{ s.id }}</span>
+                  <form method="post" action="{{ url_for('agency_admin') }}">
+                    <input type="hidden" name="action" value="delete_session">
+                    <input type="hidden" name="session_id" value="{{ s.id }}">
+                    <button type="submit" class="mt-1 px-2 py-1 rounded-full bg-red-500/30 hover:bg-red-500/50 border border-red-400/60 text-red-100 text-[10px]">
+                      삭제
+                    </button>
+                  </form>
                 </div>
               </div>
             {% endfor %}
@@ -2888,6 +2921,56 @@ def agency_admin():
             </div>
             {% else %}
               <p class="text-xs text-white/60">아직 종료된 세션 기록이 없습니다.</p>
+            {% endif %}
+          </section>
+
+          <!-- 거래 내역 (본사 DB 연동) -->
+          <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
+            <h2 class="text-lg font-semibold mb-3 flex items-center gap-2">
+              <i class="fa-solid fa-list-ul text-brand-accent"></i> 거래 내역 (본사 DB 연동)
+            </h2>
+            {% if agency_transactions %}
+            <div class="overflow-x-auto">
+              <table class="min-w-full text-xs border-separate border-spacing-y-2">
+                <thead class="text-white/70">
+                  <tr>
+                    <th class="px-3 py-1 text-left">시간</th>
+                    <th class="px-3 py-1 text-right">금액</th>
+                    <th class="px-3 py-1 text-left">구매자</th>
+                    <th class="px-3 py-1 text-center">결제상태</th>
+                    <th class="px-3 py-1 text-center">정산상태</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for t in agency_transactions|sort(attribute="created_at", reverse=True) %}
+                  {% set amount = t.amount or 0 %}
+                  <tr class="bg-black/20 hover:bg-black/30 transition align-top">
+                    <td class="px-3 py-2 whitespace-nowrap">{{ t.created_at }}</td>
+                    <td class="px-3 py-2 text-right">{{ "{:,}".format(amount) }} 원</td>
+                    <td class="px-3 py-2 whitespace-nowrap">{{ t.customer_name }}</td>
+                    <td class="px-3 py-2 text-center">
+                      {% if t.status == 'success' %}
+                        <span class="px-2 py-1 rounded-full bg-emerald-500/20 text-emerald-200 border border-emerald-500/40 text-[10px]">성공</span>
+                      {% elif t.status == 'fail' %}
+                        <span class="px-2 py-1 rounded-full bg-red-500/20 text-red-200 border border-red-500/40 text-[10px]">실패</span>
+                      {% else %}
+                        <span class="px-2 py-1 rounded-full bg-gray-500/20 text-gray-200 border border-gray-500/40 text-[10px]">기타</span>
+                      {% endif %}
+                    </td>
+                    <td class="px-3 py-2 text-center">
+                      {% if t.settlement_status == '정산완료' %}
+                        <span class="px-2 py-1 rounded-full bg-blue-500/20 text-blue-200 border border-blue-500/40 text-[10px]">정산완료</span>
+                      {% else %}
+                        <span class="px-2 py-1 rounded-full bg-yellow-500/20 text-yellow-200 border border-yellow-500/40 text-[10px]">미정산</span>
+                      {% endif %}
+                    </td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            {% else %}
+              <p class="text-xs text-white/60">아직 이 대행사에 대한 거래 내역이 없습니다.</p>
             {% endif %}
           </section>
         </div>
