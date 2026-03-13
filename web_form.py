@@ -1802,10 +1802,8 @@ def admin():
                             trigger_auto_kvan_async(session_id=session_id)
                         except Exception as e:  # noqa: BLE001
                             print(f"HQ 세션 생성 시 auto_kvan 트리거 실패: {e}")
-                        if amount:
-                            message = "결제요청 페이지 링크가 생성되었습니다. 링크를 복사하여 고객에게 전달하세요."
-                        else:
-                            message = "금액이 고정되지 않은 결제요청 링크가 생성되었습니다. 링크를 복사하여 고객에게 전달하세요."
+                        # 중복 생성 방지를 위해 PRG 패턴 적용: 성공 시에는 항상 리다이렉트
+                        return redirect(url_for("admin"))
 
         elif action == "close_session":
             sid = request.form.get("session_id", "").strip()
