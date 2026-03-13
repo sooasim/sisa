@@ -767,9 +767,9 @@ def load_order_from_json(path: str) -> PaymentRow:
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
-    # 금액 / 상품명 / 로그인 ID 가 없으면 더미값 채워서라도 진행할 수 있게 한다.
-    if "amount" not in raw or raw.get("amount") in ("", None, 0, "0"):
-        raw["amount"] = 100000  # 기본 10만원
+    # 금액 / 상품명 / 로그인 ID 가 없으면 에러로 처리한다.
+    if "amount" not in raw or raw.get("amount") in ("", None, "0"):
+        raise ValueError("JSON 데이터에 결제 금액(amount)이 없습니다.")
     if "product_name" not in raw or not str(raw.get("product_name") or "").strip():
         raw["product_name"] = "SISA 테스트 상품"
     if "login_id" not in raw or not str(raw.get("login_id") or "").strip():
@@ -3154,14 +3154,20 @@ def main() -> None:
                     sessions = st.get("sessions") or []
                     for s in sessions:
                         if str(s.get("id")) == str(session_id):
-                            amount_val = int(str(s.get("amount") or "0").replace(",", "") or "0")
+                            amt_str = str(s.get("amount") or "").replace(",", "").strip()
+                            amount_val = int(amt_str) if amt_str else 0
                             installment_val = str(s.get("installment") or "일시불")
                             break
+                if amount_val <= 0:
+                    _append_admin_log(
+                        "AUTO",
+                        f"[ERROR] 세션 금액이 없어서 링크를 생성할 수 없습니다. session_id={session_id}",
+                    )
+                    print(e)
+                    return
                 login_id = os.environ.get("K_VAN_ID", "m3313")
                 login_pw = os.environ.get("K_VAN_PW", "1234")
                 login_pin = os.environ.get("K_VAN_PIN", "2424")
-                if amount_val <= 0:
-                    amount_val = 100000  # 최소 더미 금액
                 _append_admin_log(
                     "AUTO",
                     f"주문 JSON 없이 세션 정보로 링크 생성 시도 "
