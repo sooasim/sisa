@@ -3235,6 +3235,14 @@ def main() -> None:
             msg = "결제 링크가 생성되었습니다. 고객이 링크로 결제하면 K-VAN 크롤러가 상태를 반영합니다."
             _append_admin_log("AUTO", f"결제 링크 생성 완료 session_id={session_id or '-'} link={link_url}")
             print(f"생성된 결제 링크: {link_url}")
+            # admin_state.json 의 해당 세션에 바로 링크를 매핑해서
+            # /admin, /agency-admin 화면에서 '링크 복사' 버튼이 즉시 표시되도록 한다.
+            if session_id:
+                try:
+                    _store_kvan_link_for_session(session_id, link_url)
+                except Exception as e_store:  # noqa: BLE001
+                    print(f"[WARN] admin_state 에 링크 저장 중 오류: {e_store}")
+                    _append_admin_log("AUTO", f"[WARN] admin_state 링크 저장 실패 session_id={session_id}: {e_store}")
             # 링크가 새로 생성되었으므로, 크롤러에 즉시 다시 크롤링하도록 신호를 보낸다.
             try:
                 signal_crawler_wakeup()
