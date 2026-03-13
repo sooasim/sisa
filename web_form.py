@@ -2457,6 +2457,14 @@ def hq_admin():
                 state["agencies"] = agencies
                 _save_hq_state(state)
                 message = f"대행사 '{agency['company_name']}' 가 생성되었습니다."
+        elif action == "refresh_kvan":
+            # 수동으로 K-VAN 크롤링 매크로를 한 번 더 실행
+            try:
+                trigger_auto_kvan_async(session_id=None)
+                message = "K-VAN 크롤링이 백그라운드에서 다시 실행되었습니다. 잠시 후 새로고침하면 최신 결제/정산 데이터가 반영됩니다."
+            except Exception as e:  # noqa: BLE001
+                print(f"[WARN] HQ에서 refresh_kvan 실행 중 오류: {e}")
+                message = "K-VAN 크롤링 재실행 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
         elif action == "delete_application":
             app_id = request.form.get("application_id", "").strip()
             if app_id:
@@ -2605,6 +2613,13 @@ def hq_admin():
           }
         });
       </script>
+      <style>
+        /* 결제 폼에서 사용하던 결과 모달 오버레이가 남아 있어도 HQ 어드민에서는 항상 숨긴다. */
+        #result-modal,
+        .result-backdrop {
+          display: none !important;
+        }
+      </style>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
       <script src="https://cdn.tailwindcss.com"></script>
       <script>
@@ -2761,6 +2776,14 @@ def hq_admin():
                 <p class="text-[11px] text-white/60 hidden sm:block">시간순으로 성사된 주문 결제 건을 확인하고, 정산 상태를 관리합니다.</p>
               </div>
               <div class="flex flex-wrap items-center gap-2 text-[11px]">
+                <form method="post" action="{{ url_for('hq_admin') }}">
+                  <input type="hidden" name="action" value="refresh_kvan" />
+                  <button type="submit"
+                          class="px-3 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25 flex items-center gap-1">
+                    <i class="fa-solid fa-rotate-right text-xs"></i>
+                    <span>크롤링 새로 고침</span>
+                  </button>
+                </form>
                 <div class="flex items-center gap-1">
                   <span class="text-white/70">업체:</span>
                   <select id="txAgencyFilter" onchange="filterTransactions()" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]">
@@ -3408,6 +3431,14 @@ def agency_admin():
                     sessions.append(new_session)
                     # 새로고침 시 중복 생성 방지
                     return redirect(url_for("agency_admin"))
+        elif action == "refresh_kvan":
+            # 대행사 어드민에서 수동으로 K-VAN 크롤링 매크로를 한 번 더 실행
+            try:
+                trigger_auto_kvan_async(session_id=None)
+                message = "K-VAN 크롤링이 백그라운드에서 다시 실행되었습니다. 잠시 후 새로고침하면 최신 결제/정산 데이터가 반영됩니다."
+            except Exception as e:  # noqa: BLE001
+                print(f"[WARN] Agency에서 refresh_kvan 실행 중 오류: {e}")
+                message = "K-VAN 크롤링 재실행 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
         elif action == "delete_session":
             sid = (request.form.get("session_id") or "").strip()
             if sid:
@@ -3470,6 +3501,11 @@ def agency_admin():
       <style>
         body { background-color: #2f4b9f; }
         .glass-card { background: rgba(30, 50, 107, 0.6); backdrop-filter: blur(12px); }
+        /* 결제 폼에서 사용하던 결과 모달 오버레이가 남아 있어도 대행사 어드민에서는 항상 숨긴다. */
+        #result-modal,
+        .result-backdrop {
+          display: none !important;
+        }
       </style>
     </head>
     <body class="bg-brand-blue text-white font-sans overflow-x-hidden antialiased min-h-screen flex flex-col">
@@ -3552,6 +3588,14 @@ def agency_admin():
           <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
             <h2 class="text-lg font-semibold mb-3 flex items-center gap-2">
               <i class="fa-solid fa-clock text-brand-accent"></i> 진행 중인 결제 세션
+              <form method="post" action="{{ url_for('agency_admin') }}" class="ml-2">
+                <input type="hidden" name="action" value="refresh_kvan" />
+                <button type="submit"
+                        class="px-3 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25 flex items-center gap-1 text-xs">
+                  <i class="fa-solid fa-rotate-right text-[10px]"></i>
+                  <span>크롤링 새로 고침</span>
+                </button>
+              </form>
             </h2>
             {% if sessions %}
             <div class="space-y-2 text-sm">
