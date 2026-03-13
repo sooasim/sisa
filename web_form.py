@@ -244,12 +244,9 @@ def trigger_auto_kvan_async(session_id: str | None = None) -> None:
         cmd = [sys.executable, str(script_path)]
         if session_id:
             cmd.append(str(session_id))
-        # 백그라운드에서 조용히 실행 (웹 요청을 막지 않도록)
-        subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        # 백그라운드에서 실행하되, stdout/stderr 는 웹 서버 로그에 남겨
+        # Railway 등 호스팅 환경의 로그 뷰어에서 auto_kvan 동작을 확인할 수 있게 한다.
+        subprocess.Popen(cmd)
     except Exception as e:  # noqa: BLE001
         # 매크로 실행 실패는 웹 폼 자체 오류는 아니므로 서버 로그에만 남긴다.
         print(f"auto_kvan.py 실행 실패: {e}")
@@ -3484,10 +3481,11 @@ def agency_admin():
           var vp = document.getElementById('viewport-meta');
           if (vp) vp.setAttribute('content', 'width=1280');
         }
-        // 5분마다 자동 새로고침
+        // 대행사 어드민에서는 진행 중인 결제 세션/K-VAN 링크 상태를
+        // 최대한 실시간에 가깝게 보기 위해 7초마다 자동 새로고침한다.
         setInterval(function () {
           location.reload();
-        }, 300000);
+        }, 7000);
         // 결제 페이지의 결과 모달이 남아 있는 경우를 대비해, 어드민 진입 시에는 강제로 숨긴다.
         window.addEventListener('load', function () {
           var modal = document.getElementById('result-modal');
@@ -3632,7 +3630,7 @@ def agency_admin():
                   </button>
                   <span class="font-mono text-white/70 text-[10px]">{{ kvan_link }}</span>
                   {% else %}
-                  <span class="font-mono text-white/60 text-[10px]">K-VAN 링크를 생성 중입니다. 잠시 후 새로고침 해 주세요.</span>
+                  <span class="font-mono text-white/60 text-[10px]">K-VAN 링크를 생성 중입니다. 잠시 후 자동으로 표시됩니다.</span>
                   {% endif %}
                   <form method="post" action="{{ url_for('agency_admin') }}">
                     <input type="hidden" name="action" value="delete_session">
