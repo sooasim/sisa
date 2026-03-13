@@ -307,20 +307,106 @@ def ensure_runtime_files() -> None:
         print(f"[WARN] runtime 파일 준비 실패: {e}")
 
 
-def trigger_auto_kvan_async(session_id: str | None = None) -> None:
-    """결제 폼에서 주문 저장 후 auto_kvan.py 를 비동기로 실행."""
+# K-VAN 은 동일 계정 동시 로그인을 허용하지 않는다.
+# 여러 세션이 동시에 링크 생성을 요청하면 한 번에 하나씩 직렬 처리해야 한다.
+# 큐 파일: DATA_DIR/kvan_queue.json  (session_id 목록)
+# 락 파일: DATA_DIR/kvan_running.lock (현재 실행 중인 session_id)
+KVAN_QUEUE_PATH = DATA_DIR / "kvan_queue.json"
+KVAN_LOCK_PATH = DATA_DIR / "kvan_running.lock"
+
+
+def _kvan_enqueue(session_id: str) -> None:
+    """세션 ID를 K-VAN 실행 큐에 추가한다 (중복 방지)."""
     try:
-        # wsisa 폴더로 이동된 auto_kvan.py 절대경로
-        script_path = BASE_DIR / "wsisa" / "auto_kvan.py"
-        cmd = [sys.executable, str(script_path)]
-        if session_id:
-            cmd.append(str(session_id))
-        # 백그라운드에서 실행하되, 로그 파일과 서버 로그 양쪽에 상태를 남긴다.
-        _append_hq_log("WEB", f"auto_kvan 시작 session_id={session_id or '-'}")
+        KVAN_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        queue: list[str] = []
+        if KVAN_QUEUE_PATH.exists():
+            try:
+                queue = json.loads(KVAN_QUEUE_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                queue = []
+        if session_id and session_id not in queue:
+            queue.append(session_id)
+        KVAN_QUEUE_PATH.write_text(json.dumps(queue), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] kvan_enqueue 실패: {e}")
+
+
+def _kvan_dequeue() -> str | None:
+    """큐의 첫 번째 세션 ID를 꺼낸다."""
+    try:
+        if not KVAN_QUEUE_PATH.exists():
+            return None
+        queue: list[str] = json.loads(KVAN_QUEUE_PATH.read_text(encoding="utf-8"))
+        if not queue:
+            return None
+        next_id = queue.pop(0)
+        KVAN_QUEUE_PATH.write_text(json.dumps(queue), encoding="utf-8")
+        return next_id
+    except Exception:
+        return None
+
+
+def _kvan_is_running() -> bool:
+    """락 파일이 존재하고 실제 프로세스가 살아있으면 True."""
+    try:
+        if not KVAN_LOCK_PATH.exists():
+            return False
+        pid_str = KVAN_LOCK_PATH.read_text(encoding="utf-8").strip()
+        if not pid_str:
+            return False
+        pid = int(pid_str)
+        # PID 가 살아있는지 확인 (Unix/Windows 공통: os.kill 0 시그널)
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            # 프로세스 없음 → 락 파일 제거
+            KVAN_LOCK_PATH.unlink(missing_ok=True)
+            return False
+    except Exception:
+        KVAN_LOCK_PATH.unlink(missing_ok=True)
+        return False
+
+
+def trigger_auto_kvan_async(session_id: str | None = None) -> None:
+    """결제 폼에서 주문 저장 후 auto_kvan.py 를 비동기로 실행.
+
+    K-VAN 동시 로그인 불가 문제를 해결하기 위해 직렬 큐 방식으로 동작한다.
+    - 현재 실행 중이면 큐에 추가만 하고 리턴
+    - 실행 중이 아니면 큐의 첫 번째 항목부터 순서대로 실행하는 runner 를 띄운다
+    """
+    sid = (session_id or "").strip()
+
+    # 세션 ID가 있으면 큐에 추가
+    if sid:
+        _kvan_enqueue(sid)
+        _append_hq_log("WEB", f"auto_kvan 큐 추가 session_id={sid}")
+
+    # 이미 실행 중이면 큐에 쌓인 채로 대기 (runner 가 이어서 처리)
+    if _kvan_is_running():
+        _append_hq_log("WEB", f"auto_kvan 이미 실행 중 – session_id={sid or '-'} 큐 대기")
+        return
+
+    # 실행 중이 아니면 큐 runner 를 시작
+    try:
+        runner_path = BASE_DIR / "wsisa" / "auto_kvan_runner.py"
+        if not runner_path.exists():
+            # runner 파일이 없으면 기존 방식으로 fallback (단일 실행)
+            script_path = BASE_DIR / "wsisa" / "auto_kvan.py"
+            cmd = [sys.executable, str(script_path)]
+            if sid:
+                cmd.append(sid)
+            _append_hq_log("WEB", f"auto_kvan 직접 실행(runner 없음) session_id={sid or '-'}")
+            subprocess.Popen(cmd)
+            return
+        cmd = [sys.executable, str(runner_path),
+               str(KVAN_QUEUE_PATH), str(KVAN_LOCK_PATH)]
+        _append_hq_log("WEB", f"auto_kvan runner 시작 session_id={sid or '-'}")
         subprocess.Popen(cmd)
     except Exception as e:  # noqa: BLE001
-        # 매크로 실행 실패는 웹 폼 자체 오류는 아니므로 서버 로그에만 남긴다.
         print(f"auto_kvan.py 실행 실패: {e}")
+        _append_hq_log("WEB", f"[ERROR] auto_kvan runner 실행 실패: {e}")
 
 
 def _save_session_order_json(session_id: str, amount: str, installment: str) -> Path:
