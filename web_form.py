@@ -2299,6 +2299,14 @@ def hq_login():
       </script>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
       <script src="https://cdn.tailwindcss.com"></script>
+      <style>
+        body { background-color: #2f4b9f; }
+        /* 결제 폼의 결과 모달 오버레이가 남아 있어도 로그인 화면에서는 항상 숨긴다. */
+        #result-modal,
+        .result-backdrop {
+          display: none !important;
+        }
+      </style>
     </head>
     <body class="bg-[#2f4b9f] text-white font-[Inter] min-h-screen flex items-center justify-center">
       <div class="bg-white/10 border border-white/20 rounded-2xl px-8 py-10 max-w-sm w-full shadow-2xl">
@@ -2369,7 +2377,14 @@ def agency_login():
           }
         }
       </script>
-      <style>body { background-color: #2f4b9f; }</style>
+      <style>
+        body { background-color: #2f4b9f; }
+        /* 결제 폼의 결과 모달 오버레이가 남아 있어도 로그인 화면에서는 항상 숨긴다. */
+        #result-modal,
+        .result-backdrop {
+          display: none !important;
+        }
+      </style>
     </head>
     <body class="bg-brand-blue text-white font-sans antialiased min-h-screen flex items-center justify-center">
       <div class="bg-white/10 backdrop-blur border border-white/20 rounded-2xl px-8 py-10 max-w-sm w-full shadow-2xl">
@@ -2781,7 +2796,7 @@ def hq_admin():
                   <button type="submit"
                           class="px-3 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25 flex items-center gap-1">
                     <i class="fa-solid fa-rotate-right text-xs"></i>
-                    <span>크롤링 새로 고침</span>
+                    <span>새로고침</span>
                   </button>
                 </form>
                 <div class="flex items-center gap-1">
@@ -3593,7 +3608,7 @@ def agency_admin():
                 <button type="submit"
                         class="px-3 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25 flex items-center gap-1 text-xs">
                   <i class="fa-solid fa-rotate-right text-[10px]"></i>
-                  <span>크롤링 새로 고침</span>
+                  <span>새로고침</span>
                 </button>
               </form>
             </h2>
