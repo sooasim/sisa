@@ -3233,6 +3233,7 @@ def hq_admin():
         transactions=transactions,
         message=message,
         history_warnings=history_warnings,
+        admin_logs=admin_logs,
     )
 
 
@@ -3393,11 +3394,14 @@ def agency_admin():
           var vp = document.getElementById('viewport-meta');
           if (vp) vp.setAttribute('content', 'width=1280');
         }
-        // 대행사 어드민에서는 진행 중인 결제 세션/K-VAN 링크 상태를
-        // 최대한 실시간에 가깝게 보기 위해 7초마다 자동 새로고침한다.
-        setInterval(function () {
-          location.reload();
-        }, 7000);
+        // 진행 중인 세션이 하나 이상 있을 때만 7초마다 자동 새로고침한다.
+        // (세션이 없으면 불필요한 새로고침을 하지 않음)
+        var hasActiveSessions = {{ 'true' if sessions else 'false' }};
+        if (hasActiveSessions) {
+          setInterval(function () {
+            location.reload();
+          }, 7000);
+        }
         // 결제 페이지의 결과 모달이 남아 있는 경우를 대비해, 어드민 진입 시에는 강제로 숨긴다.
         window.addEventListener('load', function () {
           var modal = document.getElementById('result-modal');
