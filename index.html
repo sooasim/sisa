@@ -83,6 +83,12 @@
             -webkit-backdrop-filter: blur(12px);
             border: 1px solid rgba(255, 255, 255, 0.2);
         }
+        /* 혹시 다른 페이지에서 사용하던 결제 결과 오버레이 DOM 이 남아 있어도
+           메인 랜딩 페이지에서는 항상 숨긴다. */
+        #result-modal,
+        .result-backdrop {
+            display: none !important;
+        }
     </style>
 </head>
 
