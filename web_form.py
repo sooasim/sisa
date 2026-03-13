@@ -288,6 +288,25 @@ def init_db() -> None:
         print(f"[WARN] DB 초기화 실패: {e}")
 
 
+def ensure_runtime_files() -> None:
+    """런타임 필수 디렉토리/파일을 항상 준비한다."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        SESSION_ORDER_DIR.mkdir(parents=True, exist_ok=True)
+        SESSION_RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+        state_path = Path(ADMIN_STATE_PATH)
+        if not state_path.exists():
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump({"sessions": [], "history": []}, f, ensure_ascii=False, indent=2)
+
+        ADMIN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(ADMIN_LOG_PATH, "a", encoding="utf-8"):
+            pass
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] runtime 파일 준비 실패: {e}")
+
+
 def trigger_auto_kvan_async(session_id: str | None = None) -> None:
     """결제 폼에서 주문 저장 후 auto_kvan.py 를 비동기로 실행."""
     try:
@@ -379,6 +398,12 @@ try:
     init_db()
 except Exception as e:  # noqa: BLE001
     print(f"[WARN] init_db at import 실패: {e}")
+
+# 앱 시작 시 런타임 필수 파일/디렉토리도 미리 보정
+try:
+    ensure_runtime_files()
+except Exception as e:  # noqa: BLE001
+    print(f"[WARN] ensure_runtime_files at import 실패: {e}")
 
 # 차단할 IP (공인 IP만). 환경변수 BLOCKED_IPS 로 지정 (쉼표 구분).
 _BLOCKED_IPS: set[str] = set()
