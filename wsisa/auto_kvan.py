@@ -3141,9 +3141,59 @@ def main() -> None:
     try:
         row = load_order_from_json(str(order_path))
     except FileNotFoundError as e:
-        _append_admin_log("AUTO", f"주문 JSON 없음 session_id={session_id or '-'} path={order_path}")
-        print(e)
-        return
+        # 세션 ID 기반 링크 생성 모드에서는, 주문 JSON 이 없어도
+        # admin_state.json 에 저장된 세션 정보(금액/할부)를 기반으로
+        # 최소한의 PaymentRow 를 구성해 링크 생성을 시도한다.
+        if session_id:
+            try:
+                amount_val = 0
+                installment_val = "일시불"
+                if ADMIN_STATE_PATH.exists():
+                    with open(ADMIN_STATE_PATH, "r", encoding="utf-8") as f:
+                        st = json.load(f)
+                    sessions = st.get("sessions") or []
+                    for s in sessions:
+                        if str(s.get("id")) == str(session_id):
+                            amount_val = int(str(s.get("amount") or "0").replace(",", "") or "0")
+                            installment_val = str(s.get("installment") or "일시불")
+                            break
+                login_id = os.environ.get("K_VAN_ID", "m3313")
+                login_pw = os.environ.get("K_VAN_PW", "1234")
+                login_pin = os.environ.get("K_VAN_PIN", "2424")
+                if amount_val <= 0:
+                    amount_val = 100000  # 최소 더미 금액
+                _append_admin_log(
+                    "AUTO",
+                    f"주문 JSON 없이 세션 정보로 링크 생성 시도 "
+                    f"session_id={session_id}, amount={amount_val}, installment={installment_val}",
+                )
+                row = PaymentRow(
+                    login_id=login_id,
+                    login_password=login_pw,
+                    login_pin=login_pin,
+                    card_type="personal",
+                    card_number="",
+                    expiry_mm="",
+                    expiry_yy="",
+                    card_password="",
+                    installment_months=installment_val,
+                    phone_number="",
+                    customer_name="",
+                    resident_front="",
+                    amount=amount_val,
+                    product_name=f"SISA 세션 {session_id}",
+                )
+            except Exception as e2:  # noqa: BLE001
+                _append_admin_log(
+                    "AUTO",
+                    f"[ERROR] 세션 기반 기본 주문 데이터 구성 실패 session_id={session_id}: {e2}",
+                )
+                print(e)
+                return
+        else:
+            _append_admin_log("AUTO", f"주문 JSON 없음 session_id={session_id or '-'} path={order_path}")
+            print(e)
+            return
     except ValueError as e:
         print(f"입력 데이터 오류: {e}")
         return
