@@ -1740,6 +1740,12 @@ def admin():
         except Exception:
             sessions = []
 
+    # 결제중인데 아직 K-VAN 링크가 없는 세션이 있는지 여부 (자동 새로고침/팝업 트리거 용)
+    has_pending_link = any(
+        (s.get("status", "결제중") == "결제중") and not s.get("kvan_link")
+        for s in sessions
+    )
+
     # 크롤러가 생성한 DB 기반 정보 (참고용 요약)
     recent_links: list[dict] = []
     recent_tx: list[dict] = []
@@ -1818,7 +1824,8 @@ def admin():
                         except Exception as e:  # noqa: BLE001
                             print(f"HQ 세션 생성 시 auto_kvan 트리거 실패: {e}")
                         # 중복 생성 방지를 위해 PRG 패턴 적용: 성공 시에는 항상 리다이렉트
-                        return redirect(url_for("admin"))
+                        # new=1 쿼리스트링으로 "새 링크 생성" 플래그를 전달
+                        return redirect(url_for("admin", new="1"))
 
         elif action == "close_session":
             sid = request.form.get("session_id", "").strip()
@@ -1956,6 +1963,24 @@ def admin():
         .pill-muted { background:#111827; color:#e5e7eb; border:1px solid #4b5563; }
         .small-input { width:100%; padding:6px 8px; border-radius:8px; border:1px solid #374151; background:#020617; color:#e5e7eb; font-size:12px; box-sizing:border-box; }
       </style>
+      <script>
+        // /admin 페이지에서: 결제중인데 아직 K-VAN 링크가 없는 세션이 있으면
+        // 한 번만 7초 후 자동 새로고침하고, 링크가 생성된 뒤에는 새로고침하지 않는다.
+        (function () {
+          var hasPending = {{ 'true' if has_pending_link else 'false' }};
+          if (hasPending) {
+            setTimeout(function () {
+              window.location.reload();
+            }, 7000);
+          }
+          // 새 링크 생성 후 리다이렉트된 경우(new=1)에는 팝업으로 한 번 안내
+          var params = new URLSearchParams(window.location.search || "");
+          var isNew = params.get("new") === "1";
+          if (isNew && !hasPending) {
+            alert("새 결제 링크 생성 작업이 완료되었습니다. 아래 '결제 요청 링크' 영역에서 복사 버튼을 확인해 주세요.");
+          }
+        })();
+      </script>
     </head>
     <body class="bg-brand-blue text-white font-sans overflow-x-hidden antialiased flex flex-col min-h-screen">
       <!-- 헤더 -->
@@ -2258,6 +2283,7 @@ def admin():
         base_url=base_url,
         recent_links=recent_links,
         recent_tx=recent_tx,
+        has_pending_link=has_pending_link,
     )
 
 
@@ -3527,11 +3553,11 @@ def agency_admin():
           var vp = document.getElementById('viewport-meta');
           if (vp) vp.setAttribute('content', 'width=1280');
         }
-        // 진행 중인 세션이 하나 이상 있을 때만 7초마다 자동 새로고침한다.
+        // 진행 중인 세션이 하나 이상 있을 때만 7초 후 한 번 자동 새로고침한다.
         // (세션이 없으면 불필요한 새로고침을 하지 않음)
         var hasActiveSessions = {{ 'true' if sessions else 'false' }};
         if (hasActiveSessions) {
-          setInterval(function () {
+          setTimeout(function () {
             location.reload();
           }, 7000);
         }
