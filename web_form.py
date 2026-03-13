@@ -1716,10 +1716,15 @@ def admin():
             with open(ADMIN_STATE_PATH, "r", encoding="utf-8") as f:
                 saved = json.load(f)
             if isinstance(saved, dict):
-                if isinstance(saved.get("sessions"), list):
-                    sessions = saved["sessions"]
-                if isinstance(saved.get("history"), list):
-                    history = saved["history"]
+                raw_sessions = saved.get("sessions") or []
+                raw_history = saved.get("history") or []
+                # /admin 페이지에서는 HQ(agency_id 가 비어 있는) 세션/히스토리만 본다.
+                sessions = [
+                    s for s in raw_sessions if not str(s.get("agency_id") or "").strip()
+                ]
+                history = [
+                    h for h in raw_history if not str(h.get("agency_id") or "").strip()
+                ]
                 # 이전 단일 세션 포맷에서 마이그레이션
                 if saved.get("current_session_id") and not sessions:
                     sessions = [
@@ -1747,9 +1752,6 @@ def admin():
             # 결제금액이 비어 있으면 세션/링크를 만들지 않고 안내
             if not amount:
                 message = "결제 금액을 입력해 주세요. 금액 없이 결제요청 링크를 생성할 수 없습니다."
-            # 금액이 지정된 경우, 최근 5분 내 동일 금액 링크가 있었는지 검사
-            elif amount and _is_recent_duplicate_amount(amount, window_minutes=5):
-                message = "같은 금액의 결제 링크가 최근 5분 이내에 생성되었습니다. 5분 후에 다시 시도해 주세요."
             else:
                 # 현재 진행 중(결제중) 세션 수 확인
                 active_count = sum(
@@ -3328,9 +3330,6 @@ def agency_admin():
             # 결제금액이 비어 있으면 세션/링크를 만들지 않고 안내
             if not amount:
                 message = "결제 금액을 입력해 주세요. 금액 없이 결제요청 링크를 생성할 수 없습니다."
-            # 금액이 지정된 경우, 최근 5분 내 동일 금액 링크가 있었는지 검사
-            elif amount and _is_recent_duplicate_amount(amount, window_minutes=5):
-                message = "같은 금액의 결제 링크가 최근 5분 이내에 생성되었습니다. 5분 후에 다시 시도해 주세요."
             else:
                 # 이 대행사의 진행 중 세션 수만 카운트
                 active_count = sum(
