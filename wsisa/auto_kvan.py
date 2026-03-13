@@ -4,13 +4,13 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
-from datetime import datetime
+from datetime import datetime, timedelta
 import random
 import re
 
 from openpyxl import load_workbook, Workbook
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -38,10 +38,144 @@ def _step_end(label: str, t0: float) -> None:
 SIGN_IN_URL = "https://store.k-van.app/sign-in"
 FACE_TO_FACE_URL = "https://store.k-van.app/face-to-face-payment"
 
+def _has_payment_links_quick(driver: webdriver.Chrome, retries: int = 5, delay: float = 1.0) -> bool:
+    """
+    결제링크 관리 화면에 실제 결제 링크 카드가 존재하는지 가볍게 확인한다.
+
+    - '생성된 결제 링크가 없습니다' 문구가 보이면 즉시 False.
+    - '거래 내역' 아이콘/버튼이 보이면 True.
+    - 위 둘 다 아닌 경우, 짧게 여러 번 재시도 후 결과를 반환한다.
+    """
+    for attempt in range(retries):
+        try:
+            # 1) "생성된 결제 링크가 없습니다" 안내 문구가 있으면 링크 없음
+            empty_msgs = driver.find_elements(
+                By.XPATH,
+                "//*[contains(normalize-space(.),'생성된 결제 링크가 없습니다')]",
+            )
+            if empty_msgs:
+                print(f"[EMPTY_CHECK] 결제링크 없음 문구 감지 (attempt={attempt})")
+                return False
+
+            # 2) '거래 내역' 버튼/아이콘이 하나라도 있으면 링크가 있다고 판단
+            icons = driver.find_elements(
+                By.XPATH,
+                "//button[@title='거래 내역']"
+                " | //button[contains(normalize-space(.),'거래 내역')]"
+                " | //button[contains(normalize-space(.),'거래내역')]"
+                " | //button[.//svg[contains(@class,'lucide-receipt')]]",
+            )
+            if icons:
+                print(f"[EMPTY_CHECK] 거래 내역 아이콘 감지 → 링크 존재 (attempt={attempt}, count={len(icons)})")
+                return True
+        except Exception as e:
+            print(f"[EMPTY_CHECK] 링크 존재 여부 확인 중 예외 (attempt={attempt}): {e}")
+
+        time.sleep(delay)
+
+    print("[EMPTY_CHECK] 여러 번 확인했으나 링크를 찾지 못했습니다 (빈 화면으로 간주).")
+    return False
+
+
+def _go_to_payment_link(driver: webdriver.Chrome, max_attempts: int = 12) -> bool:
+    """
+    /payment-link 화면으로 안정적으로 진입하기 위한 헬퍼.
+
+    - 단순 driver.get 으로 /dashboard 로 리다이렉트되는 경우가 있어,
+      여러 번 재시도 + 대시보드 사이드 메뉴 클릭까지 시도한다.
+    - 성공 시 True, 끝까지 실패 시 False 반환.
+    """
+    url_target = "https://store.k-van.app/payment-link"
+
+    for attempt in range(max_attempts):
+        cur = driver.current_url or ""
+        if "payment-link" in cur:
+            print(f"[NAV] 이미 /payment-link 에 위치 (attempt={attempt}, url={cur})")
+            return True
+
+        print(f"[NAV] /payment-link 진입 시도 (attempt={attempt}, current_url={cur})")
+        try:
+            driver.get(url_target)
+        except Exception as e:
+            print(f"[NAV] driver.get({url_target}) 중 예외: {e}")
+
+        # URL 이 곧바로 바뀌는지 3초 정도만 기다린다.
+        try:
+            WebDriverWait(driver, 3).until(EC.url_contains("payment-link"))
+            print(f"[NAV] URL 기반 /payment-link 진입 성공 (attempt={attempt}, url={driver.current_url})")
+            return True
+        except Exception:
+            # 여전히 대시보드 등이라면, 메뉴 클릭 방식도 시도해 본다.
+            pass
+
+        try:
+            # 사이드 메뉴/내비게이션에서 '결제링크' 관련 항목을 찾아 클릭 시도
+            nav_btn = None
+            candidates = driver.find_elements(
+                By.XPATH,
+                "//a[contains(@href,'payment-link')]"
+                " | //button[contains(@href,'payment-link')]"
+                " | //a[contains(normalize-space(.),'결제링크')]"
+                " | //a[contains(normalize-space(.),'결제 링크')]"
+                " | //button[contains(normalize-space(.),'결제링크')]"
+                " | //button[contains(normalize-space(.),'결제 링크')]",
+            )
+            if candidates:
+                nav_btn = candidates[0]
+
+            if nav_btn:
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({behavior:'instant',block:'center'});",
+                    nav_btn,
+                )
+                time.sleep(0.1)
+                driver.execute_script("arguments[0].click();", nav_btn)
+                try:
+                    WebDriverWait(driver, 3).until(EC.url_contains("payment-link"))
+                    print(f"[NAV] 메뉴 클릭으로 /payment-link 진입 성공 (attempt={attempt}, url={driver.current_url})")
+                    return True
+                except Exception:
+                    print("[NAV] 메뉴 클릭 후에도 /payment-link 로 전환되지 않음, 재시도 예정.")
+        except Exception as e_nav:
+            print(f"[NAV] 메뉴 기반 /payment-link 진입 시도 중 예외: {e_nav}")
+
+        time.sleep(0.5)
+
+    print("[NAV][ERROR] 여러 차례 시도했으나 /payment-link 로 진입하지 못했습니다.")
+    return False
+
 # 코드와 데이터 경로 분리: SISA_DATA_DIR (없으면 ./data)
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("SISA_DATA_DIR") or (BASE_DIR / "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+WAKEUP_FLAG_PATH = DATA_DIR / "crawler_wakeup.flag"
+
+# 로컬 테스트 모드: DB 에는 아무 것도 쓰지 않고, 크롤링/매크로 동작만 확인할 때 사용
+# - SISA_LOCAL_TEST 가 명시되면 그 값을 따르고
+# - 없으면 "서버 환경이 아니면" 기본적으로 LOCAL_TEST=True 로 동작하게 만든다.
+_local_flag = os.environ.get("SISA_LOCAL_TEST")
+if _local_flag is None:
+    LOCAL_TEST = not _is_server_env()
+else:
+    LOCAL_TEST = _local_flag.strip().lower() in ("1", "true", "yes", "y")
+
+
+def signal_crawler_wakeup() -> None:
+    """
+    K-VAN 크롤러(kvan_crawler.py)에 "즉시 다시 크롤링해 달라"는 신호를 남긴다.
+
+    - DATA_DIR/crawler_wakeup.flag 파일에 타임스탬프를 기록하는 방식으로 구현.
+    - 크롤러는 대기(sleep) 중 이 파일을 감지하면 대기를 즉시 종료하고 다음 사이클을 시작한다.
+    """
+    try:
+        WAKEUP_FLAG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(WAKEUP_FLAG_PATH, "w", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+        print(f"[WAKEUP] 크롤러 깨우기 플래그 생성: {WAKEUP_FLAG_PATH}")
+    except Exception as e:
+        print(f"[WAKEUP][WARN] 크롤러 깨우기 플래그 생성 실패: {e}")
+
 
 # 입력 데이터 JSON 파일 (web_form.py 가 생성)
 ORDER_JSON_PATH = DATA_DIR / "current_order.json"
@@ -63,6 +197,60 @@ ADMIN_STATE_PATH = DATA_DIR / "admin_state.json"
 # 옥션 상품 리스트 (본사 홈페이지 auction.html 기반)
 AUCTION_ITEMS: list[dict] = []
 AUCTION_LOADED = False
+
+
+def _has_active_sessions(window_minutes: int = 10) -> bool:
+    """
+    admin_state.json 기준으로 '결제중' 세션이 있거나,
+    최근 window_minutes 분 이내에 생성된 세션이 있으면 True.
+
+    - 링크 생성 매크로(auto_kvan)가 새 세션을 만들면 크롤러가 4~7초 주기로 동작하도록
+      크롤러에서 이 함수를 사용한다.
+    """
+    try:
+        if not ADMIN_STATE_PATH.exists():
+            return False
+        with open(ADMIN_STATE_PATH, "r", encoding="utf-8") as f:
+            st = json.load(f)
+        sessions = st.get("sessions") or []
+        history = st.get("history") or []
+
+        cutoff = datetime.utcnow() - timedelta(minutes=window_minutes)
+
+        # 1) 진행 중 세션
+        for s in sessions:
+            status = str(s.get("status") or "결제중")
+            if status == "결제중":
+                return True
+
+        # 2) 최근에 생성된 세션 (예: 매크로가 방금 만든 세션)
+        for s in sessions:
+            ts = s.get("created_at")
+            if not ts:
+                continue
+            try:
+                dt = datetime.fromisoformat(ts)
+            except Exception:
+                continue
+            if dt >= cutoff:
+                return True
+
+        # history 도 참고하고 싶으면 여기서 추가 검사 가능
+        for h in history:
+            ts = h.get("created_at")
+            if not ts:
+                continue
+            try:
+                dt = datetime.fromisoformat(ts)
+            except Exception:
+                continue
+            if dt >= cutoff and h.get("status") == "결제중":
+                return True
+
+        return False
+    except Exception as e:
+        print(f"[WARN] _has_active_sessions 검사 실패: {e}")
+        return False
 
 
 def _load_auction_items() -> None:
@@ -225,51 +413,113 @@ def _set_session_ttl_to_5min(driver: webdriver.Chrome, max_wait: float = 10.0) -
          시작하는지 확인해 실제로 변경되었는지 검증한다.
     - 위 과정을 max_wait 초 동안 반복 시도하고, 성공하면 True, 아니면 False.
     """
-    end_time = time.time() + max_wait
+    # 이 함수는 최대한 빨리(한 번의 시도 안에서) 3분 트리거를 열고,
+    # 5분 또는 60분 옵션을 클릭 시도한 다음, 바로 다음 단계(링크 생성)로 넘어가기 위한 것이다.
+    # 사용자가 5분/60분 모두 허용한다고 하였으므로, 여기서는 "최대한 클릭 시도"만 하고
+    # 성공 여부에 관계 없이 True 를 반환해 흐름을 빠르게 진행시킨다.
 
-    while time.time() < end_time:
-        changed = False
+    # 0) 현재 값 로깅 (디버깅용)
+    try:
+        trigger = driver.find_element(By.ID, "session-ttl")
+        value_span = trigger.find_element(By.CSS_SELECTOR, "span[data-slot='select-value']")
+        before = (value_span.text or "").strip()
+        print(f"[DEBUG] 세션유효시간 초기 값(before)='{before}'")
+        if before.startswith("5분") or before.startswith("60분"):
+            print(f"[INFO] 세션 유효시간이 이미 '{before}' 로 설정되어 있습니다.")
+            return True
+    except Exception as e:
+        print(f"[DEBUG] 세션유효시간 초기값 읽기 실패: {e}")
 
-        # 1) 트리거 버튼 클릭 (드롭다운 열기)
-        try:
-            trigger = driver.find_element(By.ID, "session-ttl")
-            driver.execute_script("arguments[0].click();", trigger)
+    # 1) 트리거 버튼 클릭 (3분 콤보박스 열기)
+    try:
+        trigger = driver.find_element(By.ID, "session-ttl")
+        driver.execute_script("arguments[0].click();", trigger)
+        time.sleep(0.15)
+    except Exception as e:
+        print(f"[DEBUG] 세션유효시간 트리거 클릭 실패: {e}")
+
+    # 2) 드롭다운 안에서 '5분 (일반 결제)' 또는 '5분' 텍스트 옵션 클릭 시도
+    try:
+        candidates = driver.find_elements(
+            By.XPATH,
+            "//*[contains(normalize-space(.),'5분 (일반 결제)') or contains(normalize-space(.),'5분')]",
+        )
+        visible_opts = [el for el in candidates if el.is_displayed()]
+        print(f"[DEBUG] 5분 옵션 후보 개수={len(candidates)}, 표시되는 개수={len(visible_opts)}")
+        if visible_opts:
+            driver.execute_script("arguments[0].click();", visible_opts[0])
             time.sleep(0.2)
-        except Exception:
-            # 아직 로딩 중일 수 있으므로 바로 실패로 보지 않는다.
+    except Exception as e:
+        print(f"[DEBUG] 5분 옵션 텍스트 기반 클릭 실패: {e}")
+
+    # 3) 여전히 안 보인다면, 드롭다운 내에서 다시 '3분' 위치를 기준으로 스크롤 후 5분 재시도
+    try:
+        three_opts = driver.find_elements(
+            By.XPATH,
+            "//*[contains(normalize-space(.),'3분 (빠른 결제)') or contains(normalize-space(.),'3분')]",
+        )
+        three_visible = [el for el in three_opts if el.is_displayed()]
+        print(f"[DEBUG] 3분 옵션 후보 개수={len(three_opts)}, 표시되는 개수={len(three_visible)}")
+        if three_visible:
+            three_el = three_visible[0]
+            driver.execute_script(
+                "arguments[0].scrollIntoView({behavior:'instant', block:'start'});", three_el
+            )
+            time.sleep(0.1)
+            candidates2 = driver.find_elements(
+                By.XPATH,
+                "//*[contains(normalize-space(.),'5분 (일반 결제)') or contains(normalize-space(.),'5분')]",
+            )
+            visible2 = [el for el in candidates2 if el.is_displayed()]
+            print(f"[DEBUG] 5분 옵션(재검색) 후보 개수={len(candidates2)}, 표시되는 개수={len(visible2)}")
+            if visible2:
+                driver.execute_script("arguments[0].click();", visible2[0])
+                time.sleep(0.2)
+    except Exception as e:
+        print(f"[DEBUG] 3분 기준 스크롤 후 5분 클릭 시도 실패: {e}")
+
+    # 4) 그래도 안 되면, 3분 클릭 위치에서 위로 30px 좌표 클릭 폴백 (60분 선택 가능)
+    try:
+        trigger = driver.find_element(By.ID, "session-ttl")
+        rect = driver.execute_script(
+            """
+const el = arguments[0];
+const r = el.getBoundingClientRect();
+return { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2, h: r.bottom - r.top };
+""",
+            trigger,
+        )
+        if rect and "x" in rect and "y" in rect:
+            from selenium.webdriver.common.action_chains import ActionChains
+
+            actions = ActionChains(driver)
+            try:
+                actions.move_by_offset(
+                    -actions.w3c_actions.pointer_action.x,
+                    -actions.w3c_actions.pointer_action.y,
+                )
+            except Exception:
+                pass
+            target_x = rect["x"]
+            target_y = rect["y"] - 30  # 요청하신 대로 위로 30px 이동
+            print(f"[DEBUG] 좌표 기반 5분/60분 클릭 폴백 시도: x={target_x}, y={target_y}")
+            actions.move_by_offset(target_x, target_y).click().perform()
             time.sleep(0.2)
+    except Exception as e:
+        print(f"[DEBUG] 좌표 기반 5분/60분 클릭 폴백 실패: {e}")
 
-        # 2) 드롭다운 옵션 중 '5분 (일반 결제)' 또는 '5분' 이 포함된 항목 클릭
-        try:
-            # aria-controls 로 연결된 리스트가 있을 가능성이 높지만,
-            # 여기서는 보이는 모든 노드 중에서 텍스트 기준으로 옵션을 찾는다.
-            candidates = driver.find_elements(By.XPATH, "//*[contains(normalize-space(.),'5분 (일반 결제)') or contains(normalize-space(.),'5분')]")
-            visible_opts = [el for el in candidates if el.is_displayed()]
-            if visible_opts:
-                driver.execute_script("arguments[0].click();", visible_opts[0])
-                changed = True
-                time.sleep(0.3)
-        except Exception:
-            # 옵션이 아직 생성되지 않았거나 구조가 다른 경우가 있을 수 있으므로 무시하고 재시도
-            pass
+    # 5) 최종 값 로그만 남기고, 다음 단계(링크 생성)로 진행
+    try:
+        trigger = driver.find_element(By.ID, "session-ttl")
+        value_span = trigger.find_element(By.CSS_SELECTOR, "span[data-slot='select-value']")
+        after = (value_span.text or "").strip()
+        print(f"[DEBUG] 세션유효시간 최종 값(after)='{after}'")
+    except Exception as e:
+        print(f"[DEBUG] 세션유효시간 최종 값 확인 실패: {e}")
 
-        # 3) 실제로 트리거의 표시 값이 '5분 (일반 결제)' 로 바뀌었는지 확인
-        try:
-            trigger = driver.find_element(By.ID, "session-ttl")
-            value_span = trigger.find_element(By.CSS_SELECTOR, "span[data-slot='select-value']")
-            text = (value_span.text or "").strip()
-            if text.startswith("5분"):
-                print(f"[INFO] 세션 유효시간이 '{text}' 로 설정되었습니다.")
-                return True
-        except Exception:
-            # 아직 반영 전이거나 요소를 못 찾은 경우, 아래에서 재시도
-            pass
-
-        # 클릭을 했다고 판단되었지만 검증이 실패한 경우에도 반복해서 재시도
-        time.sleep(0.3)
-
-    print("[WARN] 세션 유효시간을 '5분 (일반 결제)' 로 변경하지 못했습니다.")
-    return False
+    # 성공 여부와 상관 없이, 시간을 더 쓰지 않고 바로 다음 단계로 진행한다.
+    print("[INFO] 세션유효시간 변경 시도를 마쳤습니다. 현재 값에 상관없이 링크 생성 단계로 이동합니다.")
+    return True
 
 
 def _find_input_quick(
@@ -508,7 +758,7 @@ def load_order_from_json(path: str) -> PaymentRow:
     if "product_name" not in raw or not str(raw.get("product_name") or "").strip():
         raw["product_name"] = "SISA 테스트 상품"
     if "login_id" not in raw or not str(raw.get("login_id") or "").strip():
-        raw["login_id"] = "m1234"
+        raw["login_id"] = "m3313"
 
     missing = [k for k in HEADERS if k not in raw or raw[k] in ("", None)]
     if missing:
@@ -591,11 +841,18 @@ def _parse_amount(text: str) -> int:
 
 
 def _scrape_dashboard_and_store(driver: webdriver.Chrome) -> None:
-    """로그인 후 대시보드 화면에서 매출 요약 정보를 크롤링하여 DB에 저장."""
+    """로그인 후 대시보드 화면에서 매출 요약 정보를 크롤링하여 DB에 저장.
+
+    로컬 테스트 모드(LOCAL_TEST=True)에서는 DB 에 쓰지 않고 바로 리턴한다.
+    """
+    if LOCAL_TEST:
+        print("[LOCAL_TEST] 대시보드 크롤링/DB 저장을 건너뜁니다.")
+        return
     try:
-        wait = WebDriverWait(driver, 5)
-        # 대시보드가 렌더링될 시간을 약간 준다
-        time.sleep(2.0)
+        # 대시보드가 렌더링될 시간을 아주 짧게만 준다
+        time.sleep(0.5)
+        # 너무 오래 기다리지 않도록 짧은 wait 사용
+        wait = WebDriverWait(driver, 3)
 
         # 각 블록은 '월 매출', '전일 매출', '정산 예정 금액', '나의 크레딧' 등의 텍스트를 기준으로 탐색
         def find_block(label_text: str):
@@ -756,6 +1013,1111 @@ def _scrape_dashboard_and_store(driver: webdriver.Chrome) -> None:
         print(f"[WARN] 대시보드 크롤링/DB 저장 실패: {e}")
 
 
+def _ensure_kvan_transactions_table() -> None:
+    """kvan_transactions 테이블이 없으면 생성."""
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS kvan_transactions (
+                  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                  captured_at DATETIME NOT NULL,
+                  merchant_name VARCHAR(255) DEFAULT '',
+                  pg_name VARCHAR(100) DEFAULT '',
+                  mid VARCHAR(100) DEFAULT '',
+                  fee_rate VARCHAR(50) DEFAULT '',
+                  tx_type VARCHAR(50) DEFAULT '',
+                  amount BIGINT DEFAULT 0,
+                  cancel_amount BIGINT DEFAULT 0,
+                  payable_amount BIGINT DEFAULT 0,
+                  card_company VARCHAR(100) DEFAULT '',
+                  card_number VARCHAR(64) DEFAULT '',
+                  installment VARCHAR(50) DEFAULT '',
+                  approval_no VARCHAR(100) DEFAULT '',
+                  registered_at VARCHAR(50) DEFAULT '',
+                  raw_text TEXT
+                ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+                """
+            )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[WARN] kvan_transactions 테이블 생성 실패: {e}")
+
+
+def _scrape_transactions_and_store(driver: webdriver.Chrome) -> None:
+    """
+    K-VAN 결제/취소 거래내역 페이지(/transactions)의 테이블을 크롤링하여
+    kvan_transactions 테이블에 저장.
+    """
+    if LOCAL_TEST:
+        print("[LOCAL_TEST] /transactions 크롤링/DB 저장을 건너뜁니다.")
+        # 페이지 이동과 화면 구조만 빠르게 확인 (항상 실제 새로고침)
+        if "transactions" in driver.current_url:
+            driver.refresh()
+        else:
+            driver.get("https://store.k-van.app/transactions")
+        return
+
+    try:
+        _ensure_kvan_transactions_table()
+        # 첫 방문 또는 재방문 시 항상 최신 데이터를 보도록 새로고침/이동
+        if "transactions" in driver.current_url:
+            driver.refresh()
+        else:
+            driver.get("https://store.k-van.app/transactions")
+        wait = WebDriverWait(driver, 10)
+
+        # 실제 테이블이 렌더링될 때까지 대기 (tbody > tr)
+        wait.until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//table//tbody//tr")
+            )
+        )
+
+        # 헤더 텍스트를 기준으로 컬럼 인덱스 매핑
+        header_cells = driver.find_elements(By.XPATH, "//table//thead//tr[1]//th")
+        headers = [h.text.strip() for h in header_cells]
+
+        def idx(sub: str) -> int:
+            for i, h in enumerate(headers):
+                if sub in h:
+                    return i
+            return -1
+
+        idx_merchant = idx("가맹점명")
+        idx_pg = idx("PG사")
+        idx_mid = idx("MID")
+        idx_fee = idx("수수료율")
+        idx_type = idx("결제 유형")
+        idx_amt = idx("결제 금액")
+        idx_cancel = idx("취소 금액")
+        idx_payable = idx("지급예정금액")
+        idx_cardco = idx("카드사")
+        idx_cardno = idx("카드번호")
+        idx_inst = idx("할부")
+        idx_approval = idx("승인번호")
+        idx_reg = idx("등록일")
+
+        rows = driver.find_elements(By.XPATH, "//table//tbody//tr")
+        if not rows:
+            print("[INFO] /transactions 테이블에 표시된 거래 내역이 없습니다.")
+            return
+
+        conn = get_db()
+        inserted = 0
+        with conn.cursor() as cur:
+            for tr in rows:
+                try:
+                    cells = tr.find_elements(By.XPATH, ".//td")
+                    texts = [c.text.strip() for c in cells]
+                    if not any(texts):
+                        continue
+
+                    def get(i: int) -> str:
+                        return texts[i] if 0 <= i < len(texts) else ""
+
+                    merchant = get(idx_merchant)
+                    pg_name = get(idx_pg)
+                    mid = get(idx_mid)
+                    fee_rate = get(idx_fee)
+                    tx_type = get(idx_type)
+                    amount = _parse_amount(get(idx_amt))
+                    cancel_amount = _parse_amount(get(idx_cancel))
+                    payable_amount = _parse_amount(get(idx_payable))
+                    card_company = get(idx_cardco)
+                    card_number = get(idx_cardno)
+                    installment = get(idx_inst)
+                    approval_no = get(idx_approval)
+                    registered_at = get(idx_reg)
+                    raw_text = " | ".join(texts)
+
+                    cur.execute(
+                        """
+                        INSERT INTO kvan_transactions (
+                          captured_at,
+                          merchant_name,
+                          pg_name,
+                          mid,
+                          fee_rate,
+                          tx_type,
+                          amount,
+                          cancel_amount,
+                          payable_amount,
+                          card_company,
+                          card_number,
+                          installment,
+                          approval_no,
+                          registered_at,
+                          raw_text
+                        )
+                        VALUES (NOW(), %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        (
+                            merchant,
+                            pg_name,
+                            mid,
+                            fee_rate,
+                            tx_type,
+                            amount,
+                            cancel_amount,
+                            payable_amount,
+                            card_company,
+                            card_number,
+                            installment,
+                            approval_no,
+                            registered_at,
+                            raw_text,
+                        ),
+                    )
+                    inserted += 1
+                except Exception as e_row:
+                    print(f"[WARN] 거래내역 한 행 파싱/저장 중 오류: {e_row}")
+                    continue
+
+        conn.commit()
+        conn.close()
+        print(f"[INFO] /transactions 에서 {inserted}건의 거래내역을 kvan_transactions 에 저장했습니다.")
+    except Exception as e:
+        print(f"[WARN] 거래내역(/transactions) 크롤링/DB 저장 실패: {e}")
+
+
+def _sync_kvan_to_transactions() -> bool:
+    """
+    kvan_transactions 에 쌓인 K-VAN 거래내역을
+    내부 transactions 테이블과 최대한 매핑하고,
+    필요하면 새 거래 레코드를 생성하여 본사/대행사 정산 데이터와 연결한다.
+
+    우선순위:
+    1) approval_no(승인번호) 기준으로 기존 transactions 찾기
+    2) 없으면 amount + 날짜(+ agency_id) 기준으로 가장 최근 거래 매핑
+    3) 그래도 없으면 신규 transactions 레코드 INSERT
+
+    agency_id 매핑:
+    - agencies.kvan_mid 와 kvan_transactions.mid 를 비교해 일치하는 대행사를 찾는다.
+    """
+    if LOCAL_TEST:
+        print("[LOCAL_TEST] kvan_transactions → transactions 매핑/생성을 건너뜁니다.")
+        return False
+
+    updated = 0
+    inserted = 0
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            # 0) MID -> agency_id 매핑 테이블 생성
+            agency_mid_map: dict[str, str] = {}
+            try:
+                cur.execute("SELECT id, kvan_mid FROM agencies")
+                for ag in cur.fetchall():
+                    m = (ag.get("kvan_mid") or "").strip()
+                    if m:
+                        agency_mid_map[m] = ag["id"]
+            except Exception as e_ag:
+                print(f"[WARN] agencies.kvan_mid 조회 중 오류(계속 진행): {e_ag}")
+
+            # 1) 최근 K-VAN 거래 200건만 사용
+            cur.execute(
+                """
+                SELECT id, captured_at, merchant_name, mid, tx_type,
+                       amount, approval_no, registered_at
+                FROM kvan_transactions
+                ORDER BY captured_at DESC
+                LIMIT 200
+                """
+            )
+            krows = cur.fetchall()
+
+            for kr in krows:
+                amt = kr.get("amount") or 0
+                approval = (kr.get("approval_no") or "").strip()
+                mid = (kr.get("mid") or "").strip()
+                tx_type = (kr.get("tx_type") or "").strip()
+                reg = (kr.get("registered_at") or "").strip()
+                if not amt or not approval:
+                    # 금액/승인번호가 없으면 내부 거래와 매핑하기 어려우므로 건너뜀
+                    continue
+
+                # 등록일에서 날짜 부분만 추출 (예: '2026-03-12 10:20:30' -> '2026-03-12')
+                reg_date = reg.split(" ")[0] if reg else ""
+
+                # MID -> agency_id 매핑
+                agency_id: str | None = None
+                if mid and mid in agency_mid_map:
+                    agency_id = agency_mid_map[mid]
+
+                # K-VAN 결제유형 기준으로 내부 status 유추
+                tx_status = "other"
+                tx_type_text = tx_type or ""
+                if "승인" in tx_type_text:
+                    tx_status = "success"
+                elif "취소" in tx_type_text or "실패" in tx_type_text or "오류" in tx_type_text:
+                    tx_status = "fail"
+
+                # 1단계: 승인번호로 기존 거래 찾기
+                cur.execute(
+                    """
+                    SELECT id, agency_id
+                    FROM transactions
+                    WHERE kvan_approval_no = %s
+                    LIMIT 1
+                    """,
+                    (approval,),
+                )
+                tx = cur.fetchone()
+                if tx:
+                    tx_id = tx["id"]
+                    # agency_id 가 비어 있고, 이번 K-VAN 에서 대행사를 알 수 있다면 채워 넣는다.
+                    cur.execute(
+                        """
+                        UPDATE transactions
+                        SET amount = COALESCE(amount, %s),
+                            status = %s,
+                            kvan_mid = %s,
+                            kvan_approval_no = %s,
+                            kvan_tx_type = %s,
+                            kvan_registered_at = %s,
+                            agency_id = COALESCE(agency_id, %s)
+                        WHERE id = %s
+                        """,
+                        (amt, tx_status, mid, approval, tx_type, reg, agency_id, tx_id),
+                    )
+                    updated += 1
+                    continue
+
+                # 2단계: 금액 + 날짜(+ agency_id) 기준으로 기존 거래 찾기
+                params: list = [amt, reg_date, reg_date]
+                sql = """
+                    SELECT id, agency_id
+                    FROM transactions
+                    WHERE amount = %s
+                      AND (%s = '' OR DATE(created_at) = %s)
+                """
+                if agency_id:
+                    sql += " AND agency_id = %s"
+                    params.append(agency_id)
+                sql += """
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """
+                cur.execute(sql, tuple(params))
+                tx = cur.fetchone()
+                if tx:
+                    tx_id = tx["id"]
+                    cur.execute(
+                        """
+                        UPDATE transactions
+                        SET status = %s,
+                            kvan_mid = %s,
+                            kvan_approval_no = %s,
+                            kvan_tx_type = %s,
+                            kvan_registered_at = %s
+                        WHERE id = %s
+                        """,
+                        (tx_status, mid, approval, tx_type, reg, tx_id),
+                    )
+                    updated += 1
+                    continue
+
+                # 3단계: 매칭되는 기존 거래가 없으면 새 transactions 레코드 생성
+                new_tx_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")[-18:]
+                message = f"K-VAN {tx_type or '거래'} 자동 연동 (MID={mid}, 승인번호={approval})"
+                cur.execute(
+                    """
+                    INSERT INTO transactions (
+                      id,
+                      created_at,
+                      agency_id,
+                      amount,
+                      customer_name,
+                      phone_number,
+                      card_type,
+                      resident_front,
+                      status,
+                      message,
+                      settlement_status,
+                      settled_at,
+                      kvan_mid,
+                      kvan_approval_no,
+                      kvan_tx_type,
+                      kvan_registered_at
+                    )
+                    VALUES (
+                      %s, NOW(), %s, %s,
+                      '', '', '', '',
+                      %s, %s,
+                      '미정산', NULL,
+                      %s, %s, %s, %s
+                    )
+                    """,
+                    (
+                        new_tx_id,
+                        agency_id,
+                        amt,
+                        tx_status,
+                        message,
+                        mid,
+                        approval,
+                        tx_type,
+                        reg,
+                    ),
+                )
+                inserted += 1
+
+        conn.commit()
+        conn.close()
+        if updated or inserted:
+            print(
+                f"[INFO] kvan_transactions 기반으로 내부 거래 매핑/생성 완료 "
+                f"(updated={updated}, inserted={inserted})"
+            )
+    except Exception as e:
+        print(f"[WARN] K-VAN ↔ 내부 transactions 매핑/생성 중 오류: {e}")
+    return bool(updated or inserted)
+
+
+def _ensure_kvan_links_table() -> None:
+    """kvan_links 테이블이 없으면 생성."""
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS kvan_links (
+                  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                  captured_at DATETIME NOT NULL,
+                  title VARCHAR(255) DEFAULT '',
+                  amount BIGINT DEFAULT 0,
+                  ttl_label VARCHAR(100) DEFAULT '',
+                  status VARCHAR(100) DEFAULT '',
+                  kvan_link VARCHAR(512) DEFAULT '',
+                  mid VARCHAR(100) DEFAULT '',
+                  kvan_session_id VARCHAR(100) DEFAULT '',
+                  raw_text TEXT
+                ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+                """
+            )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[WARN] kvan_links 테이블 생성 실패: {e}")
+
+
+def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
+    """
+    K-VAN 결제링크 관리 페이지(/payment-link)의 리스트를 크롤링하여
+    kvan_links 테이블에 저장.
+
+    화면 구조는 React 카드/테이블 형태일 수 있으므로,
+    - 링크 URL (https://store.k-van.app/...)
+    - 인근 텍스트(상품명, 금액, 유효시간, 상태, MID, 세션ID 등)를 모두 raw_text 로 저장하고
+    - 자주 쓰는 필드(제목/금액/유효시간/status/MID/세션ID)는 휴리스틱하게 추출한다.
+    """
+    if LOCAL_TEST:
+        print("[LOCAL_TEST] /payment-link 크롤링/DB 저장을 건너뜁니다.")
+        # 항상 실제 새로고침 또는 첫 진입 (진입 실패 시에도 DB 작업은 건너뛰고 종료)
+        if not _go_to_payment_link(driver):
+            raise RuntimeError("[NAV] LOCAL_TEST 모드에서 /payment-link 로 진입하지 못했습니다.")
+        driver.refresh()
+        return
+
+    try:
+        _ensure_kvan_links_table()
+        # /payment-link 로 안정적으로 진입 후, 항상 새로고침
+        if not _go_to_payment_link(driver):
+            raise RuntimeError("[NAV] /payment-link 로 진입하지 못해 링크 리스트 크롤링을 중단합니다.")
+        driver.refresh()
+        wait = WebDriverWait(driver, 10)
+
+        # 실제 카드/테이블이 렌더링될 때까지 대기:
+        # 링크 텍스트나 input.value 에 'https://store.k-van.app' 가 포함된 요소가 나타날 때까지
+        wait.until(
+            EC.presence_of_element_located(
+                (
+                    By.XPATH,
+                    "//*[contains(text(),'https://store.k-van.app') "
+                    "or contains(@value,'https://store.k-van.app')]",
+                )
+            )
+        )
+
+        # 각 링크 요소를 기준으로 상위 카드 컨테이너를 찾는다.
+        link_elements = driver.find_elements(
+            By.XPATH,
+            "//*[contains(text(),'https://store.k-van.app') "
+            "or contains(@value,'https://store.k-van.app')]",
+        )
+        if not link_elements:
+            print("[INFO] /payment-link 에 표시된 결제링크가 없습니다.")
+            return
+
+        conn = get_db()
+        inserted = 0
+        with conn.cursor() as cur:
+            for el in link_elements:
+                try:
+                    # 링크 문자열 추출
+                    link_text = (el.text or "").strip()
+                    if not link_text:
+                        link_text = (el.get_attribute("value") or "").strip()
+                    if not link_text:
+                        link_text = (el.get_attribute("href") or "").strip()
+                    if not link_text:
+                        continue
+
+                    # 카드/행 컨테이너: 가장 가까운 div[role='row'] 또는 카드형 div
+                    container = el
+                    for _ in range(5):
+                        container = container.find_element(By.XPATH, "./parent::*")
+                        cls = container.get_attribute("class") or ""
+                        if "border" in cls or "rounded" in cls or "shadow" in cls or "row" in cls:
+                            break
+
+                    card_text = container.text.strip()
+
+                    # 제목/상품명: 첫 줄 또는 '상품명' 이라는 단어가 포함된 줄
+                    lines = [ln.strip() for ln in card_text.splitlines() if ln.strip()]
+                    title = lines[0] if lines else ""
+                    for ln in lines:
+                        if "상품명" in ln:
+                            title = ln
+                            break
+
+                    # 금액: '원' 이 포함된 숫자
+                    amount = 0
+                    for ln in lines:
+                        if "원" in ln:
+                            amt = _parse_amount(ln)
+                            if amt:
+                                amount = amt
+                                break
+
+                    # 유효시간/TTL: '분' 텍스트가 있는 줄 추출 (예: '60분 (긴 결제 플로우)')
+                    ttl_label = ""
+                    for ln in lines:
+                        if "분" in ln and "유효" in ln or "세션" in ln:
+                            ttl_label = ln
+                            break
+
+                    # 상태: '사용중', '만료', '취소' 등 단어가 포함된 줄 추출
+                    status = ""
+                    for ln in lines:
+                        if any(k in ln for k in ("사용", "만료", "취소", "대기", "완료")):
+                            status = ln
+                            break
+
+                    # MID / 세션ID: 'MID' 또는 '세션' 텍스트 기반
+                    mid = ""
+                    kvan_session_id = ""
+                    for ln in lines:
+                        if "MID" in ln.upper():
+                            mid = ln
+                        if "세션" in ln or "Session" in ln:
+                            kvan_session_id = ln
+
+                    cur.execute(
+                        """
+                        INSERT INTO kvan_links (
+                          captured_at,
+                          title,
+                          amount,
+                          ttl_label,
+                          status,
+                          kvan_link,
+                          mid,
+                          kvan_session_id,
+                          raw_text
+                        )
+                        VALUES (NOW(), %s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        (
+                            title,
+                            amount,
+                            ttl_label,
+                            status,
+                            link_text,
+                            mid,
+                            kvan_session_id,
+                            card_text,
+                        ),
+                    )
+                    inserted += 1
+                except Exception as e_row:
+                    print(f"[WARN] 결제링크 카드 파싱/저장 중 오류: {e_row}")
+                    continue
+
+        conn.commit()
+        conn.close()
+        print(f"[INFO] /payment-link 에서 {inserted}건의 결제링크 정보를 kvan_links 에 저장했습니다.")
+    except Exception as e:
+        print(f"[WARN] 결제링크 관리(/payment-link) 크롤링/DB 저장 실패: {e}")
+
+
+def _sync_popup_transaction_to_internal(
+    session_id: str,
+    amount: int,
+    approval_no: str,
+    card_number: str,
+    registered_at: str,
+    customer_name: str,
+) -> None:
+    """
+    결제링크 관리 화면의 '거래 내역' 팝업에서 얻은 승인 정보를
+    내부 transactions 테이블과 admin_state.json 에 반영한다.
+
+    - session_id 를 기준으로 admin_state.json 에서 agency_id 를 찾는다.
+    - kvan_approval_no 가 같은 transactions 가 있으면 업데이트,
+      없으면 새 레코드를 INSERT 한다.
+    """
+    if LOCAL_TEST:
+        print("[LOCAL_TEST] 팝업 기반 transactions 동기화를 건너뜁니다.")
+        return
+
+    approval_no = (approval_no or "").strip()
+    if not approval_no or not amount:
+        return
+
+    # admin_state.json 에서 agency_id 찾기
+    agency_id: str | None = None
+    try:
+        if ADMIN_STATE_PATH.exists():
+            with open(ADMIN_STATE_PATH, "r", encoding="utf-8") as f:
+                st = json.load(f)
+            sessions = st.get("sessions") or []
+            history = st.get("history") or []
+            for s in list(sessions) + list(history):
+                if str(s.get("id")) == str(session_id):
+                    agency_id = (s.get("agency_id") or "").strip() or None
+                    break
+    except Exception as e:
+        print(f"[WARN] popup 기반 agency_id 조회 실패: {e}")
+
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            # 1) 승인번호로 기존 거래 찾기
+            cur.execute(
+                """
+                SELECT id FROM transactions
+                WHERE kvan_approval_no = %s
+                LIMIT 1
+                """,
+                (approval_no,),
+            )
+            row = cur.fetchone()
+            if row:
+                tx_id = row["id"]
+                cur.execute(
+                    """
+                    UPDATE transactions
+                    SET amount = COALESCE(amount, %s),
+                        customer_name = COALESCE(customer_name, %s),
+                        status = 'success',
+                        kvan_registered_at = %s,
+                        agency_id = COALESCE(agency_id, %s)
+                    WHERE id = %s
+                    """,
+                    (amount, customer_name or "", registered_at, agency_id, tx_id),
+                )
+            else:
+                # 2) 새 레코드 생성
+                new_tx_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")[-18:]
+                message = (
+                    f"K-VAN 결제 승인 (세션ID={session_id}, 승인번호={approval_no}, 카드={card_number})"
+                )
+                cur.execute(
+                    """
+                    INSERT INTO transactions (
+                      id,
+                      created_at,
+                      agency_id,
+                      amount,
+                      customer_name,
+                      phone_number,
+                      card_type,
+                      resident_front,
+                      status,
+                      message,
+                      settlement_status,
+                      settled_at,
+                      kvan_mid,
+                      kvan_approval_no,
+                      kvan_tx_type,
+                      kvan_registered_at
+                    )
+                    VALUES (
+                      %s, NOW(), %s, %s,
+                      %s, '', '', '',
+                      'success', %s,
+                      '미정산', NULL,
+                      '', %s, '결제 승인', %s
+                    )
+                    """,
+                    (
+                        new_tx_id,
+                        agency_id,
+                        amount,
+                        customer_name or "",
+                        message,
+                        approval_no,
+                        registered_at,
+                    ),
+                )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[WARN] popup 기반 transactions 동기화 실패: {e}")
+
+
+def _close_dialog(dialog) -> None:
+    """
+    '거래 내역' 팝업을 안전하게 닫고, 오버레이까지 사라질 때까지 잠시 대기한다.
+
+    - dialog 내부의 닫기 버튼(data-slot='dialog-close')를 우선 클릭
+    - 실패하면 오버레이(div[data-slot='dialog-overlay'])를 클릭 시도
+    - 마지막으로, 해당 dialog 자체가 DOM 에서 사라질 때까지 최대 2초 대기
+    """
+    try:
+        driver = dialog.parent  # WebElement 가 생성된 WebDriver 인스턴스
+        # 1차: X 버튼 클릭
+        try:
+            close_btn = dialog.find_element(
+                By.XPATH, ".//button[@data-slot='dialog-close']"
+            )
+            driver.execute_script("arguments[0].click();", close_btn)
+        except Exception:
+            # 2차: 오버레이 클릭 (배경을 클릭해 닫히는 타입일 수 있음)
+            try:
+                overlay = driver.find_element(
+                    By.XPATH,
+                    "//div[@data-slot='dialog-overlay' and @data-state='open']",
+                )
+                driver.execute_script("arguments[0].click();", overlay)
+            except Exception:
+                pass
+
+        # 3차: dialog/오버레이가 실제로 사라질 때까지 잠시 대기
+        try:
+            WebDriverWait(driver, 2).until_not(
+                EC.presence_of_element_located(
+                    (
+                        By.XPATH,
+                        "//div[@role='dialog' and .//h2[normalize-space()='거래 내역']]",
+                    )
+                )
+            )
+        except TimeoutException:
+            # 완전히 사라지지 않아도, 이후 로직에서 다시 한 번 시도하게 둔다.
+            pass
+        time.sleep(0.05)
+    except Exception:
+        pass
+
+
+def _click_trash_and_confirm(card, wait: WebDriverWait) -> bool:
+    """
+    카드 안 휴지통 버튼(title='삭제') 클릭 후,
+    확인 팝업의 붉은 '삭제' 버튼을 클릭한다.
+    """
+    try:
+        driver = wait._driver  # WebDriverWait 에 연결된 driver
+
+        # 1) 카드 안의 휴지통 아이콘 클릭
+        trash_btn = card.find_element(
+            By.XPATH,
+            ".//button[@title='삭제']"
+            " | .//button[.//svg[contains(@class,'lucide-trash') or contains(@class,'lucide-trash-2')]]",
+        )
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", trash_btn)
+        time.sleep(0.05)
+        driver.execute_script("arguments[0].click();", trash_btn)
+
+        # 2) 휴지통 클릭 후 뜨는 경고 다이얼로그(빨간 '삭제' 버튼)가 나타날 때까지 대기
+        try:
+            alert = wait.until(
+                EC.visibility_of_element_located(
+                    (
+                        By.XPATH,
+                        "//div[@role='alertdialog']"
+                        " | //div[@data-slot='alert-dialog-content']",
+                    )
+                )
+            )
+        except TimeoutException:
+            print("[WARN] 휴지통 클릭 후 경고 다이얼로그를 찾지 못했습니다.")
+            return False
+
+        # 3) 다이얼로그 안의 붉은 '삭제' 버튼 클릭
+        try:
+            confirm_btn = alert.find_element(
+                By.XPATH,
+                ".//button[normalize-space()='삭제']",
+            )
+        except Exception:
+            # fallback: 화면 전체에서라도 '삭제' 버튼을 찾는다
+            confirm_btn = wait.until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, "//button[normalize-space()='삭제']")
+                )
+            )
+
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", confirm_btn)
+        time.sleep(0.05)
+        driver.execute_script("arguments[0].click();", confirm_btn)
+
+        # 4) alert 다이얼로그/오버레이가 사라질 때까지 잠시 대기
+        try:
+            WebDriverWait(driver, 2).until_not(
+                EC.presence_of_element_located(
+                    (
+                        By.XPATH,
+                        "//div[@data-slot='alert-dialog-overlay' and @data-state='open']",
+                    )
+                )
+            )
+        except TimeoutException:
+            pass
+
+        time.sleep(0.2)
+        return True
+    except Exception as e:
+        print(f"[WARN] 휴지통/삭제 버튼 처리 중 오류: {e}")
+        return False
+
+
+def _is_session_already_processed(session_id: str) -> bool:
+    """
+    admin_state.json.history 에서 이미 has_approval 또는 deleted 플래그가 있는 세션이면 True.
+    """
+    if not session_id:
+        return False
+    try:
+        if not ADMIN_STATE_PATH.exists():
+            return False
+        with open(ADMIN_STATE_PATH, "r", encoding="utf-8") as f:
+            st = json.load(f)
+        history = st.get("history") or []
+        for h in history:
+            if str(h.get("id")) == str(session_id):
+                if h.get("has_approval") or h.get("deleted"):
+                    return True
+        return False
+    except Exception as e:
+        print(f"[WARN] _is_session_already_processed 실패: {e}")
+        return False
+
+
+def _mark_session_checked(session_id: str, title: str, has_approval: bool) -> None:
+    """
+    admin_state.json.history 에 has_approval 플래그를 기록해
+    다음 크롤링에서 중복 검사하지 않게 한다.
+    """
+    if not session_id:
+        return
+    try:
+        st = {"sessions": [], "history": []}
+        if ADMIN_STATE_PATH.exists():
+            with open(ADMIN_STATE_PATH, "r", encoding="utf-8") as f:
+                st = json.load(f)
+        sessions = st.get("sessions") or []
+        history = st.get("history") or []
+
+        found = False
+        for h in history:
+            if str(h.get("id")) == str(session_id):
+                h["has_approval"] = bool(has_approval)
+                h["checked_title"] = title
+                found = True
+                break
+        if not found:
+            history.append(
+                {
+                    "id": session_id,
+                    "has_approval": bool(has_approval),
+                    "checked_title": title,
+                }
+            )
+        st["sessions"] = sessions
+        st["history"] = history
+        with open(ADMIN_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[WARN] _mark_session_checked 실패: {e}")
+
+
+def _mark_session_deleted(session_id: str, title: str) -> None:
+    _mark_session_checked(session_id, title, has_approval=False)
+    try:
+        if not ADMIN_STATE_PATH.exists():
+            return
+        with open(ADMIN_STATE_PATH, "r", encoding="utf-8") as f:
+            st = json.load(f)
+        sessions = st.get("sessions") or []
+        history = st.get("history") or []
+        for h in history:
+            if str(h.get("id")) == str(session_id):
+                h["deleted"] = True
+        st["sessions"] = sessions
+        st["history"] = history
+        with open(ADMIN_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[WARN] _mark_session_deleted 실패: {e}")
+
+
+def _scan_payment_link_popups_and_sync(driver: webdriver.Chrome) -> bool:
+    """
+    결제링크 관리(/payment-link) 화면에서 각 카드의 '거래 내역' 버튼을 클릭해
+    팝업의 '결제 승인' 정보를 읽고 내부 DB와 세션에 반영한다.
+
+    반환값: 이번 사이클에서 새로운 승인/삭제/상태 변경이 있으면 True, 아니면 False.
+    """
+    changed = False
+    try:
+        t0 = _step_start("결제링크 관리 팝업 기반 동기화")
+        wait = WebDriverWait(driver, 5)
+
+        # 항상 결제링크 관리 URL 을 강제로 맞추고,
+        # '권한 확인 중...' 스피너가 끝나고 실제 카드 리스트가 나올 때까지
+        # 0.5초 간격으로 짧게 여러 번 시도한다 (최대 약 5초).
+        if not _go_to_payment_link(driver):
+            _step_end("결제링크 관리 팝업 기반 동기화", t0)
+            raise RuntimeError("[NAV] /payment-link 로 진입하지 못해 팝업 기반 동기화를 중단합니다.")
+
+        max_tries = 12  # 0.5초 * 12 ≈ 6초
+        icons_found = False
+        for attempt in range(max_tries):
+            icons = driver.find_elements(
+                By.XPATH,
+                "//button[@title='거래 내역']"
+                " | //button[contains(normalize-space(.),'거래 내역')]"
+                " | //button[contains(normalize-space(.),'거래내역')]"
+                " | //button[.//svg[contains(@class,'lucide-receipt')]]",
+            )
+            if icons:
+                print(
+                    f"[POPUP_DEBUG] '거래 내역' 아이콘 감지 (attempt={attempt}, count={len(icons)}, url={driver.current_url})"
+                )
+                icons_found = True
+                break
+            else:
+                print(
+                    f"[POPUP_DEBUG] 아이콘 없음 (attempt={attempt}, url={driver.current_url}) – 0.5초 후 재시도"
+                )
+            time.sleep(0.5)
+
+        if not icons_found:
+            print("[WARN] 결제링크 관리 화면에서 '거래 내역' 아이콘이 표시되지 않았습니다.")
+            _step_end("결제링크 관리 팝업 기반 동기화", t0)
+            return False
+
+        # 카드 컨테이너 (각 카드 안에 '거래 내역' 버튼이 있는 것만)
+        cards = driver.find_elements(
+            By.XPATH,
+            "//div[.//button[@title='거래 내역']"
+            "      or .//button[contains(normalize-space(.),'거래 내역')]"
+            "      or .//button[contains(normalize-space(.),'거래내역')]"
+            "      or .//button[.//svg[contains(@class,'lucide-receipt')]]]",
+        )
+        if not cards:
+            _step_end("결제링크 관리 팝업 기반 동기화", t0)
+            return False
+
+        # 모든 카드를 순차적으로 처리 (세션ID 기준으로 신규만)
+        for idx, card in enumerate(cards, start=1):
+            try:
+                card_text = card.text or ""
+                lines = [ln.strip() for ln in card_text.splitlines() if ln.strip()]
+                print(f"[CARD_DEBUG] 원시 카드 텍스트 (index={idx}): {lines}")
+                # 1단계: 상태 배지(span[data-slot='badge'])에 '만료' 가 있는지 최우선으로 확인
+                is_expired = False
+                try:
+                    badge_spans = card.find_elements(
+                        By.XPATH, ".//span[@data-slot='badge']"
+                    )
+                    badge_texts = [b.text.strip() for b in badge_spans if b.text.strip()]
+                    if any("만료" in bt for bt in badge_texts):
+                        is_expired = True
+                        print(f"[TTL_DEBUG] 상태 배지에서 '만료' 감지 → is_expired=True (badges={badge_texts})")
+                    else:
+                        print(f"[TTL_DEBUG] 상태 배지들={badge_texts} → '만료' 없음")
+                except Exception as e:
+                    print(f"[TTL_DEBUG] 상태 배지 확인 중 오류: {e}")
+
+                # 2단계: 배지에서 '만료'가 아니고, 유효시간 줄에 '분' 이 있으면 만료 아님으로 강제
+                if not is_expired and any("분" in ln for ln in lines):
+                    print("[TTL_DEBUG] 상태 배지에는 '만료' 없고, 유효시간 라인에 '분' 포함 → 만료 아님으로 간주")
+                    is_expired = False
+
+                session_id = ""
+                product_title = ""
+                for ln in lines:
+                    if not product_title:
+                        product_title = ln  # 첫 줄 정도를 제목으로 사용
+                    # 1순위: "세션 ID:" 라벨이 있는 경우 (예전 UI)
+                    if "세션 ID" in ln:
+                        parts = ln.split("세션 ID:")
+                        if len(parts) > 1:
+                            session_id = parts[1].strip()
+                            continue
+                    # 2순위: 최근 UI처럼 KEY 로 시작하는 세션ID 가 단독으로 나오는 경우
+                    if not session_id and "KEY20" in ln:
+                        session_id = ln.strip()
+
+                # 세션 ID 가 없는 행(헤더/틀 행 등)은 실제 결제링크 카드가 아니므로 건너뜀
+                if not session_id:
+                    print(f"[CARD_DEBUG] 세션ID 없음 → 헤더/비카드로 판단, 건너뜀 (index={idx}, title={product_title})")
+                    continue
+
+                print(f"[CARD_DEBUG] 인덱스={idx}, 세션ID={session_id}, 제목={product_title}, is_expired={is_expired}")
+                if _is_session_already_processed(session_id):
+                    print(f"[CARD_DEBUG] 이미 처리된 세션 → 건너뜀 (session_id={session_id})")
+                    continue
+
+                # 카드 안의 '거래 내역' 버튼 클릭
+                try:
+                    btn = card.find_element(
+                        By.XPATH,
+                        ".//button[@title='거래 내역']"
+                        " | .//button[.//svg[contains(@class,'lucide-receipt')]]",
+                    )
+                except Exception:
+                    continue
+
+                # 거래 내역 버튼 클릭은 DOM 변동/레이아웃 지연 때문에 실패할 수 있으므로
+                # 0.3초 간격으로 여러 번 재시도하면서, 한 번이라도 성공하면 다음 단계로 진행한다.
+                click_ok = False
+                for _ in range(10):
+                    try:
+                        driver.execute_script(
+                            "arguments[0].scrollIntoView({behavior:'instant',block:'center'});",
+                            btn,
+                        )
+                        time.sleep(0.05)
+                        driver.execute_script("arguments[0].click();", btn)
+                        click_ok = True
+                        break
+                    except Exception as e_click:
+                        print(f"[CARD_DEBUG] 거래 내역 버튼 클릭 재시도: {e_click}")
+                        time.sleep(0.3)
+
+                if not click_ok:
+                    print("[WARN] 거래 내역 버튼 클릭 실패(여러 차례 재시도 후) → 다음 카드로 진행")
+                    continue
+
+                # 팝업(dialog) 대기
+                try:
+                    dialog = wait.until(
+                        EC.visibility_of_element_located(
+                            (
+                                By.XPATH,
+                                "//div[@role='dialog' and .//h2[normalize-space()='거래 내역']]",
+                            )
+                        )
+                    )
+                except TimeoutException:
+                    print("[WARN] '거래 내역' 팝업을 찾지 못했습니다.")
+                    continue
+
+                popup_text = dialog.text or ""
+                # "거래 내역이 없습니다" / "거래 내역 없음" 등 문구 변화를 모두 허용
+                has_no_history = (
+                    "거래 내역이 없습니다" in popup_text
+                    or "거래 내역 없음" in popup_text
+                )
+
+                if has_no_history:
+                    _close_dialog(dialog)
+                    if is_expired:
+                        if _click_trash_and_confirm(card, wait):
+                            print(f"[INFO] 만료 + 거래내역 없음 세션 삭제 시도: {session_id}")
+                            _mark_session_deleted(session_id, product_title)
+                            changed = True
+                    else:
+                        _mark_session_checked(session_id, product_title, has_approval=False)
+                    continue
+
+                # 거래 내역이 하나 이상 있는 경우: 첫 번째 행 기준으로 승인 정보 파싱
+                try:
+                    # 일부 레이아웃(모바일 카드형)에서는 table 구조가 없을 수 있으므로,
+                    # 우선 테이블 행 존재 여부를 확인하고, 없으면 "구조화된 내역 없음" 으로 처리한다.
+                    rows = dialog.find_elements(By.XPATH, ".//table//tbody//tr")
+                    if not rows:
+                        # 구조화된 테이블이 없으면, 승인 여부를 판단할 수 없으므로
+                        # 삭제는 절대 하지 않고, 단순히 "확인됨(미승인/기타)" 상태로만 표시한다.
+                        _mark_session_checked(session_id, product_title, has_approval=False)
+                        continue
+
+                    row = rows[0]
+                    tx_type = row.find_element(
+                        By.XPATH, ".//span[contains(@data-slot,'badge')]"
+                    ).text.strip()
+                    amount_text = row.find_element(
+                        By.XPATH, ".//td[3]//span"
+                    ).text.strip()
+                    amt = _parse_amount(amount_text)
+                    approval_no = row.find_element(
+                        By.XPATH, ".//td[4]"
+                    ).text.strip()
+                    customer_name = row.find_element(
+                        By.XPATH, ".//td[5]"
+                    ).text.strip()
+                    card_number = row.find_element(
+                        By.XPATH, ".//td[6]//span"
+                    ).text.strip()
+                    registered_at = row.find_element(
+                        By.XPATH, ".//td[7]"
+                    ).text.strip()
+
+                    # 팝업 헤더에서 세션 ID 다시 추출 시도
+                    try:
+                        desc_el = dialog.find_element(
+                            By.XPATH, ".//p[contains(@data-slot,'dialog-description')]"
+                        )
+                        desc_text = desc_el.text or ""
+                        m = re.search(r"세션 ID:\s*([A-Z0-9]+)", desc_text)
+                        if m:
+                            session_id = m.group(1)
+                    except Exception:
+                        pass
+
+                    if "결제 승인" in tx_type and amt:
+                        _sync_popup_transaction_to_internal(
+                            session_id=session_id,
+                            amount=amt,
+                            approval_no=approval_no,
+                            card_number=card_number,
+                            registered_at=registered_at,
+                            customer_name=customer_name,
+                        )
+                        _mark_session_checked(session_id, product_title, has_approval=True)
+                        changed = True
+                except NoSuchElementException as e_row:
+                    # 예상한 테이블/셀 구조가 없으면, 삭제는 하지 않고
+                    # 단순히 "확인했지만 구조 불명" 상태로만 표시하고 다음 카드로 넘어간다.
+                    print(f"[WARN] '거래 내역' 팝업 파싱 중 요소를 찾지 못했습니다: {e_row}")
+                    _mark_session_checked(session_id, product_title, has_approval=False)
+                except Exception as e_row:
+                    print(f"[WARN] '거래 내역' 팝업 파싱 중 오류: {e_row}")
+                finally:
+                    _close_dialog(dialog)
+
+            except StaleElementReferenceException as e_card:
+                # 카드가 DOM 에서 사라진 경우(이미 삭제되었거나 새로고침됨)는
+                # 추가 시도를 중단하고 현재 카드 루프를 빠져나온다.
+                print(f"[WARN] 결제링크 카드 처리 중 StaleElement 오류: {e_card}")
+                break
+            except Exception as e_card:
+                print(f"[WARN] 결제링크 카드 처리 중 오류: {e_card}")
+                continue
+
+        _step_end("결제링크 관리 팝업 기반 동기화", t0)
+    except Exception as e:
+        print(f"[WARN] 결제링크 팝업 동기화 전반 오류: {e}")
+    return changed
+
+
 def _go_to_payment_link_page(driver: webdriver.Chrome) -> None:
     """좌측 사이드바에서 '결제링크 관리' 메뉴까지만 이동 (리스트 화면)."""
     try:
@@ -895,8 +2257,9 @@ def _fill_payment_link_form_and_get_url(
 ) -> str | None:
     """결제링크 생성 페이지에서 폼을 채우고, 생성된 https://store.k-van.app... 링크를 리턴."""
     t0_all = _step_start("결제링크 생성 폼 작성 전체")
-    wait = WebDriverWait(driver, 5)
-    time.sleep(0.3)
+    # 전체 폼에서는 기다리는 시간을 최소화한다.
+    wait = WebDriverWait(driver, 3)
+    time.sleep(0.2)
 
     # 1. 금액 입력
     t0 = _step_start("1. 금액 입력")
@@ -974,126 +2337,219 @@ def _fill_payment_link_form_and_get_url(
             pass
     _step_end("3. 상품설명 입력", t0)
 
-    # 폼 아래쪽에 있는 링크 생성 버튼과 기타 항목들이 보이도록 스크롤을 조금 내린다.
+    # 폼 아래쪽에 있는 세션유효시간/링크 생성 버튼들이 보이도록 스크롤을 충분히 내린다.
     try:
-        # 상품설명까지 입력한 후, 아래쪽에 있는 세션유효시간/링크 생성 버튼들이
-        # 화면에 들어오도록 충분히 스크롤 다운
-        driver.execute_script("window.scrollBy(0, 800);")
+        # 기존보다 3배 정도 더 아래로 내려서, 60분 및 '링크 생성하기' 버튼이 모두 보이도록 한다.
+        driver.execute_script("window.scrollBy(0, 1800);")
         time.sleep(0.3)
     except Exception:
         pass
 
     # 1-1. 세션유효시간: 콤보박스(#session-ttl)를 '5분 (일반 결제)' 로 변경
-    t0 = _step_start("4. 세션유효시간 선택 (3분→5분)")
-    changed_to_5min = _set_session_ttl_to_5min(driver, max_wait=10.0)
-    if not changed_to_5min:
-        print(
-            "[WARN] 10초 동안 세션유효시간을 '5분 (일반 결제)' 로 변경하지 못했습니다. "
-            "현재 값(기본 3분 등)을 유지한 채 링크 생성 단계로 진행합니다."
-        )
-    _step_end("4. 세션유효시간 선택 (3분→5분)", t0)
-
-    # 2. 링크 복사/생성 버튼 클릭
-    t0 = _step_start("5. 링크 복사/생성 버튼 클릭")
-    used_copy_button = False
+    # 4. 세션유효시간은 더 이상 오래 시도하지 않고, 한 번만 빠르게 시도 후 바로 진행
+    t0 = _step_start("4. 세션유효시간 선택 (3분→5분, 빠른 시도)")
     try:
-        # 1차: '링크 복사' 문구가 있는 버튼을 우선 시도
-        copy_btn = wait.until(
+        _set_session_ttl_to_5min(driver, max_wait=2.0)
+    except Exception:
+        # 실패해도 기본값(3분)으로 진행
+        pass
+    _step_end("4. 세션유효시간 선택 (3분→5분, 빠른 시도)", t0)
+
+    # 5. '링크 생성하기' 버튼 클릭
+    t0 = _step_start("5. '링크 생성하기' 버튼 클릭")
+    used_copy_button = False
+    # 1단계: 반드시 '링크 생성하기' 텍스트 버튼을 먼저 누른다.
+    try:
+        # 너무 오래 기다리지 않도록, 짧은 반복으로 직접 찾는다.
+        clicked = False
+        end_ts = time.time() + 2.0
+        while time.time() < end_ts and not clicked:
+            try:
+                create_btn = driver.find_element(
+                    By.XPATH, "//button[contains(normalize-space(.),'링크 생성하기')]"
+                )
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({behavior:'instant', block:'center'});",
+                    create_btn,
+                )
+                time.sleep(0.05)
+                driver.execute_script("arguments[0].click();", create_btn)
+                clicked = True
+                break
+            except Exception:
+                time.sleep(0.1)
+        if not clicked:
+            print("[WARN] '링크 생성하기' 버튼을 2초 내에 찾지 못했습니다.")
+            _step_end("5. '링크 생성하기' 버튼 클릭", t0)
+            _step_end("결제링크 생성 폼 작성 전체", t0_all)
+            return None
+        time.sleep(0.3)
+    except Exception:
+        print("[WARN] '링크 생성하기' 버튼 클릭 중 예외가 발생했습니다.")
+        _step_end("5. '링크 생성하기' 버튼 클릭", t0)
+        _step_end("결제링크 생성 폼 작성 전체", t0_all)
+        return None
+
+    # 2단계: '링크 생성하기' 가 눌린 뒤에 나타나는 '링크 복사' 버튼이 있으면 눌러준다.
+    try:
+        copy_btn = WebDriverWait(driver, 2).until(
             EC.element_to_be_clickable(
                 (By.XPATH, "//button[contains(normalize-space(.),'링크 복사')]")
             )
         )
-        copy_btn.click()
+        driver.execute_script(
+            "arguments[0].scrollIntoView({behavior:'instant', block:'center'});",
+            copy_btn,
+        )
+        time.sleep(0.1)
+        driver.execute_script("arguments[0].click();", copy_btn)
         used_copy_button = True
         time.sleep(0.4)
     except TimeoutException:
-        # 2차: '링크 생성하기' 또는 '링크 생성' 문구가 있는 버튼
+        # 링크 복사 버튼이 없는 구조일 수도 있으므로, 이 경우에는 생성 버튼만 누른 상태로 진행한다.
+        print("[DEBUG] '링크 복사' 버튼을 찾지 못했습니다. 생성 버튼만 누른 상태로 진행합니다.")
+    _step_end("5. '링크 생성하기' 버튼 클릭", t0)
+
+    # 6. 팝업/페이지 내 '생성하기' 버튼 한 번 깔끔하게, 최대한 빠르게 클릭
+    t0 = _step_start("6. 팝업 '생성하기' 버튼 클릭")
+    if not used_copy_button:
         try:
-            create_btn = wait.until(
+            # dialog 안의 '생성하기' 버튼을 우선적으로 찾는다.
+            confirm_btn = WebDriverWait(driver, 2).until(
                 EC.element_to_be_clickable(
                     (
                         By.XPATH,
-                        "//button[contains(normalize-space(.),'링크 생성하기') or contains(normalize-space(.),'링크 생성')]",
+                        "//div[@role='dialog' and @data-state='open']"
+                        "//button[contains(normalize-space(.),'생성하기') or contains(normalize-space(.),'생성 하기')]",
                     )
                 )
             )
-            create_btn.click()
-            time.sleep(0.4)
         except TimeoutException:
-            # 3차: 현재 폼 내에서 type='submit' 이고 '생성' 텍스트가 포함된 버튼
+            # dialog 를 못 찾으면 화면 전체에서 '생성하기' 버튼을 찾는다.
             try:
-                create_btn = wait.until(
+                confirm_btn = WebDriverWait(driver, 2).until(
                     EC.element_to_be_clickable(
                         (
                             By.XPATH,
-                            "//form//button[@type='submit' and contains(normalize-space(.),'생성')]",
+                            "//button[contains(normalize-space(.),'생성하기') or contains(normalize-space(.),'생성 하기')]",
                         )
                     )
                 )
-                create_btn.click()
-                time.sleep(0.4)
             except TimeoutException:
-                print("[WARN] '링크 복사' / '링크 생성하기' / '생성' 버튼을 찾지 못했습니다.")
+                print("[WARN] 화면에서 '생성하기' 버튼을 찾지 못했습니다.")
+                _step_end("6. 팝업 '생성하기' 버튼 클릭", t0)
+                _step_end("결제링크 생성 폼 작성 전체", t0_all)
                 return None
-    _step_end("5. 링크 복사/생성 버튼 클릭", t0)
 
-    # "결제 링크를 생성 하시겠습니까?" 팝업에서 '생성하기' 버튼 클릭
-    t0 = _step_start("6. 생성 확인 팝업 처리 및 최종 링크 추출")
-    if not used_copy_button:
-        # '링크 생성하기' 플로우인 경우에만 확인 팝업이 뜬다.
+        # 한 가지 방법만: scrollIntoView + JS click (가장 안정적인 패턴)
         try:
-            wait.until(
-                EC.visibility_of_element_located(
-                    (
-                        By.XPATH,
-                        "//*[contains(normalize-space(text()),'결제 링크를 생성 하시겠습니까')]",
-                    )
-                )
+            driver.execute_script(
+                "arguments[0].scrollIntoView({behavior:'instant', block:'center'});",
+                confirm_btn,
             )
-            confirm_btn = wait.until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, "//button[contains(normalize-space(text()),'생성하기')]")
-                )
-            )
-            confirm_btn.click()
-            time.sleep(0.8)
-        except TimeoutException:
-            print("[WARN] 결제 링크 생성 확인 팝업을 찾지 못했습니다.")
+            # 너무 길게 기다리지 않고 바로 클릭
+            time.sleep(0.05)
+            driver.execute_script("arguments[0].click();", confirm_btn)
+            print("[INFO] '생성하기' 버튼(JS click) 실행.")
+        except Exception as e:
+            print(f"[WARN] '생성하기' 버튼 클릭 중 오류: {e}")
+            _step_end("6. 팝업 '생성하기' 버튼 클릭", t0)
+            _step_end("결제링크 생성 폼 작성 전체", t0_all)
+            return None
+    _step_end("6. 팝업 '생성하기' 버튼 클릭", t0)
 
-    # 생성된 링크 중 'https://store.k-van.app' 로 시작하는 첫 번째 링크 확보
+    # 7. 생성된 링크 추출 + 링크 복사 아이콘 클릭 + 클립보드 복사
+    t0 = _step_start("7. 생성된 링크 추출")
     link_text = None
     try:
-        link_el = wait.until(
+        # readonly input.value 형태의 링크를 우선적으로 찾는다.
+        url_input = WebDriverWait(driver, 3).until(
             EC.presence_of_element_located(
                 (
                     By.XPATH,
-                    (
-                        "//*[contains(text(),'https://store.k-van.app') "
-                        "or @value[contains(.,'https://store.k-van.app')] "
-                        "or contains(@href,'https://store.k-van.app') "
-                        "or contains(@data-clipboard-text,'https://store.k-van.app')]"
-                    ),
+                    "//input[@readonly and contains(@value,'https://store.k-van.app')]",
                 )
             )
         )
-        # 텍스트, value, href, data-clipboard-text 순으로 링크를 추출
-        link_text = (link_el.text or "").strip()
-        if not link_text:
-            link_text = (link_el.get_attribute("value") or "").strip()
-        if not link_text:
-            link_text = (link_el.get_attribute("href") or "").strip()
-        if not link_text:
-            link_text = (link_el.get_attribute("data-clipboard-text") or "").strip()
+        link_text = (url_input.get_attribute("value") or "").strip()
+        if link_text:
+            print(f"[INFO] 생성된 결제 링크: {link_text}")
+
+            # (1) 링크 복사 아이콘(버튼)을 클릭해서 K-VAN 내부 복사 로직 실행
+            try:
+                # 아이콘이 늦게 뜰 수 있으니 짧게 여러 번 재시도 (최대 2초)
+                end_copy = time.time() + 2.0
+                clicked_copy = False
+                while time.time() < end_copy and not clicked_copy:
+                    try:
+                        copy_btn = WebDriverWait(driver, 0.5).until(
+                            EC.element_to_be_clickable(
+                                (
+                                    By.XPATH,
+                                    "//button[.//svg[contains(@class,'copy') or contains(@class,'lucide-copy')]]",
+                                )
+                            )
+                        )
+                        driver.execute_script(
+                            "arguments[0].scrollIntoView({behavior:'instant', block:'center'});",
+                            copy_btn,
+                        )
+                        time.sleep(0.05)
+                        driver.execute_script("arguments[0].click();", copy_btn)
+                        clicked_copy = True
+                        print("[INFO] K-VAN 화면의 '링크 복사' 아이콘 버튼 클릭.")
+                        break
+                    except TimeoutException:
+                        # 아직 아이콘이 안 뜬 경우 → 0.2초 정도 기다리고 다시 시도
+                        time.sleep(0.2)
+
+            except TimeoutException:
+                print("[WARN] '링크 복사' 아이콘 버튼을 찾지 못했습니다. K-VAN 내부 복사는 생략합니다.")
+
+            # (2) 브라우저 클립보드 API 로도 한 번 더 복사 시도
+            try:
+                driver.execute_script(
+                    """
+try {
+  const text = arguments[0] || '';
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => {
+      console.log('[K-VAN] navigator.clipboard.writeText 성공');
+    }).catch(e => {
+      console.log('[K-VAN] navigator.clipboard.writeText 실패', e);
+    });
+  } else {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand('copy');
+      console.log('[K-VAN] document.execCommand(\"copy\") 성공');
+    } catch (e) {
+      console.log('[K-VAN] document.execCommand(\"copy\") 실패', e);
+    }
+    document.body.removeChild(ta);
+  }
+} catch (e) {
+  console.log('[K-VAN] 클립보드 복사 전체 실패', e);
+}
+""",
+                    link_text,
+                )
+                print("[INFO] 생성된 링크를 클립보드에 복사 시도했습니다.")
+            except Exception as e:
+                print(f"[WARN] 클립보드 복사 시도 중 오류: {e}")
     except TimeoutException:
-        print("[WARN] 생성된 결제 링크 텍스트를 찾지 못했습니다.")
+        print("[WARN] 생성된 결제 링크 input 을 찾지 못했습니다.")
 
     if link_text and "https://store.k-van.app" in link_text:
         _store_kvan_link_for_session(session_id, link_text)
-        _step_end("6. 생성 확인 팝업 처리 및 최종 링크 추출", t0)
+        _step_end("7. 생성된 링크 추출", t0)
         _step_end("결제링크 생성 폼 작성 전체", t0_all)
         return link_text
 
-    _step_end("6. 생성 확인 팝업 처리 및 최종 링크 추출", t0)
+    _step_end("7. 생성된 링크 추출", t0)
     _step_end("결제링크 생성 폼 작성 전체", t0_all)
     return None
 
@@ -1212,18 +2668,14 @@ def sign_in(driver: webdriver.Chrome, row: PaymentRow) -> None:
 
     # 로그인 완료까지 잠시 대기 (홈 또는 다른 보호된 페이지로 진입)
     try:
+        # 리다이렉트는 최대 1초만 확인하고, 바로 다음 단계로 진행한다.
         t0 = _step_start("로그인 후 리다이렉트 대기")
-        wait.until(EC.url_contains("store.k-van.app"))
+        short_wait = WebDriverWait(driver, 1)
+        short_wait.until(EC.url_contains("store.k-van.app"))
         _step_end("로그인 후 리다이렉트 대기", t0)
     except TimeoutException:
-        print("[WARN] 로그인 후 리다이렉트 URL을 확인하지 못했습니다.")
+        print("[WARN] 로그인 후 리다이렉트 URL을 1초 내에 확인하지 못했습니다. 다음 단계로 계속 진행합니다.")
         _step_end("로그인 후 리다이렉트 대기", t0)
-        _step_end("로그인 전체", t0_all)
-        return
-
-    # 서버 환경에서만 대시보드 크롤링 수행 (로컬 테스트에서는 생략)
-    if _is_server_env():
-        _scrape_dashboard_and_store(driver)
 
     _step_end("로그인 전체", t0_all)
 
@@ -1644,10 +3096,20 @@ def append_transaction_to_hq(
 
 
 def main() -> None:
-    # 명령행 인자로 세션 ID 를 받을 수 있게 함:
-    # python auto_kvan.py            -> 기본 단일 모드 (current_order.json 사용)
-    # python auto_kvan.py SESSIONID  -> 세션별 orders/SESSIONID.json 사용
+    """
+    auto_kvan 링크 생성 메인 엔트리.
+    - 세션 ID 또는 기본 JSON 을 읽어 K-VAN 결제 링크를 생성한다.
+    - 전체 실행 시간이 30분(1800초)을 넘으면 안전하게 종료한다.
+    """
     import sys
+
+    start_ts = time.time()
+
+    def _check_timeout(stage: str) -> None:
+        """30분 타임아웃 체크. 초과 시 TimeoutError 를 발생시킨다."""
+        elapsed = time.time() - start_ts
+        if elapsed > 1800:
+            raise TimeoutError(f"auto_kvan.py 30분 초과 타임아웃 (stage={stage}, elapsed={elapsed:.1f}s)")
 
     session_id = sys.argv[1].strip() if len(sys.argv) > 1 else ""
 
@@ -1670,103 +3132,60 @@ def main() -> None:
         print(f"입력 데이터 오류: {e}")
         return
 
+    _check_timeout("after_load_order")
+
     driver = create_driver()
     try:
+        _check_timeout("before_sign_in")
         print("K-VAN 가맹점 페이지에 로그인 중...")
         sign_in(driver, row)
-        print("로그인 및 대시보드 정보 수집 완료. 결제링크 관리 페이지로 이동합니다...")
+        _check_timeout("after_sign_in")
+
+        print("로그인 완료. 결제링크 관리 페이지로 이동합니다...")
         _go_to_payment_link_page(driver)
+        _check_timeout("after_go_payment_link")
 
         print("결제링크 관리 화면에서 '+ 생성' 버튼을 눌러 생성 페이지로 이동합니다...")
         moved = _go_to_create_link_page(driver)
+        _check_timeout("after_go_create")
         if not moved:
             print("[ERROR] '+ 생성' 버튼 클릭 후 생성 페이지로 이동하지 못했습니다. 폼 작성 단계는 건너뜁니다.")
             status = "error"
             msg = "결제링크 생성 페이지 진입 실패(생성 버튼 미동작)."
             save_result_to_excel(RESULT_EXCEL_PATH, row, status, msg)
             save_result_to_json(str(result_json_path), status, msg)
-            append_transaction_to_hq(row, status, msg, session_id=session_id)
             return
 
         print("결제링크 생성 페이지에서 폼을 채우고 링크를 생성합니다...")
         link_url = _fill_payment_link_form_and_get_url(driver, row, session_id)
+        _check_timeout("after_fill_form")
         if link_url:
+            status = "link_created"
+            msg = "결제 링크가 생성되었습니다. 고객이 링크로 결제하면 K-VAN 크롤러가 상태를 반영합니다."
             print(f"생성된 결제 링크: {link_url}")
+            # 링크가 새로 생성되었으므로, 크롤러에 즉시 다시 크롤링하도록 신호를 보낸다.
+            try:
+                signal_crawler_wakeup()
+            except Exception as e:
+                print(f"[WAKEUP][WARN] 크롤러 깨우기 신호 전송 중 오류: {e}")
         else:
-            print("결제 링크 생성에 실패했거나 링크를 찾지 못했습니다.")
-
-        # (선택) 필요 시 기존 대면결제 플로우 유지/활용
-        try:
-            fill_face_to_face_form(driver, row)
-            status, msg = confirm_popup_and_get_result(driver)
-            print(f"결제 결과: {status} - {msg}")
-        except Exception as e:  # noqa: BLE001
             status = "error"
-            msg = str(e)
-            print(f"결제 처리 중 오류 발생: {e}")
+            msg = "결제 링크 생성에 실패했거나 링크를 찾지 못했습니다."
+            print(msg)
 
+        # 결과는 참고용 엑셀/JSON 에만 남기고, 실제 결제/정산 정보는
+        # K-VAN 크롤러(kvan_crawler.py)와 DB 동기화를 기준으로 관리한다.
         save_result_to_excel(RESULT_EXCEL_PATH, row, status, msg)
         save_result_to_json(str(result_json_path), status, msg)
-        append_transaction_to_hq(row, status, msg, session_id=session_id)
 
-        # 세션 모드인 경우, 어드민 상태에 세션 결과를 반영하고 세션을 히스토리로 이동
-        if session_id:
-            admin_path = DATA_DIR / "admin_state.json"
-            if admin_path.exists():
-                try:
-                    with open(admin_path, "r", encoding="utf-8") as f:
-                        admin_state = json.load(f)
-                except Exception:
-                    admin_state = {}
-                sessions = admin_state.get("sessions") or []
-                history = admin_state.get("history") or []
-
-                new_sessions: list = []
-                found = False
-                for s in sessions:
-                    if str(s.get("id")) == str(session_id):
-                        found = True
-                        human_status = (
-                            "결제완료"
-                            if status == "success"
-                            else "결제실패"
-                            if status in ("fail", "error")
-                            else "알수없음"
-                        )
-                        entry = {
-                            "id": session_id,
-                            "amount": str(row.amount),
-                            "installment": row.installment_months,
-                            "status": human_status,
-                            "created_at": s.get("created_at")
-                            or datetime.utcnow().isoformat(),
-                            "finished_at": datetime.utcnow().isoformat(),
-                            "result_message": msg,
-                            "customer_name": row.customer_name,
-                            "phone_number": row.phone_number,
-                            "product_name": row.product_name,
-                            "settled": "정산전",
-                        }
-                        history.append(entry)
-                    else:
-                        new_sessions.append(s)
-
-                if found:
-                    admin_state["sessions"] = new_sessions
-                    admin_state["history"] = history
-                    try:
-                        with open(admin_path, "w", encoding="utf-8") as f:
-                            json.dump(admin_state, f, ensure_ascii=False, indent=2)
-                    except OSError:
-                        pass
-        print(f"결과가 {RESULT_EXCEL_PATH} 파일에 기록되었습니다.")
         if not _is_server_env():
             input("브라우저를 확인한 뒤, 종료하려면 Enter 키를 누르세요...")
+    except TimeoutError as te:
+        print(f"[ERROR] {te}")
     finally:
         driver.quit()
 
 
 if __name__ == "__main__":
     main()
-
 

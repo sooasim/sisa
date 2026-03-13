@@ -4,7 +4,7 @@ import json
 import time
 from typing import List
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 from io import BytesIO
 import subprocess
@@ -55,6 +55,12 @@ DB_NAME = (
 
 
 def get_db():
+    """
+    공용 MySQL 커넥션 헬퍼.
+
+    - connect_timeout 을 짧게 두어(2초) DB 연결 문제로 크롤러/서버가 오래 멈추지 않게 한다.
+    - read/write_timeout 도 3초로 제한해, 쿼리 중 연결이 끊기면 빠르게 예외를 발생시킨다.
+    """
     return pymysql.connect(
         host=DB_HOST,
         port=DB_PORT,
@@ -64,8 +70,53 @@ def get_db():
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=False,
-        connect_timeout=5,
+        connect_timeout=2,
+        read_timeout=3,
+        write_timeout=3,
     )
+
+
+def cleanup_history_files() -> dict:
+    """
+    세션 JSON 히스토리 파일을 3개월 기준으로 정리하고,
+    7일/3일 뒤 삭제 예정인 파일 이름 목록을 반환한다.
+
+    - 삭제 대상: SESSION_ORDER_DIR, SESSION_RESULT_DIR 의 *.json
+    - created_at 기준이 없으므로 파일의 mtime 을 사용한다.
+    """
+    now = datetime.utcnow()
+    warn_7: list[str] = []
+    warn_3: list[str] = []
+
+    targets: list[Path] = []
+    for d in [SESSION_ORDER_DIR, SESSION_RESULT_DIR]:
+        if d.exists():
+            targets.extend(list(d.glob("*.json")))
+
+    for path in targets:
+        try:
+            st = path.stat()
+            created = datetime.utcfromtimestamp(st.st_mtime)
+            delete_at = created + timedelta(days=90)
+            days_left = (delete_at - now).days
+
+            if days_left <= 0:
+                # 실제 삭제
+                try:
+                    path.unlink()
+                except OSError:
+                    # 삭제 실패는 치명적이지 않으므로 경고만 남긴다.
+                    print(f"[WARN] 히스토리 파일 삭제 실패: {path}")
+            else:
+                name = path.name
+                if days_left <= 3:
+                    warn_3.append(name)
+                elif days_left <= 7:
+                    warn_7.append(name)
+        except Exception as e:
+            print(f"[WARN] cleanup_history_files 처리 중 오류: {e}")
+
+    return {"warn_7_days": warn_7, "warn_3_days": warn_3}
 
 
 def init_db() -> None:
@@ -94,18 +145,19 @@ def init_db() -> None:
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS agencies (
-                  id            VARCHAR(32) PRIMARY KEY,
-                  company_name  VARCHAR(255) NOT NULL,
-                  domain        VARCHAR(255) NOT NULL,
-                  phone         VARCHAR(50),
-                  bank_name     VARCHAR(100),
+                  id             VARCHAR(32) PRIMARY KEY,
+                  company_name   VARCHAR(255) NOT NULL,
+                  domain         VARCHAR(255) NOT NULL,
+                  phone          VARCHAR(50),
+                  bank_name      VARCHAR(100),
                   account_number VARCHAR(100),
                   email_or_sheet TEXT,
-                  login_id      VARCHAR(100) UNIQUE,
+                  login_id       VARCHAR(100) UNIQUE,
                   login_password VARCHAR(255),
-                  fee_percent   INT DEFAULT 10,
-                  created_at    DATETIME,
-                  status        VARCHAR(20)
+                  fee_percent    INT DEFAULT 10,
+                  kvan_mid       VARCHAR(100),
+                  created_at     DATETIME,
+                  status         VARCHAR(20)
                 ) CHARACTER SET utf8mb4
                 """
             )
@@ -124,6 +176,11 @@ def init_db() -> None:
                   message           TEXT,
                   settlement_status VARCHAR(20),
                   settled_at        DATETIME,
+                  -- K-VAN 연동을 위한 보조 필드들 (있으면 사용)
+                  kvan_mid          VARCHAR(100),
+                  kvan_approval_no  VARCHAR(100),
+                  kvan_tx_type      VARCHAR(50),
+                  kvan_registered_at VARCHAR(50),
                   FOREIGN KEY (agency_id) REFERENCES agencies(id)
                 ) CHARACTER SET utf8mb4
                 """
@@ -151,6 +208,28 @@ def init_db() -> None:
                 ) CHARACTER SET utf8mb4
                 """
             )
+            # 기존 DB에 이미 생성된 테이블들이 있는 경우를 위해
+            # 필요한 열이 없으면 추가 (에러는 무시)
+            try:
+                cur.execute("ALTER TABLE agencies ADD COLUMN kvan_mid VARCHAR(100)")
+            except Exception:
+                pass
+            try:
+                cur.execute("ALTER TABLE transactions ADD COLUMN kvan_mid VARCHAR(100)")
+            except Exception:
+                pass
+            try:
+                cur.execute("ALTER TABLE transactions ADD COLUMN kvan_approval_no VARCHAR(100)")
+            except Exception:
+                pass
+            try:
+                cur.execute("ALTER TABLE transactions ADD COLUMN kvan_tx_type VARCHAR(50)")
+            except Exception:
+                pass
+            try:
+                cur.execute("ALTER TABLE transactions ADD COLUMN kvan_registered_at VARCHAR(50)")
+            except Exception:
+                pass
         conn.commit()
         conn.close()
     except Exception as e:  # noqa: BLE001
@@ -221,11 +300,15 @@ try:
 except Exception as e:  # noqa: BLE001
     print(f"[WARN] init_db at import 실패: {e}")
 
-# 차단할 IP (공인 IP만). 환경변수 BLOCKED_IPS 로 지정 (쉼표 구분). 100.64.x.x 같은 CGN 대역은 넣지 말 것.
+# 차단할 IP (공인 IP만). 환경변수 BLOCKED_IPS 로 지정 (쉼표 구분).
 _BLOCKED_IPS: set[str] = set()
 _env_blocked = os.environ.get("BLOCKED_IPS", "").strip()
 if _env_blocked:
     _BLOCKED_IPS.update(ip.strip() for ip in _env_blocked.split(",") if ip.strip())
+
+# 404 다발 IP 카운트 (프로세스 메모리 기준, 재시작 시 초기화)
+_IP_404_COUNTS: dict[str, int] = {}
+_IP_404_THRESHOLD: int = 3
 
 # 봇/스캐너가 찾는 경로 → 최소 응답으로 즉시 404 ("찾는 정보 없음", 트래픽 절약)
 _SCAN_PATH_PREFIXES = (
@@ -262,6 +345,14 @@ def reject_scan_paths():
     if ".php" in path or path.startswith("/.env") or "/.git" in path:
         return "Not Found", 404
     return None
+
+
+def _get_client_ip() -> str:
+    """실제 클라이언트 IP 추출(X-Forwarded-For 우선)."""
+    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+    if not ip:
+        ip = request.remote_addr or ""
+    return ip
 
 
 @app.route("/login.html", methods=["GET"])
@@ -965,6 +1056,42 @@ def home():
     return "<h1>World SISA</h1>", 200
 
 
+@app.route("/seo/overseas-luxury-auction", methods=["GET"])
+def seo_overseas_luxury():
+    """해외 중고 명품 경매 대행 전용 SEO 랜딩 페이지."""
+    html = """
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+      <meta charset="UTF-8" />
+      <title>해외 중고 명품 경매 대행 사이트 | SISA 글로벌 옥션</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <meta name="description" content="해외 중고 명품 경매 대행 사이트 SISA. 일본 야후옥션, 미국 이베이, 유럽 명품 경매장에서 샤넬, 에르메스, 루이비통, 롤렉스 등 중고·빈티지 명품을 안전하게 입찰·구매 대행합니다." />
+      <meta name="keywords" content="해외 중고 명품,명품 경매 대행,해외 명품 경매,일본 야후옥션 명품,미국 이베이 명품,유럽 명품 경매,샤넬 중고 가방,에르메스 버킨 중고,롤렉스 시계 경매,명품 시계 입찰 대행,해외 명품 구매 대행,해외 빈티지 명품,명품 위탁 판매,해외 리세일 플랫폼,글로벌 럭셔리 옥션" />
+      <meta name="robots" content="index,follow" />
+    </head>
+    <body>
+      <h1>해외 중고 명품 경매 대행 사이트 SISA</h1>
+      <p>해외 중고 명품 경매 대행 플랫폼 SISA는 일본 야후옥션, 미국 이베이, 유럽 현지 럭셔리 경매 하우스와 연동하여 전 세계 중고 명품을 한 곳에서 검색하고 입찰할 수 있도록 돕는 B2B 전문 사이트입니다.</p>
+      <h2>주요 서비스</h2>
+      <ul>
+        <li>일본 야후옥션·세컨스트리트·라쿠마 등 <strong>일본 중고 명품 경매 대행</strong></li>
+        <li>미국 eBay, Heritage, LiveAuctioneers 등 <strong>미국·북미 명품 경매 대행</strong></li>
+        <li>Christie's, Sotheby's, Phillips 등 <strong>유럽 하이엔드 명품 경매 대행</strong></li>
+        <li>샤넬, 에르메스, 루이비통, 고야드, 디올 등 <strong>럭셔리 가방·지갑·잡화</strong> 경매 입찰</li>
+        <li>롤렉스, 파텍필립, 오데마피게, 오메가 등 <strong>명품 시계 경매·입찰 대행</strong></li>
+        <li>명품 시계·가방·주얼리 <strong>위탁 판매 및 글로벌 리세일</strong> 컨설팅</li>
+      </ul>
+      <h2>검색 키워드 예시</h2>
+      <p>해외 중고 명품, 해외 명품 경매, 중고 명품 경매 대행, 일본 야후옥션 명품 구매, 미국 이베이 명품 시계, 유럽 명품 가방 경매, 샤넬 클래식 플랩 중고, 에르메스 버킨 낙찰가, 롤렉스 서브마리너 경매, 해외 명품 시세 조회, 명품 위탁 판매 수수료, 글로벌 럭셔리 옥션 플랫폼 등 다양한 키워드로 SISA를 찾을 수 있습니다.</p>
+      <h2>SISA와 함께하는 안전한 해외 명품 경매</h2>
+      <p>SISA는 해외 법인 및 전문 감정 네트워크를 통해 위조품을 차단하고, 실시간 경매 정보, 관세·배송·보험까지 포함한 토털 솔루션으로 해외 중고 명품 경매 대행을 제공합니다.</p>
+    </body>
+    </html>
+    """
+    return html, 200
+
+
 @app.route("/favicon.ico", methods=["GET"])
 @app.route("/favicon.png", methods=["GET"])
 @app.route("/favicon.svg", methods=["GET"])
@@ -985,6 +1112,35 @@ def robots_txt():
     """검색엔진·봇용 robots.txt (불필요한 크롤링 완화)."""
     body = "User-agent: *\nDisallow: /admin\nDisallow: /hq-admin\nDisallow: /agency-admin\nDisallow: /pay/\nAllow: /\n"
     return body, 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+@app.errorhandler(404)
+def handle_404(error):  # noqa: D401, ANN001
+    """404 다발 IP를 감지해 차단 목록에 추가하고, SEO 페이지로 부드럽게 유도."""
+    path = (request.path or "").strip().lower()
+
+    # SEO 전용 페이지 자체가 404 난 경우에는 기본 404 반환
+    if path.startswith("/seo/overseas-luxury-auction"):
+        return "Not Found", 404
+
+    # IP별 404 카운트 증가
+    ip = _get_client_ip()
+    if ip:
+        current = _IP_404_COUNTS.get(ip, 0) + 1
+        _IP_404_COUNTS[ip] = current
+        if current >= _IP_404_THRESHOLD:
+            _BLOCKED_IPS.add(ip)
+
+    # 봇(User-Agent)에 대해서도 404를 SEO 페이지 방문으로 전환
+    ua = (request.headers.get("User-Agent") or "").lower()
+    is_bot = any(keyword in ua for keyword in ("bot", "crawl", "spider", "slurp", "preview", "scanner"))
+
+    # 사람/봇 구분 없이 404 대신 SEO용 컨텐츠로 리다이렉트(소프트 404 방지 목적)
+    if is_bot or True:
+        return redirect(url_for("seo_overseas_luxury")), 302
+
+    # (이론상 도달하지 않지만 안전망으로 둠)
+    return "Not Found", 404
 
 
 @app.route("/payment", methods=["GET", "POST"])
@@ -1252,6 +1408,59 @@ def _load_hq_state() -> dict:
     return state
 
 
+def _is_recent_duplicate_amount(amount_str: str, window_minutes: int = 5) -> bool:
+    """
+    admin_state.json 기준으로, 최근 window_minutes 분 이내에
+    동일 금액으로 생성된 세션/히스토리가 있는지 확인한다.
+
+    - 금액이 비어 있거나 0 이하이면 중복 검사 대상에서 제외
+    - created_at / finished_at 중 존재하는 타임스탬프를 사용
+    """
+    amount_str = (amount_str or "").replace(",", "").strip()
+    if not amount_str:
+        return False
+    try:
+        amt = int(amount_str)
+    except ValueError:
+        return False
+    if amt <= 0:
+        return False
+
+    try:
+        cutoff = datetime.utcnow() - timedelta(minutes=window_minutes)
+        state_path = Path(ADMIN_STATE_PATH)
+        if not state_path.exists():
+            return False
+        with open(state_path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        sessions = saved.get("sessions") or []
+        history = saved.get("history") or []
+        candidates = list(sessions) + list(history)
+
+        for s in candidates:
+            s_amount = str(s.get("amount") or "").replace(",", "").strip()
+            try:
+                s_amt = int(s_amount)
+            except ValueError:
+                continue
+            if s_amt != amt:
+                continue
+
+            ts = s.get("created_at") or s.get("finished_at")
+            if not ts:
+                continue
+            try:
+                dt = datetime.fromisoformat(ts)
+            except Exception:
+                continue
+            if dt >= cutoff:
+                return True
+        return False
+    except Exception:
+        # 중복 검사에서 문제가 생겨도 결제 자체를 막지는 않는다.
+        return False
+
+
 def _save_hq_state(state: dict) -> None:
     """기존 JSON 기반 코드와의 호환을 위해 전체 상태를 DB에 반영."""
     try:
@@ -1509,6 +1718,36 @@ def admin():
         except Exception:
             sessions = []
 
+    # K-VAN 연동 DB (대시보드/거래내역/결제링크) 조회
+    kvan_transactions: list[dict] = []
+    kvan_links: list[dict] = []
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    "SELECT captured_at, merchant_name, pg_name, mid, fee_rate, tx_type, "
+                    "amount, cancel_amount, payable_amount, card_company, card_number, "
+                    "installment, approval_no, registered_at "
+                    "FROM kvan_transactions ORDER BY captured_at DESC LIMIT 30"
+                )
+                kvan_transactions = cur.fetchall()
+            except Exception:
+                kvan_transactions = []
+            try:
+                cur.execute(
+                    "SELECT captured_at, title, amount, ttl_label, status, "
+                    "kvan_link, mid, kvan_session_id "
+                    "FROM kvan_links ORDER BY captured_at DESC LIMIT 30"
+                )
+                kvan_links = cur.fetchall()
+            except Exception:
+                kvan_links = []
+        conn.close()
+    except Exception as e:
+        print(f\"[WARN] K-VAN 연동 데이터 조회 실패: {e}\")
+        kvan_transactions, kvan_links = [], []
+
     if request.method == "POST":
         action = request.form.get("action", "create").strip()
 
@@ -1516,40 +1755,44 @@ def admin():
             amount = request.form.get("admin_amount", "").strip()
             installment = request.form.get("admin_installment", "일시불").strip()
 
-            # 현재 진행 중(결제중) 세션 수 확인
-            active_count = sum(
-                1 for s in sessions if s.get("status", "결제중") == "결제중"
-            )
-            if active_count >= 5:
-                message = "동시에 진행할 수 있는 세션은 최대 5개입니다."
+            # 금액이 지정된 경우, 최근 5분 내 동일 금액 링크가 있었는지 검사
+            if amount and _is_recent_duplicate_amount(amount, window_minutes=5):
+                message = "같은 금액의 결제 링크가 최근 5분 이내에 생성되었습니다. 5분 후에 다시 시도해 주세요."
             else:
-                # 새 세션 ID 생성
-                session_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")[-12:]
-                session = {
-                    "id": session_id,
-                    "amount": amount,  # 비어 있으면 '고정 안 됨' 으로 동작
-                    "installment": installment or "",
-                    "status": "결제중",
-                    "created_at": datetime.utcnow().isoformat(),
-                    "agency_id": "",  # HQ에서 생성한 세션은 특정 대행사에 속하지 않음
-                }
-                sessions.append(session)
-                admin_state = {"sessions": sessions, "history": history}
-                try:
-                    with open(ADMIN_STATE_PATH, "w", encoding="utf-8") as f:
-                        json.dump(admin_state, f, ensure_ascii=False, indent=2)
-                except Exception as e:  # noqa: BLE001
-                    message = f"상태 저장 중 오류가 발생했습니다: {e}"
+                # 현재 진행 중(결제중) 세션 수 확인
+                active_count = sum(
+                    1 for s in sessions if s.get("status", "결제중") == "결제중"
+                )
+                if active_count >= 5:
+                    message = "동시에 진행할 수 있는 세션은 최대 5개입니다."
                 else:
-                    # HQ에서 링크를 생성한 시점에도 자동 결제 매크로를 준비
+                    # 새 세션 ID 생성
+                    session_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")[-12:]
+                    session = {
+                        "id": session_id,
+                        "amount": amount,  # 비어 있으면 '고정 안 됨' 으로 동작
+                        "installment": installment or "",
+                        "status": "결제중",
+                        "created_at": datetime.utcnow().isoformat(),
+                        "agency_id": "",  # HQ에서 생성한 세션은 특정 대행사에 속하지 않음
+                    }
+                    sessions.append(session)
+                    admin_state = {"sessions": sessions, "history": history}
                     try:
-                        trigger_auto_kvan_async(session_id=session_id)
+                        with open(ADMIN_STATE_PATH, "w", encoding="utf-8") as f:
+                            json.dump(admin_state, f, ensure_ascii=False, indent=2)
                     except Exception as e:  # noqa: BLE001
-                        print(f"HQ 세션 생성 시 auto_kvan 트리거 실패: {e}")
-                    if amount:
-                        message = "결제요청 페이지 링크가 생성되었습니다. 링크를 복사하여 고객에게 전달하세요."
+                        message = f"상태 저장 중 오류가 발생했습니다: {e}"
                     else:
-                        message = "금액이 고정되지 않은 결제요청 링크가 생성되었습니다. 링크를 복사하여 고객에게 전달하세요."
+                        # HQ에서 링크를 생성한 시점에도 자동 결제 매크로를 준비
+                        try:
+                            trigger_auto_kvan_async(session_id=session_id)
+                        except Exception as e:  # noqa: BLE001
+                            print(f"HQ 세션 생성 시 auto_kvan 트리거 실패: {e}")
+                        if amount:
+                            message = "결제요청 페이지 링크가 생성되었습니다. 링크를 복사하여 고객에게 전달하세요."
+                        else:
+                            message = "금액이 고정되지 않은 결제요청 링크가 생성되었습니다. 링크를 복사하여 고객에게 전달하세요."
 
         elif action == "close_session":
             sid = request.form.get("session_id", "").strip()
@@ -1619,8 +1862,8 @@ def admin():
           var vp = document.getElementById('viewport-meta');
           if (vp) vp.setAttribute('content', 'width=1280');
         }
-        // 5분마다 자동 새로고침
-        setInterval(function() { window.location.reload(); }, 300000);
+        // 7초마다 자동 새로고침 (K-VAN 연동 데이터 포함)
+        setInterval(function() { window.location.reload(); }, 7000);
       </script>
       <!-- 폰트 / 아이콘 / Tailwind -->
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;900&display=swap" rel="stylesheet">
@@ -1787,6 +2030,101 @@ def admin():
                   {% endfor %}
                 {% else %}
                   <div class="hint">아직 생성된 결제 요청 링크가 없습니다.</div>
+                {% endif %}
+              </div>
+
+              <!-- K-VAN 연동 거래 내역 (본사용) -->
+              <div class="status-card">
+                <div class="status-title">
+                  <i class="fa-solid fa-credit-card text-indigo-300 text-xs"></i>
+                  K-VAN 결제 / 취소 내역 (최근 30건)
+                </div>
+        <div class="hint" style="margin-top:4px;">
+          ※ K-VAN MID 와 대행사 정보가 agencies.kvan_mid 로 연결된 경우, 해당 결제는 자동으로
+          대행사별 거래/정산 내역에 반영됩니다. 매핑이 없으면 '미지정' 거래로 처리될 수 있으니
+          문제가 계속되면 관리자에게 문의해 주세요.
+        </div>
+                {% if kvan_transactions %}
+                  <div style="max-height:260px; overflow-y:auto; font-size:11px; margin-top:4px;">
+                    <table style="width:100%; border-collapse:collapse;">
+                      <thead>
+                        <tr style="border-bottom:1px solid rgba(148,163,184,0.4);">
+                          <th style="padding:4px; text-align:left;">가맹점명</th>
+                          <th style="padding:4px; text-align:left;">PG사/MID</th>
+                          <th style="padding:4px; text-align:right;">결제유형</th>
+                          <th style="padding:4px; text-align:right;">결제금액</th>
+                          <th style="padding:4px; text-align:right;">취소금액</th>
+                          <th style="padding:4px; text-align:right;">승인번호</th>
+                          <th style="padding:4px; text-align:left;">등록일</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {% for t in kvan_transactions %}
+                          <tr style="border-bottom:1px dashed rgba(55,65,81,0.8);">
+                            <td style="padding:3px 4px;">{{ t.merchant_name }}</td>
+                            <td style="padding:3px 4px;">
+                              {{ t.pg_name }} / {{ t.mid }}
+                              {% if t.fee_rate %}
+                                <span style="color:#9ca3af;"> ({{ t.fee_rate }})</span>
+                              {% endif %}
+                            </td>
+                            <td style="padding:3px 4px; text-align:right;">{{ t.tx_type }}</td>
+                            <td style="padding:3px 4px; text-align:right;">{{ "{:,}".format(t.amount or 0) }}</td>
+                            <td style="padding:3px 4px; text-align:right;">{{ "{:,}".format(t.cancel_amount or 0) }}</td>
+                            <td style="padding:3px 4px; text-align:right;">{{ t.approval_no }}</td>
+                            <td style="padding:3px 4px; font-size:10px;">{{ t.registered_at }}</td>
+                          </tr>
+                        {% endfor %}
+                      </tbody>
+                    </table>
+                  </div>
+                {% else %}
+                  <div class="hint">아직 크롤링된 K-VAN 결제/취소 내역이 없습니다.</div>
+                {% endif %}
+              </div>
+
+              <!-- K-VAN 결제링크 관리 (본사용) -->
+              <div class="status-card">
+                <div class="status-title">
+                  <i class="fa-solid fa-link text-sky-300 text-xs"></i>
+                  K-VAN 결제링크 관리 (최근 30건)
+                </div>
+                {% if kvan_links %}
+                  <div style="max-height:220px; overflow-y:auto; font-size:11px; margin-top:4px;">
+                    {% for l in kvan_links %}
+                      <div style="margin:6px 0; padding:7px 8px; border-radius:10px; background:#020617; border:1px solid #111827;">
+                        <div class="status-row">
+                          <span class="status-label">제목</span>
+                          <span class="status-value">{{ l.title }}</span>
+                        </div>
+                        <div class="status-row">
+                          <span class="status-label">금액</span>
+                          <span class="status-value">{{ "{:,}".format(l.amount or 0) }} 원</span>
+                        </div>
+                        <div class="status-row">
+                          <span class="status-label">유효시간</span>
+                          <span class="status-value">{{ l.ttl_label }}</span>
+                        </div>
+                        <div class="status-row">
+                          <span class="status-label">상태</span>
+                          <span class="status-value">{{ l.status }}</span>
+                        </div>
+                        <div class="status-row">
+                          <span class="status-label">MID / 세션</span>
+                          <span class="status-value">{{ l.mid }} / {{ l.kvan_session_id }}</span>
+                        </div>
+                        <div class="status-title" style="margin-top:4px;">
+                          <i class="fa-solid fa-arrow-up-right-from-square text-blue-300 text-[10px]"></i>
+                          링크
+                        </div>
+                        <div class="link-box">
+                          <div class="link-text" style="font-size:10px;">{{ l.kvan_link }}</div>
+                        </div>
+                      </div>
+                    {% endfor %}
+                  </div>
+                {% else %}
+                  <div class="hint">아직 크롤링된 결제링크 정보가 없습니다.</div>
                 {% endif %}
               </div>
 
@@ -2043,6 +2381,8 @@ def hq_admin():
     if not session.get("hq_logged_in"):
         return redirect(url_for("hq_login"))
 
+    history_warnings = cleanup_history_files()
+
     state = _load_hq_state()
     applications = state.get("applications") or []
     agencies = state.get("agencies") or []
@@ -2270,6 +2610,22 @@ def hq_admin():
       </header>
       <main class="flex-grow pt-20 pb-10 px-3 sm:px-4">
         <div class="max-w-6xl mx-auto space-y-8">
+          {% if history_warnings.warn_7_days or history_warnings.warn_3_days %}
+          <script>
+            window.addEventListener('load', function () {
+              var msg = "";
+              {% if history_warnings.warn_7_days %}
+              msg += "7일 뒤 삭제 예정 파일: {{ history_warnings.warn_7_days|join(', ') }}\n";
+              {% endif %}
+              {% if history_warnings.warn_3_days %}
+              msg += "3일 뒤 삭제 예정 파일: {{ history_warnings.warn_3_days|join(', ') }}\n";
+              {% endif %}
+              if (msg) {
+                alert("3개월이 지난 세션 JSON 히스토리가 곧 자동 삭제됩니다.\\n다운로드가 필요하면 지금 받아두세요.\\n\\n" + msg);
+              }
+            });
+          </script>
+          {% endif %}
           {% if message %}
           <div class="bg-emerald-500/10 border border-emerald-400/40 text-emerald-100 text-sm px-4 py-3 rounded-xl">
             {{ message }}
@@ -2883,6 +3239,7 @@ def hq_admin():
         agencies=agencies,
         transactions=transactions,
         message=message,
+        history_warnings=history_warnings,
     )
 
 
@@ -2921,11 +3278,26 @@ def agency_admin():
         except Exception:
             sessions, history = [], []
 
-    # DB 기반 거래 내역 (본사와 동일한 소스)
-    all_transactions = state.get("transactions") or []
-    agency_transactions = [
-        t for t in all_transactions if str(t.get("agency_id") or "") == str(agency_id)
-    ]
+    # DB 기반 거래 내역 (transactions 테이블에서 이 대행사 건만)
+    agency_transactions: list[dict] = []
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM transactions
+                WHERE agency_id = %s
+                ORDER BY created_at DESC
+                LIMIT 100
+                """,
+                (agency_id,),
+            )
+            agency_transactions = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        print(f"[WARN] agency_admin transactions 조회 실패: {e}")
+        agency_transactions = []
 
     message = ""
     base_url = request.url_root.rstrip("/")
@@ -2935,54 +3307,59 @@ def agency_admin():
         if action == "create":
             amount = request.form.get("admin_amount", "").strip()
             installment = request.form.get("admin_installment", "일시불").strip()
-            # 이 대행사의 진행 중 세션 수만 카운트
-            active_count = sum(
-                1 for s in sessions if s.get("status", "결제중") == "결제중"
-            )
-            if active_count >= 5:
-                message = "동시에 진행할 수 있는 세션은 최대 5개입니다."
+
+            # 금액이 지정된 경우, 최근 5분 내 동일 금액 링크가 있었는지 검사
+            if amount and _is_recent_duplicate_amount(amount, window_minutes=5):
+                message = "같은 금액의 결제 링크가 최근 5분 이내에 생성되었습니다. 5분 후에 다시 시도해 주세요."
             else:
-                session_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")[-12:]
-                new_session = {
-                    "id": session_id,
-                    "amount": amount,
-                    "installment": installment or "",
-                    "status": "결제중",
-                    "created_at": datetime.utcnow().isoformat(),
-                    "agency_id": agency_id,
-                }
-                # 전체 admin_state 에 병합 저장
-                all_sessions = sessions
-                all_history = history
-                if Path(ADMIN_STATE_PATH).exists():
-                    try:
-                        with open(ADMIN_STATE_PATH, "r", encoding="utf-8") as f:
-                            saved = json.load(f)
-                        all_sessions = saved.get("sessions") or []
-                        all_history = saved.get("history") or []
-                    except Exception:
-                        all_sessions, all_history = [], []
-                all_sessions.append(new_session)
-                admin_state = {"sessions": all_sessions, "history": all_history}
-                try:
-                    with open(ADMIN_STATE_PATH, "w", encoding="utf-8") as f:
-                        json.dump(admin_state, f, ensure_ascii=False, indent=2)
-                except Exception as e:  # noqa: BLE001
-                    message = f"세션 생성 중 오류가 발생했습니다: {e}"
+                # 이 대행사의 진행 중 세션 수만 카운트
+                active_count = sum(
+                    1 for s in sessions if s.get("status", "결제중") == "결제중"
+                )
+                if active_count >= 5:
+                    message = "동시에 진행할 수 있는 세션은 최대 5개입니다."
                 else:
-                    # 대행사가 링크를 생성한 시점에도 자동 결제 매크로를 준비
+                    session_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")[-12:]
+                    new_session = {
+                        "id": session_id,
+                        "amount": amount,
+                        "installment": installment or "",
+                        "status": "결제중",
+                        "created_at": datetime.utcnow().isoformat(),
+                        "agency_id": agency_id,
+                    }
+                    # 전체 admin_state 에 병합 저장
+                    all_sessions = sessions
+                    all_history = history
+                    if Path(ADMIN_STATE_PATH).exists():
+                        try:
+                            with open(ADMIN_STATE_PATH, "r", encoding="utf-8") as f:
+                                saved = json.load(f)
+                            all_sessions = saved.get("sessions") or []
+                            all_history = saved.get("history") or []
+                        except Exception:
+                            all_sessions, all_history = [], []
+                    all_sessions.append(new_session)
+                    admin_state = {"sessions": all_sessions, "history": all_history}
                     try:
-                        trigger_auto_kvan_async(session_id=session_id)
+                        with open(ADMIN_STATE_PATH, "w", encoding="utf-8") as f:
+                            json.dump(admin_state, f, ensure_ascii=False, indent=2)
                     except Exception as e:  # noqa: BLE001
-                        print(f"Agency 세션 생성 시 auto_kvan 트리거 실패: {e}")
-                    if amount:
-                        message = "결제요청 페이지 링크가 생성되었습니다. 링크를 복사하여 고객에게 전달하세요."
+                        message = f"세션 생성 중 오류가 발생했습니다: {e}"
                     else:
-                        message = "금액이 고정되지 않은 결제요청 링크가 생성되었습니다. 링크를 복사하여 고객에게 전달하세요."
-                # 로컬 세션 리스트도 갱신
-                sessions.append(new_session)
-                # 새로고침 시 중복 생성 방지
-                return redirect(url_for("agency_admin"))
+                        # 대행사가 링크를 생성한 시점에도 자동 결제 매크로를 준비
+                        try:
+                            trigger_auto_kvan_async(session_id=session_id)
+                        except Exception as e:  # noqa: BLE001
+                            print(f"Agency 세션 생성 시 auto_kvan 트리거 실패: {e}")
+                        if amount:
+                            message = "결제요청 페이지 링크가 생성되었습니다. 링크를 복사하여 고객에게 전달하세요."
+                        else:
+                            message = "금액이 고정되지 않은 결제요청 링크가 생성되었습니다. 링크를 복사하여 고객에게 전달하세요."
+                    # 로컬 세션 리스트도 갱신
+                    sessions.append(new_session)
+                    # 새로고침 시 중복 생성 방지
+                    return redirect(url_for("agency_admin"))
         elif action == "delete_session":
             sid = (request.form.get("session_id") or "").strip()
             if sid:
@@ -3223,19 +3600,26 @@ def agency_admin():
                   <tr>
                     <th class="px-3 py-1 text-left">시간</th>
                     <th class="px-3 py-1 text-right">금액</th>
+                    <th class="px-3 py-1 text-right">수수료율</th>
+                    <th class="px-3 py-1 text-right">지급예정금액</th>
                     <th class="px-3 py-1 text-left">구매자</th>
                     <th class="px-3 py-1 text-center">결제상태</th>
                     <th class="px-3 py-1 text-center">정산상태</th>
                   </tr>
                 </thead>
                 <tbody id="agencyTxBody">
+                  {% set fee = agency.fee_percent or 10 %}
                   {% for t in agency_transactions|sort(attribute="created_at", reverse=True) %}
                   {% set amount = t.amount or 0 %}
+                  {% set fee_amount = (amount * fee) // 100 %}
+                  {% set payable = amount - fee_amount %}
                   <tr class="bg-black/20 hover:bg-black/30 transition align-top"
                       data-date="{{ t.created_at.strftime('%Y-%m-%d') if t.created_at else '' }}"
                       data-status="{{ t.status or '' }}">
                     <td class="px-3 py-2 whitespace-nowrap">{{ t.created_at }}</td>
                     <td class="px-3 py-2 text-right">{{ amount }} 원</td>
+                    <td class="px-3 py-2 text-right">{{ fee }}%</td>
+                    <td class="px-3 py-2 text-right">{{ payable }} 원</td>
                     <td class="px-3 py-2 whitespace-nowrap">{{ t.customer_name }}</td>
                     <td class="px-3 py-2 text-center">
                       {% if t.status == 'success' %}
@@ -3274,6 +3658,7 @@ def agency_admin():
         history=history,
         base_url=base_url,
         message=message,
+        agency_transactions=agency_transactions,
     )
 
 
