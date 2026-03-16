@@ -25,11 +25,13 @@ from auto_kvan import (
     _go_to_payment_link,
     _has_payment_links_quick,
     WAKEUP_FLAG_PATH,
+    DATA_DIR,
 )
 
 
 # 로컬 테스트용 디버그 플래그 (기본 ON: "1")
 DEBUG_CRAWLER = os.environ.get("K_VAN_DEBUG", "1") == "1"
+HEARTBEAT_PATH = DATA_DIR / "kvan_crawler.heartbeat"
 
 
 def _dbg(msg: str) -> None:
@@ -43,6 +45,15 @@ def _alog(msg: str) -> None:
     """HQ 어드민 로그 박스에 표시될 크롤러 로그."""
     try:
         _append_admin_log("CRAWLER", msg)
+    except Exception:
+        pass
+
+
+def _touch_heartbeat() -> None:
+    """크롤러 생존 신호 파일 갱신."""
+    try:
+        HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        HEARTBEAT_PATH.write_text(str(time.time()), encoding="utf-8")
     except Exception:
         pass
 
@@ -184,6 +195,7 @@ def _wait_with_wakeup(total_delay: int) -> None:
     """
     waited = 0
     while waited < total_delay:
+        _touch_heartbeat()
         # 1초 단위로 쪼갬
         step = min(1, total_delay - waited)
         time.sleep(step)
@@ -216,6 +228,7 @@ def run_crawler_loop() -> None:
     try:
         print("[crawler] K-VAN 로그인 시작")
         _alog("K-VAN 로그인 시작")
+        _touch_heartbeat()
         _simple_sign_in(driver)
         print("[crawler] 로그인 완료. 주기 크롤링 루프 시작.")
         _alog("로그인 완료. 주기 크롤링 루프 시작")
@@ -241,6 +254,7 @@ def run_crawler_loop() -> None:
         empty_cycles = 0  # 연속으로 "링크 없음"으로 판정된 사이클 수
 
         while True:
+            _touch_heartbeat()
             loop_start = time.strftime("%Y-%m-%d %H:%M:%S")
             print(f"[crawler] 크롤링 사이클 시작: {loop_start}")
             _alog(f"크롤링 사이클 시작: {loop_start}")
@@ -365,6 +379,7 @@ def run_crawler_loop() -> None:
                 last_backup_ts = now_ts
     finally:
         _alog("크롤러 종료 (driver.quit)")
+        _touch_heartbeat()
         driver.quit()
 
 

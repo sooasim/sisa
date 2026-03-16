@@ -97,6 +97,15 @@ def _has_payment_links_quick(driver: webdriver.Chrome, retries: int = 5, delay: 
             if icons:
                 print(f"[EMPTY_CHECK] 거래 내역 아이콘 감지 → 링크 존재 (attempt={attempt}, count={len(icons)})")
                 return True
+
+            # 3) 거래내역 버튼이 없는 UI에서는 KEY 세션 ID 문자열로 링크 존재를 판단
+            key_tokens = driver.find_elements(
+                By.XPATH,
+                "//*[contains(normalize-space(.),'KEY20')]",
+            )
+            if key_tokens:
+                print(f"[EMPTY_CHECK] KEY 세션ID 감지 → 링크 존재 (attempt={attempt}, count={len(key_tokens)})")
+                return True
         except Exception as e:
             print(f"[EMPTY_CHECK] 링크 존재 여부 확인 중 예외 (attempt={attempt}): {e}")
 
@@ -173,10 +182,8 @@ def _go_to_payment_link(driver: webdriver.Chrome, max_attempts: int = 12) -> boo
     print("[NAV][ERROR] 여러 차례 시도했으나 /payment-link 로 진입하지 못했습니다.")
     return False
 
-# 코드와 데이터 경로 분리: SISA_DATA_DIR (없으면 ./data)
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("SISA_DATA_DIR") or (BASE_DIR / "data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+# 경로는 파일 상단에서 이미 초기화된 DATA_DIR(/app/data 또는 SISA_DATA_DIR)를 그대로 사용한다.
+# (중복 재정의 시 web_form.py 와 경로가 갈라져 lock/heartbeat/wakeup 파일 불일치가 발생할 수 있음)
 
 WAKEUP_FLAG_PATH = DATA_DIR / "crawler_wakeup.flag"
 
@@ -1548,16 +1555,20 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
         wait = WebDriverWait(driver, 10)
 
         # 실제 카드/테이블이 렌더링될 때까지 대기:
-        # 링크 텍스트나 input.value 에 'https://store.k-van.app' 가 포함된 요소가 나타날 때까지
-        wait.until(
-            EC.presence_of_element_located(
-                (
-                    By.XPATH,
-                    "//*[contains(text(),'https://store.k-van.app') "
-                    "or contains(@value,'https://store.k-van.app')]",
+        # 링크 텍스트 또는 행/아이콘이 보이면 진행한다.
+        try:
+            wait.until(
+                EC.presence_of_element_located(
+                    (
+                        By.XPATH,
+                        "//*[contains(text(),'https://store.k-van.app') "
+                        "or contains(@value,'https://store.k-van.app') "
+                        "or .//button[@title='거래 내역']]",
+                    )
                 )
             )
-        )
+        except TimeoutException:
+            print("[WARN] /payment-link 링크 텍스트 대기 타임아웃 - 현재 렌더된 행으로 계속 진행")
 
         # 각 링크 요소를 기준으로 상위 카드 컨테이너를 찾는다.
         link_elements = driver.find_elements(
@@ -1565,13 +1576,23 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
             "//*[contains(text(),'https://store.k-van.app') "
             "or contains(@value,'https://store.k-van.app')]",
         )
+        # 일부 UI에서는 링크 URL이 텍스트로 노출되지 않고 세션ID(KEY...)만 보인다.
+        # 이 경우엔 KEY를 추출해 표준 URL을 구성해서 저장한다.
+        fallback_rows: list = []
         if not link_elements:
-            print("[INFO] /payment-link 에 표시된 결제링크가 없습니다.")
-            return
+            fallback_rows = driver.find_elements(
+                By.XPATH,
+                "//tr[.//*[contains(normalize-space(.),'KEY20')]]"
+                " | //div[.//*[contains(normalize-space(.),'KEY20')]]",
+            )
+            if not fallback_rows:
+                print("[INFO] /payment-link 에 표시된 결제링크가 없습니다.")
+                return
 
         conn = get_db()
         inserted = 0
         with conn.cursor() as cur:
+            # 기본 모드: 링크 URL 텍스트 기반 수집
             for el in link_elements:
                 try:
                     # 링크 문자열 추출
@@ -1704,11 +1725,90 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
                     print(f"[WARN] 결제링크 카드 파싱/저장 중 오류: {e_row}")
                     continue
 
+            # 폴백 모드: KEY 세션ID 기반 수집
+            if not link_elements and fallback_rows:
+                for row in fallback_rows:
+                    try:
+                        row_text = (row.text or "").strip()
+                        if not row_text:
+                            continue
+                        lines = [ln.strip() for ln in row_text.splitlines() if ln.strip()]
+                        sid = ""
+                        for ln in lines:
+                            m = re.search(r"(KEY[0-9A-Za-z]+)", ln)
+                            if m:
+                                sid = m.group(1)
+                                break
+                        if not sid:
+                            continue
+                        link_text = f"https://store.k-van.app/p/{sid}?sessionId={sid}&type=KEYED"
+                        title = ""
+                        amount = 0
+                        status = ""
+                        ttl_label = ""
+                        mid = ""
+                        for ln in lines:
+                            if not title and "원" in ln:
+                                title = ln
+                            if not amount and "원" in ln:
+                                amount = _parse_amount(ln) or 0
+                            if not ttl_label and ("분" in ln):
+                                ttl_label = ln
+                            if not status and any(k in ln for k in ("사용", "만료", "취소", "대기", "완료")):
+                                status = ln
+                            if not mid and "MID" in ln.upper():
+                                mid = ln
+                        cur.execute("DELETE FROM kvan_links WHERE kvan_link = %s", (link_text,))
+                        cur.execute(
+                            """
+                            INSERT INTO kvan_links (
+                              captured_at, title, amount, ttl_label, status, kvan_link, mid, kvan_session_id, raw_text
+                            )
+                            VALUES (NOW(), %s,%s,%s,%s,%s,%s,%s,%s)
+                            """,
+                            (title, amount, ttl_label, status, link_text, mid, sid, row_text),
+                        )
+                        inserted += 1
+                        try:
+                            st_data = _load_admin_state()
+                            matched = False
+                            for s in st_data.get("sessions") or []:
+                                if str(s.get("id") or "") == sid:
+                                    if s.get("kvan_link") != link_text:
+                                        s["kvan_link"] = link_text
+                                        matched = True
+                            if matched:
+                                _save_admin_state(st_data)
+                        except Exception:
+                            pass
+                    except Exception as e_row2:
+                        print(f"[WARN] 결제링크 폴백 파싱/저장 중 오류: {e_row2}")
+                        continue
+
         conn.commit()
         conn.close()
         print(f"[INFO] /payment-link 에서 {inserted}건의 결제링크 정보를 kvan_links 에 저장했습니다.")
     except Exception as e:
         print(f"[WARN] 결제링크 관리(/payment-link) 크롤링/DB 저장 실패: {e}")
+
+
+def _is_expired_link_status(status_text: str) -> bool:
+    """
+    결제링크 상태 문자열이 '실제 만료/취소'인지 판별한다.
+
+    주의:
+    - '취소 가능' 같은 문구는 만료/취소 완료 상태가 아니므로 제외한다.
+    """
+    s = str(status_text or "").strip()
+    if not s:
+        return False
+    if "만료" in s:
+        return True
+    if "취소 가능" in s or "취소가능" in s:
+        return False
+    if s in ("취소", "취소됨", "취소 완료", "취소완료"):
+        return True
+    return False
 
 
 def mark_expired_sessions_from_kvan_links() -> None:
@@ -1719,7 +1819,8 @@ def mark_expired_sessions_from_kvan_links() -> None:
     정책:
     - 만료/취소 링크 데이터(kvan_links)는 DB에서 자동 삭제한다.
     - 거래내역(transactions)은 자동 삭제하지 않는다.
-    - admin_state 의 세션은 해당 링크를 가진 항목만 제거한다.
+    - admin_state 의 진행중 세션은 즉시 제거하고, history에
+      status='만료', deleted_in_kvan=True 로 남긴다.
     """
     if LOCAL_TEST:
         return
@@ -1728,12 +1829,16 @@ def mark_expired_sessions_from_kvan_links() -> None:
         expired_urls: set[str] = set()
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT kvan_link FROM kvan_links WHERE kvan_link IS NOT NULL AND kvan_link != '' AND (status LIKE %s OR status LIKE %s)",
-                ("%만료%", "%취소%"),
+                """
+                SELECT kvan_link, status
+                FROM kvan_links
+                WHERE kvan_link IS NOT NULL AND kvan_link != ''
+                """,
             )
             for row in cur.fetchall() or []:
                 url = (row.get("kvan_link") or "").strip()
-                if url:
+                status_text = str(row.get("status") or "").strip()
+                if url and _is_expired_link_status(status_text):
                     expired_urls.add(url)
         if not expired_urls:
             conn.close()
@@ -1741,39 +1846,45 @@ def mark_expired_sessions_from_kvan_links() -> None:
         st = _load_admin_state()
         sessions = list(st.get("sessions") or [])
         history = list(st.get("history") or [])
-        still_active: list[dict] = []
+        remaining_sessions: list[dict] = []
         removed_count = 0
+        now_iso = datetime.utcnow().isoformat()
+
         for s in sessions:
             link = (s.get("kvan_link") or "").strip()
             if link and link in expired_urls:
                 removed_count += 1
+                sid = str(s.get("id") or "")
+                s["status"] = "만료"
+                s["deleted"] = True
+                s["deleted_in_kvan"] = True
+                s["deleted_at"] = now_iso
+                s["finished_at"] = s.get("finished_at") or now_iso
+                old_msg = str(s.get("result_message") or "").strip()
+                mark_msg = "만료 감지로 K-VAN 링크가 삭제되었습니다."
+                s["result_message"] = f"{old_msg}\n{mark_msg}".strip() if old_msg else mark_msg
+
+                # 동일 세션이 history에 이미 있으면 업데이트, 없으면 추가
+                history = _upsert_history_by_session_id(history, dict(s))
+
                 _append_admin_log(
                     "AUTO",
-                    f"만료 링크 세션 정리 session_id={s.get('id')}, link={link[:50]}...",
+                    f"만료 링크 세션 정리 session_id={sid}, link={link[:50]}...",
                 )
             else:
-                still_active.append(s)
-        kept_history: list[dict] = []
-        for h in history:
-            h_link = (h.get("kvan_link") or "").strip()
-            h_status = str(h.get("status") or "").strip()
-            if (h_link and h_link in expired_urls) or ("만료" in h_status):
-                removed_count += 1
-                continue
-            kept_history.append(h)
-        st["sessions"] = still_active
-        st["history"] = kept_history
+                remaining_sessions.append(s)
+
+        st["sessions"] = remaining_sessions
+        st["history"] = history
         _save_admin_state(st)
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                DELETE FROM kvan_links
-                WHERE kvan_link IS NOT NULL
-                  AND kvan_link != ''
-                  AND (status LIKE %s OR status LIKE %s)
-                """,
-                ("%만료%", "%취소%"),
-            )
+        # 상태 문자열 LIKE 광역 삭제를 피하고, 위에서 판별한 URL만 정확히 삭제한다.
+        if expired_urls:
+            with conn.cursor() as cur:
+                placeholders = ",".join(["%s"] * len(expired_urls))
+                cur.execute(
+                    f"DELETE FROM kvan_links WHERE kvan_link IN ({placeholders})",
+                    tuple(expired_urls),
+                )
         conn.commit()
         conn.close()
         if removed_count:
@@ -2074,6 +2185,28 @@ def _is_session_already_processed(session_id: str) -> bool:
         return False
 
 
+def _upsert_history_by_session_id(history: list[dict], entry: dict) -> list[dict]:
+    """history에서 동일 session_id를 1건으로 유지하며 upsert."""
+    sid = str(entry.get("id") or "").strip()
+    if not sid:
+        return history
+    merged_history: list[dict] = []
+    merged_target: dict | None = None
+    for h in history or []:
+        if str(h.get("id") or "").strip() == sid:
+            if merged_target is None:
+                merged_target = dict(h)
+            else:
+                merged_target.update(h)
+        else:
+            merged_history.append(h)
+    if merged_target is None:
+        merged_target = {}
+    merged_target.update(entry)
+    merged_history.append(merged_target)
+    return merged_history
+
+
 def _mark_session_checked(session_id: str, title: str, has_approval: bool) -> None:
     """
     admin_state.json.history 에 has_approval 플래그를 기록해
@@ -2083,25 +2216,36 @@ def _mark_session_checked(session_id: str, title: str, has_approval: bool) -> No
         return
     try:
         st = _load_admin_state()
-        sessions = st.get("sessions") or []
-        history = st.get("history") or []
+        sessions = list(st.get("sessions") or [])
+        history = list(st.get("history") or [])
+        now_iso = datetime.utcnow().isoformat()
 
-        found = False
-        for h in history:
-            if str(h.get("id")) == str(session_id):
-                h["has_approval"] = bool(has_approval)
-                h["checked_title"] = title
-                found = True
-                break
-        if not found:
-            history.append(
-                {
-                    "id": session_id,
-                    "has_approval": bool(has_approval),
-                    "checked_title": title,
-                }
-            )
-        st["sessions"] = sessions
+        if has_approval:
+            # 승인 완료된 세션은 진행중 목록에서 제거하고 history로 이동
+            remaining_sessions: list[dict] = []
+            moved_session: dict | None = None
+            for s in sessions:
+                if str(s.get("id") or "") == str(session_id):
+                    moved_session = dict(s)
+                else:
+                    remaining_sessions.append(s)
+
+            if moved_session is None:
+                moved_session = {"id": session_id}
+            moved_session["status"] = "결제완료"
+            moved_session["has_approval"] = True
+            moved_session["checked_title"] = title
+            moved_session["finished_at"] = moved_session.get("finished_at") or now_iso
+            history = _upsert_history_by_session_id(history, moved_session)
+            st["sessions"] = remaining_sessions
+        else:
+            # 미승인 체크 결과는 history 신규 생성하지 않고 기존 history 항목만 보강
+            for h in history:
+                if str(h.get("id") or "") == str(session_id):
+                    h["checked_title"] = title or h.get("checked_title") or ""
+                    break
+            st["sessions"] = sessions
+
         st["history"] = history
         _save_admin_state(st)
     except Exception as e:
@@ -2109,15 +2253,33 @@ def _mark_session_checked(session_id: str, title: str, has_approval: bool) -> No
 
 
 def _mark_session_deleted(session_id: str, title: str) -> None:
-    _mark_session_checked(session_id, title, has_approval=False)
     try:
         st = _load_admin_state()
-        sessions = st.get("sessions") or []
-        history = st.get("history") or []
-        for h in history:
-            if str(h.get("id")) == str(session_id):
-                h["deleted"] = True
-        st["sessions"] = sessions
+        sessions = list(st.get("sessions") or [])
+        history = list(st.get("history") or [])
+        now_iso = datetime.utcnow().isoformat()
+
+        remaining_sessions: list[dict] = []
+        removed_session: dict | None = None
+        for s in sessions:
+            if str(s.get("id") or "") == str(session_id):
+                removed_session = dict(s)
+            else:
+                remaining_sessions.append(s)
+
+        if removed_session is None:
+            removed_session = {"id": session_id}
+        removed_session["status"] = "만료"
+        removed_session["deleted"] = True
+        removed_session["deleted_in_kvan"] = True
+        removed_session["checked_title"] = title
+        removed_session["finished_at"] = removed_session.get("finished_at") or now_iso
+        old_msg = str(removed_session.get("result_message") or "").strip()
+        mark_msg = "만료 감지로 K-VAN 링크가 삭제되었습니다."
+        removed_session["result_message"] = f"{old_msg}\n{mark_msg}".strip() if old_msg else mark_msg
+
+        history = _upsert_history_by_session_id(history, removed_session)
+        st["sessions"] = remaining_sessions
         st["history"] = history
         _save_admin_state(st)
     except Exception as e:
@@ -2166,24 +2328,30 @@ def _scan_payment_link_popups_and_sync(driver: webdriver.Chrome) -> bool:
             time.sleep(0.5)
 
         if not icons_found:
-            print("[WARN] 결제링크 관리 화면에서 '거래 내역' 아이콘이 표시되지 않았습니다.")
+            print("[INFO] 결제링크 관리 화면에서 '거래 내역' 아이콘이 없어 팝업 기반 동기화를 건너뜁니다. (transactions 동기화는 계속 진행)")
             _step_end("결제링크 관리 팝업 기반 동기화", t0)
             return False
 
-        # 카드 컨테이너 (각 카드 안에 '거래 내역' 버튼이 있는 것만)
-        cards = driver.find_elements(
-            By.XPATH,
-            "//div[.//button[@title='거래 내역']"
-            "      or .//button[contains(normalize-space(.),'거래 내역')]"
-            "      or .//button[contains(normalize-space(.),'거래내역')]"
-            "      or .//button[.//svg[contains(@class,'lucide-receipt')]]]",
-        )
-        if not cards:
+        # 버튼 기준으로 실제 "행/카드" 컨테이너를 좁혀 잡는다.
+        # (기존의 광범위 div 탐색은 페이지 전체를 1개 카드로 오인할 수 있음)
+        card_items: list[tuple] = []
+        for btn in icons:
+            try:
+                card = btn.find_element(
+                    By.XPATH,
+                    "./ancestor::tr[1]"
+                    " | ./ancestor::*[@role='row'][1]"
+                    " | ./ancestor::div[contains(@class,'rounded')][1]",
+                )
+                card_items.append((card, btn))
+            except Exception:
+                continue
+        if not card_items:
             _step_end("결제링크 관리 팝업 기반 동기화", t0)
             return False
 
         # 모든 카드를 순차적으로 처리 (세션ID 기준으로 신규만)
-        for idx, card in enumerate(cards, start=1):
+        for idx, (card, btn) in enumerate(card_items, start=1):
             try:
                 card_text = card.text or ""
                 lines = [ln.strip() for ln in card_text.splitlines() if ln.strip()]
@@ -2219,9 +2387,11 @@ def _scan_payment_link_popups_and_sync(driver: webdriver.Chrome) -> bool:
                         if len(parts) > 1:
                             session_id = parts[1].strip()
                             continue
-                    # 2순위: 최근 UI처럼 KEY 로 시작하는 세션ID 가 단독으로 나오는 경우
+                    # 2순위: 문자열에서 KEY... 패턴을 정규식으로 추출
                     if not session_id and "KEY20" in ln:
-                        session_id = ln.strip()
+                        m = re.search(r"(KEY[0-9A-Za-z]+)", ln)
+                        if m:
+                            session_id = m.group(1)
 
                 # 세션 ID 가 없는 행(헤더/틀 행 등)은 실제 결제링크 카드가 아니므로 건너뜀
                 if not session_id:
@@ -2231,16 +2401,6 @@ def _scan_payment_link_popups_and_sync(driver: webdriver.Chrome) -> bool:
                 print(f"[CARD_DEBUG] 인덱스={idx}, 세션ID={session_id}, 제목={product_title}, is_expired={is_expired}")
                 if _is_session_already_processed(session_id):
                     print(f"[CARD_DEBUG] 이미 처리된 세션 → 건너뜀 (session_id={session_id})")
-                    continue
-
-                # 카드 안의 '거래 내역' 버튼 클릭
-                try:
-                    btn = card.find_element(
-                        By.XPATH,
-                        ".//button[@title='거래 내역']"
-                        " | .//button[.//svg[contains(@class,'lucide-receipt')]]",
-                    )
-                except Exception:
                     continue
 
                 # 거래 내역 버튼 클릭은 DOM 변동/레이아웃 지연 때문에 실패할 수 있으므로

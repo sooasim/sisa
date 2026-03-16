@@ -344,6 +344,7 @@ KVAN_LOCK_PATH = DATA_DIR / "kvan_running.lock"
 PAYMENT_NOTIFICATIONS_PATH = DATA_DIR / "payment_notifications.json"
 KVAN_CRAWLER_LOCK_PATH = DATA_DIR / "kvan_crawler.lock"
 KVAN_CRAWLER_WAKEUP_PATH = DATA_DIR / "crawler_wakeup.flag"
+KVAN_CRAWLER_HEARTBEAT_PATH = DATA_DIR / "kvan_crawler.heartbeat"
 
 
 def _load_payment_notifications(agency_id: str | None = None) -> list[dict]:
@@ -445,6 +446,16 @@ def _crawler_is_running() -> bool:
         pid = int(pid_str)
         try:
             os.kill(pid, 0)
+            # PID는 살아있지만 크롤러 루프가 멈췄을 수 있으므로 heartbeat 신선도도 함께 본다.
+            try:
+                if KVAN_CRAWLER_HEARTBEAT_PATH.exists():
+                    hb_age = time.time() - KVAN_CRAWLER_HEARTBEAT_PATH.stat().st_mtime
+                    if hb_age > 180:
+                        KVAN_CRAWLER_LOCK_PATH.unlink(missing_ok=True)
+                        _append_hq_log("WEB", f"[WARN] crawler heartbeat stale({int(hb_age)}s) - lock reset")
+                        return False
+            except Exception:
+                pass
             return True
         except (OSError, ProcessLookupError):
             KVAN_CRAWLER_LOCK_PATH.unlink(missing_ok=True)
@@ -2800,16 +2811,26 @@ def admin():
         .loading-card { background:#0f172a; border:1px solid #334155; border-radius:14px; padding:16px 18px; color:#e2e8f0; min-width:240px; text-align:center; box-shadow:0 18px 44px rgba(2,6,23,0.65); }
         .loading-spinner { width:28px; height:28px; border:3px solid #475569; border-top-color:#60a5fa; border-radius:50%; margin:0 auto 10px; animation:spin1 0.8s linear infinite; }
         @keyframes spin1 { to { transform: rotate(360deg); } }
+        .pending-popup { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); z-index:2100; min-width:260px; max-width:90vw; background:#0f172a; border:1px solid #334155; border-radius:14px; padding:14px 16px; text-align:center; color:#e2e8f0; box-shadow:0 18px 48px rgba(2,6,23,.72); display:none; }
+        .pending-popup.show { display:block; }
+        .pending-dot { width:10px; height:10px; border-radius:999px; background:#60a5fa; display:inline-block; animation:pulseDot 1s infinite ease-in-out; }
+        .pending-dot:nth-child(2) { animation-delay:.2s; }
+        .pending-dot:nth-child(3) { animation-delay:.4s; }
+        @keyframes pulseDot { 0%,100% { opacity:.2; transform:translateY(0);} 50% { opacity:1; transform:translateY(-2px);} }
       </style>
       <script>
         // /admin 페이지에서: 결제중인데 아직 K-VAN 링크가 없는 세션이 있으면
         // 한 번만 7초 후 자동 새로고침하고, 링크가 생성된 뒤에는 새로고침하지 않는다.
         (function () {
           var hasPending = {{ 'true' if has_pending_link else 'false' }};
+          var pendingPopup = document.getElementById("pending-create-popup");
           if (hasPending) {
+            if (pendingPopup) pendingPopup.classList.add("show");
             setTimeout(function () {
               window.location.reload();
             }, 7000);
+          } else if (pendingPopup) {
+            pendingPopup.classList.remove("show");
           }
           // 새 링크 생성 후 리다이렉트된 경우(new=1)에는 팝업으로 한 번 안내
           var params = new URLSearchParams(window.location.search || "");
@@ -2821,6 +2842,13 @@ def admin():
       </script>
     </head>
     <body class="bg-brand-blue text-white font-sans overflow-x-hidden antialiased flex flex-col min-h-screen">
+      <div id="pending-create-popup" class="pending-popup" aria-hidden="true">
+        <div style="font-size:13px;font-weight:700; margin-bottom:6px;">링크 생성중입니다</div>
+        <div style="font-size:11px; color:#94a3b8; margin-bottom:8px;">생성이 완료되면 자동으로 반영됩니다.</div>
+        <div style="display:flex; justify-content:center; gap:6px;">
+          <span class="pending-dot"></span><span class="pending-dot"></span><span class="pending-dot"></span>
+        </div>
+      </div>
       <!-- 헤더 -->
       <header class="fixed top-0 left-0 right-0 z-30 glass-card border-b border-white/10">
         <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
@@ -2911,6 +2939,14 @@ def admin():
                         <span class="status-label">상태</span>
                         <span class="status-value">{{ s.status or '결제중' }}</span>
                       </div>
+                      {% if s.status == '만료' %}
+                      <div class="status-row">
+                        <span class="status-label">만료/삭제</span>
+                        <span class="status-value" style="color:#fca5a5;">
+                          만료 감지됨{% if s.deleted_in_kvan %} · K-VAN에서 삭제됨{% endif %}
+                        </span>
+                      </div>
+                      {% endif %}
                       <div class="status-title" style="margin-top:6px;">
                         <i class="fa-solid fa-link text-blue-400 text-xs"></i>
                         결제 요청 링크
@@ -2980,7 +3016,10 @@ def admin():
                       </div>
                       <div class="status-row">
                         <span class="status-label">상태</span>
-                        <span class="status-value">{{ h.status }}</span>
+                        <span class="status-value">
+                          {{ h.status }}
+                          {% if h.deleted_in_kvan %}<span style="color:#fca5a5;"> · 삭제됨</span>{% endif %}
+                        </span>
                       </div>
                       <div class="status-row">
                         <span class="status-label">정산</span>
@@ -4661,6 +4700,10 @@ def agency_admin():
     # 미확인 결제 알림 건수 (현재 로그인한 대행사만)
     _agency_id = session.get("agency_id")
     payment_notifications_count = len(_load_payment_notifications(agency_id=_agency_id))
+    has_pending_link = any(
+        (s.get("status", "결제중") == "결제중") and not s.get("kvan_link")
+        for s in sessions
+    )
 
     template = """
     <!DOCTYPE html>
@@ -4676,13 +4719,16 @@ def agency_admin():
           var vp = document.getElementById('viewport-meta');
           if (vp) vp.setAttribute('content', 'width=1280');
         }
-        // 진행 중인 세션이 하나 이상 있을 때만 7초 후 한 번 자동 새로고침한다.
-        // (세션이 없으면 불필요한 새로고침을 하지 않음)
-        var hasActiveSessions = {{ 'true' if sessions else 'false' }};
-        if (hasActiveSessions) {
+        // 결제중이면서 링크가 아직 없는 세션이 있을 때만 7초 후 한 번 자동 새로고침한다.
+        var hasPending = {{ 'true' if has_pending_link else 'false' }};
+        var pendingPopup = document.getElementById("pending-create-popup");
+        if (hasPending) {
+          if (pendingPopup) pendingPopup.classList.add("show");
           setTimeout(function () {
             location.reload();
           }, 7000);
+        } else if (pendingPopup) {
+          pendingPopup.classList.remove("show");
         }
         // 결제 페이지의 결과 모달/오버레이가 남아 있는 경우를 대비해 강제로 숨긴다.
         function hideStaleOverlays() {
@@ -4732,6 +4778,12 @@ def agency_admin():
         .loading-card { background:#0f172a; border:1px solid #334155; border-radius:14px; padding:16px 18px; color:#e2e8f0; min-width:240px; text-align:center; box-shadow:0 18px 44px rgba(2,6,23,0.65); }
         .loading-spinner { width:28px; height:28px; border:3px solid #475569; border-top-color:#60a5fa; border-radius:50%; margin:0 auto 10px; animation:spin2 0.8s linear infinite; }
         @keyframes spin2 { to { transform: rotate(360deg); } }
+        .pending-popup { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); z-index:2100; min-width:260px; max-width:90vw; background:#0f172a; border:1px solid #334155; border-radius:14px; padding:14px 16px; text-align:center; color:#e2e8f0; box-shadow:0 18px 48px rgba(2,6,23,.72); display:none; }
+        .pending-popup.show { display:block; }
+        .pending-dot { width:10px; height:10px; border-radius:999px; background:#60a5fa; display:inline-block; animation:pulseDot2 1s infinite ease-in-out; }
+        .pending-dot:nth-child(2) { animation-delay:.2s; }
+        .pending-dot:nth-child(3) { animation-delay:.4s; }
+        @keyframes pulseDot2 { 0%,100% { opacity:.2; transform:translateY(0);} 50% { opacity:1; transform:translateY(-2px);} }
         /* 결제 폼에서 사용하던 결과 모달 오버레이가 남아 있어도 대행사 어드민에서는 항상 숨긴다. */
         #result-modal,
         .result-backdrop,
@@ -4744,6 +4796,13 @@ def agency_admin():
       </style>
     </head>
     <body class="bg-brand-blue text-white font-sans overflow-x-hidden antialiased min-h-screen flex flex-col">
+      <div id="pending-create-popup" class="pending-popup" aria-hidden="true">
+        <div style="font-size:13px;font-weight:700; margin-bottom:6px;">링크 생성중입니다</div>
+        <div style="font-size:11px; color:#94a3b8; margin-bottom:8px;">생성이 완료되면 자동으로 반영됩니다.</div>
+        <div style="display:flex; justify-content:center; gap:6px;">
+          <span class="pending-dot"></span><span class="pending-dot"></span><span class="pending-dot"></span>
+        </div>
+      </div>
       <div id="link-loading-overlay" class="loading-backdrop" aria-hidden="true">
         <div class="loading-card">
           <div class="loading-spinner"></div>
@@ -4861,6 +4920,9 @@ def agency_admin():
                   </div>
                   <div class="text-white/60">생성일: {{ s.created_at }}</div>
                   <div class="text-white/70">상태: {{ s.status or '결제중' }}</div>
+                  {% if s.status == '만료' %}
+                  <div class="text-red-300">만료 감지됨{% if s.deleted_in_kvan %} · K-VAN에서 삭제됨{% endif %}</div>
+                  {% endif %}
                 </div>
                 <div class="flex flex-col items-end gap-1 text-[11px]">
                   {% set kvan_link = s.kvan_link %}
@@ -4928,7 +4990,9 @@ def agency_admin():
                     <td class="px-3 py-2 font-mono text-blue-200">{{ h.id }}</td>
                     <td class="px-3 py-2 text-right">{{ h.amount }}</td>
                     <td class="px-3 py-2">{{ h.installment }}</td>
-                    <td class="px-3 py-2 text-[11px] text-white/80">{{ h.status }}</td>
+                    <td class="px-3 py-2 text-[11px] text-white/80">
+                      {{ h.status }}{% if h.deleted_in_kvan %} · 삭제됨{% endif %}
+                    </td>
                     <td class="px-3 py-2 text-[11px] text-white/70 max-w-[200px] truncate">{{ h.result_message }}</td>
                   </tr>
                   {% endfor %}
@@ -5066,6 +5130,7 @@ def agency_admin():
         message=message,
         agency_transactions=agency_transactions,
         payment_notifications_count=payment_notifications_count,
+        has_pending_link=has_pending_link,
     )
 
 
