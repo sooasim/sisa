@@ -14,6 +14,7 @@ from auto_kvan import (
     _scrape_dashboard_and_store,
     _scrape_transactions_and_store,
     _scrape_payment_links_and_store,
+    mark_expired_sessions_from_kvan_links,
     _sync_kvan_to_transactions,
     _scan_payment_link_popups_and_sync,
     _has_active_sessions,
@@ -258,6 +259,10 @@ def run_crawler_loop() -> None:
                 _dbg("결제링크 목록 크롤링 시작 (_scrape_payment_links_and_store)")
                 _scrape_payment_links_and_store(driver)
                 _dbg(f"결제링크 목록 크롤링 종료 (elapsed={time.time() - t_links:.2f}s, url={driver.current_url})")
+                try:
+                    mark_expired_sessions_from_kvan_links()
+                except Exception as _e:
+                    _dbg(f"링크 만료 세션 반영 스킵: {_e}")
 
                 # 1-1) 현재 결제링크가 화면에 남아 있는지 간단히 확인
                 # (팝업 스캔 여부를 결정하는 용도, empty_cycles 업데이트는 루프 끝에서 수행)

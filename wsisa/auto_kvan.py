@@ -7,6 +7,7 @@ from typing import List
 from datetime import datetime, timedelta
 import random
 import re
+from urllib.parse import urlparse, parse_qs
 
 from openpyxl import load_workbook, Workbook
 from selenium import webdriver
@@ -1582,6 +1583,14 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
                     if not link_text:
                         continue
 
+                    # 링크 URL의 querystring에서 sessionId를 우선 추출해 매핑 정확도를 높인다.
+                    parsed_session_id = ""
+                    try:
+                        q = parse_qs(urlparse(link_text).query)
+                        parsed_session_id = str((q.get("sessionId") or [""])[0] or "").strip()
+                    except Exception:
+                        parsed_session_id = ""
+
                     # 카드/행 컨테이너: 가장 가까운 div[role='row'] 또는 카드형 div
                     container = el
                     for _ in range(5):
@@ -1612,7 +1621,7 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
                     # 유효시간/TTL: '분' 텍스트가 있는 줄 추출 (예: '60분 (긴 결제 플로우)')
                     ttl_label = ""
                     for ln in lines:
-                        if "분" in ln and "유효" in ln or "세션" in ln:
+                        if ("분" in ln and "유효" in ln) or ("세션" in ln):
                             ttl_label = ln
                             break
 
@@ -1631,6 +1640,20 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
                             mid = ln
                         if "세션" in ln or "Session" in ln:
                             kvan_session_id = ln
+                    resolved_session_id = parsed_session_id
+                    if not resolved_session_id and kvan_session_id:
+                        m = re.search(r"(KEY[0-9A-Za-z]+)", kvan_session_id)
+                        if m:
+                            resolved_session_id = m.group(1)
+                    if not resolved_session_id:
+                        for ln in lines:
+                            m = re.search(r"(KEY[0-9A-Za-z]+)", ln)
+                            if m:
+                                resolved_session_id = m.group(1)
+                                break
+
+                    # 동일 링크가 매 사이클 누적 저장되지 않도록 기존 행을 제거 후 최신 스냅샷 저장
+                    cur.execute("DELETE FROM kvan_links WHERE kvan_link = %s", (link_text,))
 
                     cur.execute(
                         """
@@ -1654,24 +1677,23 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
                             status,
                             link_text,
                             mid,
-                            kvan_session_id,
+                            resolved_session_id or kvan_session_id,
                             card_text,
                         ),
                     )
                     inserted += 1
 
                     # 크롤링으로 새로 얻은 링크를 admin_state.json 에도 즉시 반영
-                    # (kvan_session_id 가 있으면 세션 ID 기준으로, 없으면 title 기준으로 매칭)
+                    # (sessionId 가 있으면 세션 ID 기준으로 우선 매칭)
                     if link_text:
                         try:
                             st_data = _load_admin_state()
                             matched = False
                             for s in st_data.get("sessions") or []:
                                 sid = str(s.get("id") or "")
-                                s_title = str(s.get("product_name") or s.get("id") or "")
-                                if (kvan_session_id and sid and sid in kvan_session_id) or \
-                                   (title and s_title and s_title in title):
-                                    if not s.get("kvan_link"):
+                                if (resolved_session_id and sid and sid == resolved_session_id) or \
+                                   (sid and title and sid in title):
+                                    if s.get("kvan_link") != link_text:
                                         s["kvan_link"] = link_text
                                         matched = True
                             if matched:
@@ -1687,6 +1709,80 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
         print(f"[INFO] /payment-link 에서 {inserted}건의 결제링크 정보를 kvan_links 에 저장했습니다.")
     except Exception as e:
         print(f"[WARN] 결제링크 관리(/payment-link) 크롤링/DB 저장 실패: {e}")
+
+
+def mark_expired_sessions_from_kvan_links() -> None:
+    """
+    kvan_links 테이블에서 상태가 '만료'인 링크 URL 목록을 조회한 뒤,
+    admin_state.json 의 진행 중 세션 중 해당 링크를 가진 세션을 종료 처리한다.
+
+    정책:
+    - 만료/취소 링크 데이터(kvan_links)는 DB에서 자동 삭제한다.
+    - 거래내역(transactions)은 자동 삭제하지 않는다.
+    - admin_state 의 세션은 해당 링크를 가진 항목만 제거한다.
+    """
+    if LOCAL_TEST:
+        return
+    try:
+        conn = get_db()
+        expired_urls: set[str] = set()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT kvan_link FROM kvan_links WHERE kvan_link IS NOT NULL AND kvan_link != '' AND (status LIKE %s OR status LIKE %s)",
+                ("%만료%", "%취소%"),
+            )
+            for row in cur.fetchall() or []:
+                url = (row.get("kvan_link") or "").strip()
+                if url:
+                    expired_urls.add(url)
+        if not expired_urls:
+            conn.close()
+            return
+        st = _load_admin_state()
+        sessions = list(st.get("sessions") or [])
+        history = list(st.get("history") or [])
+        still_active: list[dict] = []
+        removed_count = 0
+        for s in sessions:
+            link = (s.get("kvan_link") or "").strip()
+            if link and link in expired_urls:
+                removed_count += 1
+                _append_admin_log(
+                    "AUTO",
+                    f"만료 링크 세션 정리 session_id={s.get('id')}, link={link[:50]}...",
+                )
+            else:
+                still_active.append(s)
+        kept_history: list[dict] = []
+        for h in history:
+            h_link = (h.get("kvan_link") or "").strip()
+            h_status = str(h.get("status") or "").strip()
+            if (h_link and h_link in expired_urls) or ("만료" in h_status):
+                removed_count += 1
+                continue
+            kept_history.append(h)
+        st["sessions"] = still_active
+        st["history"] = kept_history
+        _save_admin_state(st)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM kvan_links
+                WHERE kvan_link IS NOT NULL
+                  AND kvan_link != ''
+                  AND (status LIKE %s OR status LIKE %s)
+                """,
+                ("%만료%", "%취소%"),
+            )
+        conn.commit()
+        conn.close()
+        if removed_count:
+            _append_admin_log(
+                "AUTO",
+                f"만료/취소 링크 DB 정리 완료 (세션 {removed_count}건, 링크 {len(expired_urls)}건)",
+            )
+    except Exception as e:
+        print(f"[WARN] 링크 만료 세션 반영 실패: {e}")
 
 
 def _sync_popup_transaction_to_internal(
@@ -1797,10 +1893,50 @@ def _sync_popup_transaction_to_internal(
                         registered_at,
                     ),
                 )
+                # 결제 완료 알림 큐에 추가 (본사/대행사 어드민에서 미확인 알림 표시용)
+                _append_payment_notification(
+                    agency_id=agency_id or "",
+                    amount=amount,
+                    tx_id=new_tx_id,
+                    customer_name=customer_name or "",
+                )
         conn.commit()
         conn.close()
     except Exception as e:
         print(f"[WARN] popup 기반 transactions 동기화 실패: {e}")
+
+
+def _append_payment_notification(
+    agency_id: str,
+    amount: int,
+    tx_id: str,
+    customer_name: str,
+) -> None:
+    """결제 완료 시 알림 큐 파일에 추가한다. (카카오/문자 연동은 추후 확장)"""
+    if not tx_id or amount <= 0:
+        return
+    try:
+        path = DATA_DIR / "payment_notifications.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        items: list[dict] = []
+        if path.exists():
+            try:
+                items = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                items = []
+        items.append({
+            "agency_id": agency_id or "",
+            "amount": amount,
+            "tx_id": tx_id,
+            "customer_name": customer_name or "",
+            "created_at": datetime.utcnow().isoformat(),
+            "seen": False,
+        })
+        # 최근 500건만 유지
+        items = items[-500:]
+        path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[WARN] 결제 알림 큐 추가 실패: {e}")
 
 
 def _close_dialog(dialog) -> None:

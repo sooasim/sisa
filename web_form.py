@@ -266,6 +266,15 @@ def init_db() -> None:
                 cur.execute("ALTER TABLE agencies ADD COLUMN kvan_mid VARCHAR(100)")
             except Exception:
                 pass
+            for col, typ in [
+                ("kvan_login_id", "VARCHAR(100)"),
+                ("kvan_login_password", "VARCHAR(255)"),
+                ("kvan_login_pin", "VARCHAR(20)"),
+            ]:
+                try:
+                    cur.execute(f"ALTER TABLE agencies ADD COLUMN {col} {typ}")
+                except Exception:
+                    pass
             try:
                 cur.execute("ALTER TABLE transactions ADD COLUMN kvan_mid VARCHAR(100)")
             except Exception:
@@ -332,6 +341,43 @@ def _create_code_backup() -> None:
 # 락 파일: DATA_DIR/kvan_running.lock (현재 실행 중인 session_id)
 KVAN_QUEUE_PATH = DATA_DIR / "kvan_queue.json"
 KVAN_LOCK_PATH = DATA_DIR / "kvan_running.lock"
+PAYMENT_NOTIFICATIONS_PATH = DATA_DIR / "payment_notifications.json"
+KVAN_CRAWLER_LOCK_PATH = DATA_DIR / "kvan_crawler.lock"
+KVAN_CRAWLER_WAKEUP_PATH = DATA_DIR / "crawler_wakeup.flag"
+
+
+def _load_payment_notifications(agency_id: str | None = None) -> list[dict]:
+    """미확인 결제 알림 목록. agency_id 가 None 이면 전체, 아니면 해당 대행사만."""
+    try:
+        if not PAYMENT_NOTIFICATIONS_PATH.exists():
+            return []
+        items = json.loads(PAYMENT_NOTIFICATIONS_PATH.read_text(encoding="utf-8"))
+        if not isinstance(items, list):
+            return []
+        out = [x for x in items if x.get("seen") is not True]
+        if agency_id is not None and str(agency_id).strip():
+            out = [x for x in out if str(x.get("agency_id") or "").strip() == str(agency_id).strip()]
+        return out[-100:]
+    except Exception:
+        return []
+
+
+def _mark_payment_notifications_seen(agency_id: str | None = None) -> None:
+    """결제 알림을 확인 처리. agency_id None 이면 전체, 아니면 해당 대행사만."""
+    try:
+        if not PAYMENT_NOTIFICATIONS_PATH.exists():
+            return
+        items = json.loads(PAYMENT_NOTIFICATIONS_PATH.read_text(encoding="utf-8"))
+        if not isinstance(items, list):
+            return
+        for x in items:
+            if agency_id is None or str(x.get("agency_id") or "").strip() == str(agency_id).strip():
+                x["seen"] = True
+        PAYMENT_NOTIFICATIONS_PATH.write_text(
+            json.dumps(items[-500:], ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] 결제 알림 확인 처리 실패: {e}")
 
 
 def _kvan_enqueue(session_id: str) -> None:
@@ -388,6 +434,76 @@ def _kvan_is_running() -> bool:
         return False
 
 
+def _crawler_is_running() -> bool:
+    """크롤러 락 파일 PID가 실제로 살아있으면 True."""
+    try:
+        if not KVAN_CRAWLER_LOCK_PATH.exists():
+            return False
+        pid_str = KVAN_CRAWLER_LOCK_PATH.read_text(encoding="utf-8").strip()
+        if not pid_str:
+            return False
+        pid = int(pid_str)
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            KVAN_CRAWLER_LOCK_PATH.unlink(missing_ok=True)
+            return False
+    except Exception:
+        KVAN_CRAWLER_LOCK_PATH.unlink(missing_ok=True)
+        return False
+
+
+def trigger_kvan_crawler_refresh() -> None:
+    """
+    결제링크/거래내역 크롤러를 즉시 깨운다.
+
+    - 이미 크롤러가 실행 중이면 wakeup.flag만 남겨 다음 사이클 즉시 실행
+    - 실행 중이 아니면 크롤러 프로세스를 새로 기동
+    """
+    try:
+        KVAN_CRAWLER_WAKEUP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        KVAN_CRAWLER_WAKEUP_PATH.write_text(datetime.utcnow().isoformat(), encoding="utf-8")
+        _append_hq_log("WEB", f"crawler wakeup 신호 생성: {KVAN_CRAWLER_WAKEUP_PATH}")
+    except Exception as e:  # noqa: BLE001
+        _append_hq_log("WEB", f"[WARN] crawler wakeup 신호 생성 실패: {e}")
+
+    if _crawler_is_running():
+        _append_hq_log("WEB", "crawler 이미 실행 중 - wakeup만 전송")
+        return
+
+    lf = None
+    try:
+        crawler_path = BASE_DIR / "wsisa" / "kvan_crawler.py"
+        if not crawler_path.exists():
+            raise FileNotFoundError(f"kvan_crawler.py not found: {crawler_path}")
+        ADMIN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        lf = open(ADMIN_LOG_PATH, "a", encoding="utf-8")  # noqa: SIM115
+        cmd = [sys.executable, str(crawler_path)]
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        p = subprocess.Popen(
+            cmd,
+            stdout=lf,
+            stderr=lf,
+            env=env,
+            cwd=str(BASE_DIR / "wsisa"),
+        )
+        try:
+            lf.close()
+        except Exception:
+            pass
+        KVAN_CRAWLER_LOCK_PATH.write_text(str(p.pid), encoding="utf-8")
+        _append_hq_log("WEB", f"crawler 시작 pid={p.pid}")
+    except Exception as e:  # noqa: BLE001
+        try:
+            if lf:
+                lf.close()
+        except Exception:
+            pass
+        _append_hq_log("WEB", f"[ERROR] crawler 시작 실패: {e}")
+
+
 def trigger_auto_kvan_async(session_id: str | None = None) -> None:
     """결제 폼에서 주문 저장 후 auto_kvan.py 를 비동기로 실행.
 
@@ -428,19 +544,34 @@ def trigger_auto_kvan_async(session_id: str | None = None) -> None:
         _append_hq_log("WEB", f"[ERROR] auto_kvan runner 실행 실패: {e}")
 
 
-def _save_session_order_json(session_id: str, amount: str, installment: str) -> Path:
+def _save_session_order_json(
+    session_id: str,
+    amount: str,
+    installment: str,
+    agency_id: str | None = None,
+    agency: dict | None = None,
+) -> Path:
     """
     세션 기반 링크 생성용 주문 JSON을 sessions/orders 에 저장한다.
 
-    auto_kvan.py 에서 동일 session_id 파일을 직접 읽을 수 있도록
-    HEADERS 스키마를 채워 파일을 생성한다.
+    agency 가 주어지고 kvan_login_id 가 있으면 해당 대행사 K-VAN 계정을 사용하고,
+    없으면 환경 변수(K_VAN_ID 등)를 사용한다.
     """
     SESSION_ORDER_DIR.mkdir(parents=True, exist_ok=True)
     amount_digits = str(amount or "").replace(",", "").strip()
+    # 대행사별 K-VAN 계정: agency 에 kvan_login_id 가 있으면 사용
+    if agency and (agency.get("kvan_login_id") or "").strip():
+        login_id = str(agency.get("kvan_login_id") or "").strip()
+        login_password = str(agency.get("kvan_login_password") or "").strip()
+        login_pin = str(agency.get("kvan_login_pin") or "").strip()
+    else:
+        login_id = os.environ.get("K_VAN_ID", "m3313")
+        login_password = os.environ.get("K_VAN_PW", "1234")
+        login_pin = os.environ.get("K_VAN_PIN", "2424")
     payload = {
-        "login_id": os.environ.get("K_VAN_ID", "m3313"),
-        "login_password": os.environ.get("K_VAN_PW", "1234"),
-        "login_pin": os.environ.get("K_VAN_PIN", "2424"),
+        "login_id": login_id,
+        "login_password": login_password,
+        "login_pin": login_pin,
         "card_type": "personal",
         "card_number": "",
         "expiry_mm": "",
@@ -1208,7 +1339,12 @@ FORM_TEMPLATE = """
       var modal = document.getElementById("result-modal");
       window.__closeResultModal = function () {
         if (modal) {
-          modal.style.display = "none";
+          // display:none 만 하면 뒤로가기 캐시 복원 시 남아 있을 수 있어 DOM에서 제거한다.
+          if (modal.parentNode) {
+            modal.parentNode.removeChild(modal);
+          } else {
+            modal.style.display = "none";
+          }
         }
       };
       if (modal) {
@@ -1847,6 +1983,26 @@ def debug_paths():
     except Exception as e:  # noqa: BLE001
         db_info["error"] = str(e)
 
+    # K-VAN 큐/락 상태 (실시간 표시)
+    kvan_queue_len = 0
+    kvan_queue_ids: list[str] = []
+    kvan_lock_pid: str | None = None
+    kvan_lock_running = False
+    try:
+        if KVAN_QUEUE_PATH.exists():
+            q = json.loads(KVAN_QUEUE_PATH.read_text(encoding="utf-8"))
+            if isinstance(q, list):
+                kvan_queue_len = len(q)
+                kvan_queue_ids = [str(x) for x in q[:20]]
+    except Exception:
+        pass
+    try:
+        if KVAN_LOCK_PATH.exists():
+            kvan_lock_pid = KVAN_LOCK_PATH.read_text(encoding="utf-8").strip()
+            kvan_lock_running = _kvan_is_running()
+    except Exception:
+        pass
+
     template = """
     <!DOCTYPE html>
     <html lang="ko">
@@ -1892,6 +2048,14 @@ def debug_paths():
           <div class="text-xs font-mono break-all">SISA_DATA_DIR={{ env_sisa_data_dir or '(비어있음)' }}</div>
           <div class="text-xs font-mono break-all mt-1">WEB DATA_DIR={{ web_data_dir }}</div>
           <div class="text-xs font-mono break-all mt-1">AUTO 예상 DATA_DIR={{ auto_data_dir }}</div>
+        </section>
+
+        <section class="rounded border border-slate-700 p-3 bg-slate-900/60">
+          <h2 class="text-sm font-semibold mb-2">K-VAN 큐·락 상태</h2>
+          <div class="text-xs space-y-1">
+            <div>큐 대기: <span class="font-mono font-semibold">{{ kvan_queue_len }}</span>건 {% if kvan_queue_ids %}(세션 ID: {{ kvan_queue_ids|join(', ') }}{% if kvan_queue_len > 20 %} …{% endif %}){% endif %}</div>
+            <div>락: {% if kvan_lock_pid %}<span class="font-mono">{{ kvan_lock_pid }}</span> (PID) — {% if kvan_lock_running %}<span class="text-amber-300">실행 중</span>{% else %}<span class="text-slate-400">프로세스 종료됨</span>{% endif %}{% else %}<span class="text-slate-400">대기 중</span>{% endif %}</div>
+          </div>
         </section>
 
         <section class="rounded border border-slate-700 p-3 bg-slate-900/60">
@@ -1991,6 +2155,10 @@ def debug_paths():
         path_checks=path_checks,
         recent_sessions=recent_sessions,
         db_info=db_info,
+        kvan_queue_len=kvan_queue_len,
+        kvan_queue_ids=kvan_queue_ids,
+        kvan_lock_pid=kvan_lock_pid,
+        kvan_lock_running=kvan_lock_running,
     )
 
 
@@ -2102,8 +2270,10 @@ def _save_hq_state(state: dict) -> None:
                     """
                     INSERT INTO agencies
                     (id, company_name, domain, phone, bank_name, account_number,
-                     email_or_sheet, login_id, login_password, fee_percent, created_at, status)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     email_or_sheet, login_id, login_password, fee_percent,
+                     kvan_mid, kvan_login_id, kvan_login_password, kvan_login_pin,
+                     created_at, status)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """,
                     (
                         ag.get("id"),
@@ -2116,6 +2286,10 @@ def _save_hq_state(state: dict) -> None:
                         ag.get("login_id"),
                         ag.get("login_password"),
                         ag.get("fee_percent", 10),
+                        ag.get("kvan_mid"),
+                        ag.get("kvan_login_id"),
+                        ag.get("kvan_login_password"),
+                        ag.get("kvan_login_pin"),
                         ag.get("created_at"),
                         ag.get("status"),
                     ),
@@ -2127,8 +2301,9 @@ def _save_hq_state(state: dict) -> None:
                     """
                     INSERT INTO transactions
                     (id, created_at, agency_id, amount, customer_name, phone_number,
-                     card_type, resident_front, status, message, settlement_status, settled_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     card_type, resident_front, status, message, settlement_status, settled_at,
+                     kvan_mid, kvan_approval_no, kvan_tx_type, kvan_registered_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """,
                     (
                         t.get("id"),
@@ -2143,6 +2318,10 @@ def _save_hq_state(state: dict) -> None:
                         t.get("message"),
                         t.get("settlement_status"),
                         t.get("settled_at"),
+                        t.get("kvan_mid"),
+                        t.get("kvan_approval_no"),
+                        t.get("kvan_tx_type"),
+                        t.get("kvan_registered_at"),
                     ),
                 )
         conn.commit()
@@ -2474,6 +2653,12 @@ def admin():
                 except Exception as e:  # noqa: BLE001
                     message = f"재요청 중 오류: {e}"
             return redirect(url_for("admin"))
+        elif action == "refresh_kvan":
+            try:
+                trigger_kvan_crawler_refresh()
+                message = "K-VAN 크롤러 새로고침 신호를 보냈습니다. 잠시 후 최신 상태가 반영됩니다."
+            except Exception as e:  # noqa: BLE001
+                message = f"K-VAN 새로고침 중 오류: {e}"
 
         elif action == "close_session":
             sid = request.form.get("session_id", "").strip()
@@ -2610,6 +2795,11 @@ def admin():
         .pill-danger { background:#b91c1c; color:#fef2f2; }
         .pill-muted { background:#111827; color:#e5e7eb; border:1px solid #4b5563; }
         .small-input { width:100%; padding:6px 8px; border-radius:8px; border:1px solid #374151; background:#020617; color:#e5e7eb; font-size:12px; box-sizing:border-box; }
+        .loading-backdrop { position:fixed; inset:0; background:rgba(2,6,23,0.78); display:none; align-items:center; justify-content:center; z-index:2000; }
+        .loading-backdrop.show { display:flex; }
+        .loading-card { background:#0f172a; border:1px solid #334155; border-radius:14px; padding:16px 18px; color:#e2e8f0; min-width:240px; text-align:center; box-shadow:0 18px 44px rgba(2,6,23,0.65); }
+        .loading-spinner { width:28px; height:28px; border:3px solid #475569; border-top-color:#60a5fa; border-radius:50%; margin:0 auto 10px; animation:spin1 0.8s linear infinite; }
+        @keyframes spin1 { to { transform: rotate(360deg); } }
       </style>
       <script>
         // /admin 페이지에서: 결제중인데 아직 K-VAN 링크가 없는 세션이 있으면
@@ -2647,6 +2837,13 @@ def admin():
         </div>
       </header>
 
+      <div id="link-loading-overlay" class="loading-backdrop" aria-hidden="true">
+        <div class="loading-card">
+          <div class="loading-spinner"></div>
+          <div id="link-loading-text" style="font-size:13px;font-weight:600;">링크 생성중입니다...</div>
+          <div style="margin-top:4px;font-size:11px;color:#94a3b8;">잠시만 기다려 주세요.</div>
+        </div>
+      </div>
       <main class="flex-grow pt-24 pb-12 px-3 sm:px-4">
         <div class="max-w-4xl mx-auto">
           <div class="glass-card rounded-[2rem] border border-white/20 shadow-2xl">
@@ -2660,7 +2857,7 @@ def admin():
                 </div>
               </div>
 
-              <form method="post" action="{{ url_for('admin') }}">
+              <form method="post" action="{{ url_for('admin') }}" data-loading-msg="링크 생성중입니다...">
                 <div class="grid">
                   <div>
                     <label for="admin_amount">결제 금액 (원 단위)</label>
@@ -2688,6 +2885,12 @@ def admin():
                 <div class="status-title">
                   <i class="fa-solid fa-circle-play text-emerald-400 text-xs"></i>
                   진행 중인 결제 세션 (최대 5개)
+                  <form method="post" action="{{ url_for('admin') }}" style="margin-left:auto;" data-loading-msg="크롤러를 새로고침하는 중입니다...">
+                    <input type="hidden" name="action" value="refresh_kvan" />
+                    <button type="submit" class="pill-btn pill-muted" style="font-size:11px; padding:4px 10px;">
+                      새로고침
+                    </button>
+                  </form>
                 </div>
                 {% if sessions %}
                   {% for s in sessions %}
@@ -2723,7 +2926,7 @@ def admin():
                           {% if s.error_reason %}
                           <div style="color:#fecaca;font-size:10px;margin-top:2px;">{{ s.error_reason }}</div>
                           {% endif %}
-                          <form method="post" action="{{ url_for('admin') }}" style="margin-top:6px;">
+                          <form method="post" action="{{ url_for('admin') }}" style="margin-top:6px;" data-loading-msg="링크 재생성 요청중입니다...">
                             <input type="hidden" name="action" value="retry_kvan" />
                             <input type="hidden" name="session_id" value="{{ s.id }}" />
                             <button type="submit" style="background:#dc2626;color:white;border:none;border-radius:6px;padding:4px 12px;font-size:11px;cursor:pointer;">
@@ -2894,6 +3097,22 @@ def admin():
       </main>
 
       <script>
+        function showLinkLoading(msg) {
+          var overlay = document.getElementById("link-loading-overlay");
+          var textEl = document.getElementById("link-loading-text");
+          if (!overlay) return;
+          if (textEl && msg) textEl.textContent = msg;
+          overlay.classList.add("show");
+        }
+        (function () {
+          var forms = document.querySelectorAll("form[data-loading-msg]");
+          forms.forEach(function (f) {
+            f.addEventListener("submit", function () {
+              var msg = f.getAttribute("data-loading-msg") || "처리중입니다...";
+              showLinkLoading(msg);
+            });
+          });
+        })();
         function copyPayLink(id) {
           var el = document.getElementById(id);
           if (!el) return;
@@ -2930,7 +3149,7 @@ def admin():
           } else {
             navigator.clipboard.writeText(text).catch(function () {});
           }
-          alert("결제 실폐/완료 정보가 복사되었습니다.");
+          alert("결제 실패/완료 정보가 복사되었습니다.");
         }
       </script>
     </body>
@@ -3129,44 +3348,58 @@ def hq_admin():
                     found = a
                     break
             if found:
-                # 승인된 신청서는 목록에서 제거
-                applications = [a for a in applications if str(a.get("id")) != app_id]
                 agency_id = datetime.utcnow().strftime("AGY%Y%m%d%H%M%S%f")
-                agency = {
-                    "id": agency_id,
-                    "company_name": found.get("company_name", ""),
-                    "domain": found.get("domain", ""),
-                    "phone": found.get("phone", ""),
-                    "bank_name": found.get("bank_name", ""),
-                    "account_number": found.get("account_number", ""),
-                    "email_or_sheet": found.get("email_or_sheet", ""),
-                    "login_id": found.get("login_id", ""),
-                    "login_password": found.get("login_password", ""),
-                    "fee_percent": found.get("fee_percent", 10),
-                    "created_at": datetime.utcnow().isoformat(),
-                    "status": "active",
-                }
-                agencies.append(agency)
-                state["applications"] = applications
-                state["agencies"] = agencies
-                _save_hq_state(state)
-                message = f"대행사 '{agency['company_name']}' 가 생성되었습니다."
+                try:
+                    conn = get_db()
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO agencies
+                            (id, company_name, domain, phone, bank_name, account_number,
+                             email_or_sheet, login_id, login_password, fee_percent, created_at, status)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            """,
+                            (
+                                agency_id,
+                                found.get("company_name", ""),
+                                found.get("domain", ""),
+                                found.get("phone", ""),
+                                found.get("bank_name", ""),
+                                found.get("account_number", ""),
+                                found.get("email_or_sheet", ""),
+                                found.get("login_id", ""),
+                                found.get("login_password", ""),
+                                found.get("fee_percent", 10),
+                                datetime.utcnow().isoformat(),
+                                "active",
+                            ),
+                        )
+                        cur.execute("DELETE FROM applications WHERE id = %s", (app_id,))
+                    conn.commit()
+                    conn.close()
+                    message = f"대행사 '{found.get('company_name', '')}' 가 생성되었습니다."
+                except Exception as e:  # noqa: BLE001
+                    message = f"대행사 승인 처리 중 오류: {e}"
         elif action == "refresh_kvan":
             # 수동으로 K-VAN 크롤링 매크로를 한 번 더 실행
             try:
-                trigger_auto_kvan_async(session_id=None)
-                message = "K-VAN 크롤링이 백그라운드에서 다시 실행되었습니다. 잠시 후 새로고침하면 최신 결제/정산 데이터가 반영됩니다."
+                trigger_kvan_crawler_refresh()
+                message = "K-VAN 크롤러 새로고침 신호를 보냈습니다. 로그 박스에서 상세 진행 상태를 확인해 주세요."
             except Exception as e:  # noqa: BLE001
                 print(f"[WARN] HQ에서 refresh_kvan 실행 중 오류: {e}")
                 message = "K-VAN 크롤링 재실행 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
         elif action == "delete_application":
             app_id = request.form.get("application_id", "").strip()
             if app_id:
-                # 해당 신청서를 목록에서 제거하고 DB 에 반영
-                applications = [a for a in applications if str(a.get("id")) != app_id]
-                state["applications"] = applications
-                _save_hq_state(state)
-                message = "선택한 대행사 신청이 삭제되었습니다."
+                try:
+                    conn = get_db()
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM applications WHERE id = %s", (app_id,))
+                    conn.commit()
+                    conn.close()
+                    message = "선택한 대행사 신청이 삭제되었습니다."
+                except Exception as e:  # noqa: BLE001
+                    message = f"대행사 신청 삭제 중 오류: {e}"
         elif action == "update_fee":
             agency_id = request.form.get("agency_id", "").strip()
             try:
@@ -3174,13 +3407,18 @@ def hq_admin():
             except ValueError:
                 fee_percent = None
             if agency_id and fee_percent is not None:
-                for ag in agencies:
-                    if str(ag.get("id")) == agency_id:
-                        ag["fee_percent"] = fee_percent
-                        break
-                state["agencies"] = agencies
-                _save_hq_state(state)
-                message = "수수료 설정이 저장되었습니다."
+                try:
+                    conn = get_db()
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE agencies SET fee_percent = %s WHERE id = %s",
+                            (fee_percent, agency_id),
+                        )
+                    conn.commit()
+                    conn.close()
+                    message = "수수료 설정이 저장되었습니다."
+                except Exception as e:  # noqa: BLE001
+                    message = f"수수료 설정 저장 중 오류: {e}"
         elif action == "update_application_fee":
             app_id = request.form.get("application_id", "").strip()
             try:
@@ -3188,77 +3426,151 @@ def hq_admin():
             except ValueError:
                 fee_percent = None
             if app_id and fee_percent is not None:
-                for a in applications:
-                    if str(a.get("id")) == app_id:
-                        a["fee_percent"] = fee_percent
-                        break
-                state["applications"] = applications
-                _save_hq_state(state)
-                message = "대행사 신청 수수료가 저장되었습니다."
+                try:
+                    conn = get_db()
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE applications SET fee_percent = %s WHERE id = %s",
+                            (fee_percent, app_id),
+                        )
+                    conn.commit()
+                    conn.close()
+                    message = "대행사 신청 수수료가 저장되었습니다."
+                except Exception as e:  # noqa: BLE001
+                    message = f"신청 수수료 저장 중 오류: {e}"
         elif action == "bulk_settle":
             tx_ids = request.form.getlist("tx_ids")
             if tx_ids:
-                for t in transactions:
-                    if str(t.get("id")) in tx_ids:
-                        t["settlement_status"] = "정산완료"
-                        t["settled_at"] = datetime.utcnow().isoformat()
-                state["transactions"] = transactions
-                _save_hq_state(state)
-                message = f"{len(tx_ids)}건을 정산완료로 표시했습니다."
+                tx_id_set = {str(x).strip() for x in tx_ids if str(x).strip()}
+                if tx_id_set:
+                    try:
+                        conn = get_db()
+                        with conn.cursor() as cur:
+                            placeholders = ",".join(["%s"] * len(tx_id_set))
+                            cur.execute(
+                                f"""
+                                UPDATE transactions
+                                SET settlement_status = '정산완료', settled_at = NOW()
+                                WHERE id IN ({placeholders})
+                                """,
+                                tuple(tx_id_set),
+                            )
+                        conn.commit()
+                        conn.close()
+                        message = f"{len(tx_id_set)}건을 정산완료로 표시했습니다."
+                    except Exception as e:  # noqa: BLE001
+                        message = f"일괄 정산 처리 중 오류: {e}"
         elif action == "update_agency":
             agency_id = request.form.get("agency_id", "").strip()
             do = request.form.get("do", "save").strip()
             if agency_id:
-                # 정보 수정
                 phone = (request.form.get("phone") or "").strip()
                 bank_name = (request.form.get("bank_name") or "").strip()
                 account_number = (request.form.get("account_number") or "").strip()
                 email_or_sheet = (request.form.get("email_or_sheet") or "").strip()
                 login_id_val = (request.form.get("login_id") or "").strip()
                 login_pw_val = (request.form.get("login_password") or "").strip()
+                kvan_mid_val = (request.form.get("kvan_mid") or "").strip()
+                kvan_login_id_val = (request.form.get("kvan_login_id") or "").strip()
+                kvan_login_pw_val = (request.form.get("kvan_login_password") or "").strip()
+                kvan_login_pin_val = (request.form.get("kvan_login_pin") or "").strip()
                 status_val = (request.form.get("status") or "").strip() or "active"
                 try:
                     fee_percent = int((request.form.get("fee_percent") or "").strip())
                 except ValueError:
                     fee_percent = None
-                for ag in agencies:
-                    if str(ag.get("id")) == agency_id:
+                try:
+                    conn = get_db()
+                    with conn.cursor() as cur:
+                        updates: list[str] = ["status = %s"]
+                        params: list = [status_val]
                         if phone:
-                            ag["phone"] = phone
+                            updates.append("phone = %s")
+                            params.append(phone)
                         if bank_name:
-                            ag["bank_name"] = bank_name
+                            updates.append("bank_name = %s")
+                            params.append(bank_name)
                         if account_number:
-                            ag["account_number"] = account_number
+                            updates.append("account_number = %s")
+                            params.append(account_number)
                         if email_or_sheet:
-                            ag["email_or_sheet"] = email_or_sheet
+                            updates.append("email_or_sheet = %s")
+                            params.append(email_or_sheet)
                         if login_id_val:
-                            ag["login_id"] = login_id_val
+                            updates.append("login_id = %s")
+                            params.append(login_id_val)
                         if login_pw_val:
-                            ag["login_password"] = login_pw_val
+                            updates.append("login_password = %s")
+                            params.append(login_pw_val)
+                        if kvan_mid_val:
+                            updates.append("kvan_mid = %s")
+                            params.append(kvan_mid_val)
+                        if kvan_login_id_val:
+                            updates.append("kvan_login_id = %s")
+                            params.append(kvan_login_id_val)
+                        if kvan_login_pw_val:
+                            updates.append("kvan_login_password = %s")
+                            params.append(kvan_login_pw_val)
+                        if kvan_login_pin_val:
+                            updates.append("kvan_login_pin = %s")
+                            params.append(kvan_login_pin_val)
                         if fee_percent is not None:
-                            ag["fee_percent"] = fee_percent
-                        ag["status"] = status_val
-                        break
-                state["agencies"] = agencies
-                # 개별 대행사 미정산 건 정산완료 처리
-                if do == "settle":
-                    for t in transactions:
-                        if str(t.get("agency_id")) == agency_id and t.get("status") == "success":
-                            if t.get("settlement_status") != "정산완료":
-                                t["settlement_status"] = "정산완료"
-                                t["settled_at"] = datetime.utcnow().isoformat()
-                    state["transactions"] = transactions
-                    message = "선택한 대행사의 미정산 거래를 정산완료로 표시했습니다."
-                else:
-                    message = "대행사 정보가 저장되었습니다."
-                _save_hq_state(state)
+                            updates.append("fee_percent = %s")
+                            params.append(fee_percent)
+                        params.append(agency_id)
+                        cur.execute(
+                            f"UPDATE agencies SET {', '.join(updates)} WHERE id = %s",
+                            tuple(params),
+                        )
+                        if do == "settle":
+                            cur.execute(
+                                """
+                                UPDATE transactions
+                                SET settlement_status = '정산완료', settled_at = NOW()
+                                WHERE agency_id = %s
+                                  AND status = 'success'
+                                  AND (settlement_status IS NULL OR settlement_status != '정산완료')
+                                """,
+                                (agency_id,),
+                            )
+                    conn.commit()
+                    conn.close()
+                    if do == "settle":
+                        message = "선택한 대행사의 미정산 거래를 정산완료로 표시했습니다."
+                    else:
+                        message = "대행사 정보가 저장되었습니다."
+                except Exception as e:  # noqa: BLE001
+                    message = f"대행사 정보 저장 중 오류: {e}"
         elif action == "delete_tx":
             tx_id = request.form.get("tx_id", "").strip()
             if tx_id:
-                transactions = [t for t in transactions if str(t.get("id")) != tx_id]
-                state["transactions"] = transactions
-                _save_hq_state(state)
-                message = "선택한 거래 내역이 삭제되었습니다."
+                try:
+                    conn = get_db()
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM transactions WHERE id = %s", (tx_id,))
+                    conn.commit()
+                    conn.close()
+                    message = "선택한 거래 내역이 삭제되었습니다."
+                except Exception as e:  # noqa: BLE001
+                    message = f"거래 내역 삭제 중 오류: {e}"
+        elif action == "bulk_delete_tx":
+            tx_ids = request.form.getlist("tx_ids")
+            if tx_ids:
+                tx_id_set = {str(x).strip() for x in tx_ids if str(x).strip()}
+                if tx_id_set:
+                    try:
+                        conn = get_db()
+                        with conn.cursor() as cur:
+                            placeholders = ",".join(["%s"] * len(tx_id_set))
+                            cur.execute(
+                                f"DELETE FROM transactions WHERE id IN ({placeholders})",
+                                tuple(tx_id_set),
+                            )
+                        conn.commit()
+                        conn.close()
+                        message = f"{len(tx_id_set)}건의 거래 내역을 삭제했습니다."
+                    except Exception as e:  # noqa: BLE001
+                        message = f"거래 내역 일괄 삭제 중 오류: {e}"
         elif action == "clear_logs":
             # HQ 어드민에서 버튼으로 로그 파일을 비울 수 있게 한다.
             try:
@@ -3269,6 +3581,18 @@ def hq_admin():
             except Exception as e:  # noqa: BLE001
                 print(f"[WARN] HQ 로그 파일 삭제 실패: {e}")
                 message = "로그 파일 삭제 중 오류가 발생했습니다."
+        elif action == "mark_payment_notifications_seen":
+            _mark_payment_notifications_seen(agency_id=None)
+            message = "결제 완료 알림을 모두 확인 처리했습니다."
+
+    # POST 처리 후 화면은 항상 DB 기준 최신 상태를 다시 로드한다.
+    state = _load_hq_state()
+    applications = state.get("applications") or []
+    agencies = state.get("agencies") or []
+    transactions = state.get("transactions") or []
+
+    # 미확인 결제 알림 건수 (본사는 전체)
+    payment_notifications_count = len(_load_payment_notifications(agency_id=None))
 
     # 대행사 관리 페이징 (20개씩)
     try:
@@ -3324,19 +3648,40 @@ def hq_admin():
         setInterval(function () {
           location.reload();
         }, 300000);
-        // 혹시 이전 결제 페이지에서 남은 결과 모달이 DOM에 섞여 있으면 강제로 숨긴다.
-        window.addEventListener('load', function () {
-          var modal = document.getElementById('result-modal');
-          if (modal) {
-            modal.style.display = 'none';
-          }
-        });
+        // 혹시 이전 페이지에서 남은 오버레이가 DOM에 섞여 있으면 강제로 숨긴다.
+        function hideStaleOverlays() {
+          var sels = [
+            '#result-modal',
+            '.result-backdrop',
+            "[data-slot='dialog-overlay']",
+            '.dialog-overlay',
+            '.modal-backdrop'
+          ];
+          sels.forEach(function (sel) {
+            document.querySelectorAll(sel).forEach(function (el) {
+              el.style.setProperty('display', 'none', 'important');
+              el.style.setProperty('pointer-events', 'none', 'important');
+            });
+          });
+        }
+        function runOverlayCleanupBurst() {
+          hideStaleOverlays();
+          setTimeout(hideStaleOverlays, 300);
+          setTimeout(hideStaleOverlays, 1200);
+        }
+        window.addEventListener('load', runOverlayCleanupBurst);
+        // Safari/Chrome의 뒤로가기 캐시(bfcache) 복원 시 load가 실행되지 않을 수 있다.
+        window.addEventListener('pageshow', runOverlayCleanupBurst);
       </script>
       <style>
         /* 결제 폼에서 사용하던 결과 모달 오버레이가 남아 있어도 HQ 어드민에서는 항상 숨긴다. */
         #result-modal,
-        .result-backdrop {
+        .result-backdrop,
+        [data-slot='dialog-overlay'],
+        .dialog-overlay,
+        .modal-backdrop {
           display: none !important;
+          pointer-events: none !important;
         }
       </style>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -3519,6 +3864,17 @@ def hq_admin():
 
           <!-- 2. 전체 거래 내역 리스트 -->
           <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
+            {% if payment_notifications_count and payment_notifications_count > 0 %}
+            <div class="mb-3 p-3 rounded-lg bg-amber-500/20 border border-amber-400/40 flex items-center justify-between gap-2 flex-wrap">
+              <span class="text-amber-200 text-sm">
+                <i class="fa-solid fa-bell mr-1"></i> 미확인 결제 완료 알림 {{ payment_notifications_count }}건
+              </span>
+              <form method="post" action="{{ url_for('hq_admin') }}">
+                <input type="hidden" name="action" value="mark_payment_notifications_seen" />
+                <button type="submit" class="px-2 py-1 rounded bg-amber-600/80 text-white text-xs hover:bg-amber-600">확인</button>
+              </form>
+            </div>
+            {% endif %}
             <div class="flex flex-col md:flex-row items-start md:items-center justify-between mb-3 gap-2">
               <div>
                 <h2 class="text-lg font-semibold flex items-center gap-2">
@@ -3566,8 +3922,7 @@ def hq_admin():
               </div>
             </div>
             {% if transactions %}
-            <form method="post" action="{{ url_for('hq_admin') }}" class="space-y-3">
-              <input type="hidden" name="action" value="bulk_settle">
+            <form method="post" action="{{ url_for('hq_admin') }}" class="space-y-3" onsubmit="return confirm('선택한 거래 내역 처리(삭제/정산완료)를 진행할까요?');">
               <div class="overflow-x-auto">
                 <table class="min-w-full text-xs border-separate border-spacing-y-2">
                   <thead class="text-white/70">
@@ -3674,7 +4029,12 @@ def hq_admin():
                 </div>
                 <div class="flex items-center gap-2">
                   <span>선택 건을</span>
-                  <button type="submit" class="px-3 py-1 rounded-full bg-brand-accent text-brand-blue font-semibold hover:bg-white transition">
+                  <button type="submit" name="action" value="bulk_delete_tx"
+                          class="px-3 py-1 rounded-full bg-red-500/40 text-red-100 font-semibold hover:bg-red-500/60 transition">
+                    삭제
+                  </button>
+                  <button type="submit" name="action" value="bulk_settle"
+                          class="px-3 py-1 rounded-full bg-brand-accent text-brand-blue font-semibold hover:bg-white transition">
                     정산완료 처리
                   </button>
                 </div>
@@ -3827,6 +4187,14 @@ def hq_admin():
                               <input type="text" name="login_id" value="{{ ag.login_id }}" placeholder="로그인 아이디"
                                      class="bg-black/40 border border-white/20 rounded px-2 py-0.5 text-[11px]">
                               <input type="text" name="login_password" value="{{ ag.login_password }}" placeholder="로그인 비밀번호"
+                                     class="bg-black/40 border border-white/20 rounded px-2 py-0.5 text-[11px]">
+                              <input type="text" name="kvan_mid" value="{{ ag.kvan_mid or '' }}" placeholder="K-VAN MID"
+                                     class="bg-black/40 border border-white/20 rounded px-2 py-0.5 text-[11px]">
+                              <input type="text" name="kvan_login_id" value="{{ ag.kvan_login_id or '' }}" placeholder="K-VAN 아이디"
+                                     class="bg-black/40 border border-white/20 rounded px-2 py-0.5 text-[11px]">
+                              <input type="text" name="kvan_login_password" value="{{ ag.kvan_login_password or '' }}" placeholder="K-VAN 비밀번호"
+                                     class="bg-black/40 border border-white/20 rounded px-2 py-0.5 text-[11px]">
+                              <input type="text" name="kvan_login_pin" value="{{ ag.kvan_login_pin or '' }}" placeholder="K-VAN PIN"
                                      class="bg-black/40 border border-white/20 rounded px-2 py-0.5 text-[11px]">
                               <input type="text" name="phone" value="{{ ag.phone }}" placeholder="전화번호"
                                      class="bg-black/40 border border-white/20 rounded px-2 py-0.5 text-[11px]">
@@ -4064,6 +4432,7 @@ def hq_admin():
         history_warnings=history_warnings,
         admin_logs=admin_logs,
         admin_log_path=str(ADMIN_LOG_PATH),
+        payment_notifications_count=payment_notifications_count,
     )
 
 
@@ -4135,7 +4504,7 @@ def agency_admin():
         order_file = SESSION_ORDER_DIR / f"{sid}.json"
         if not order_file.exists():
             try:
-                _save_session_order_json(sid, str(s.get("amount") or ""), str(s.get("installment") or "일시불"))
+                _save_session_order_json(sid, str(s.get("amount") or ""), str(s.get("installment") or "일시불"), agency_id=session.get("agency_id"), agency=agency)
                 _append_hq_log("WEB", f"[AUTO-HEAL] 대행사 누락 주문 JSON 재생성 session_id={sid}")
                 trigger_auto_kvan_async(session_id=sid)
             except Exception as _e:
@@ -4190,7 +4559,7 @@ def agency_admin():
                         message = f"세션 생성 중 오류가 발생했습니다: {e}"
                     else:
                         try:
-                            order_json = _save_session_order_json(session_id, amount, installment)
+                            order_json = _save_session_order_json(session_id, amount, installment, agency_id=session.get("agency_id"), agency=agency)
                             _append_hq_log("WEB", f"세션 주문 JSON 저장 session_id={session_id}, path={order_json}")
                         except Exception as e_order:  # noqa: BLE001
                             _append_hq_log("WEB", f"[WARN] 세션 주문 JSON 저장 실패 session_id={session_id}: {e_order}")
@@ -4233,7 +4602,7 @@ def agency_admin():
                 try:
                     for s in sessions:
                         if str(s.get("id")) == sid:
-                            _save_session_order_json(sid, str(s.get("amount") or ""), str(s.get("installment") or "일시불"))
+                            _save_session_order_json(sid, str(s.get("amount") or ""), str(s.get("installment") or "일시불"), agency_id=session.get("agency_id"), agency=agency)
                             break
                     trigger_auto_kvan_async(session_id=sid)
                     _append_hq_log("WEB", f"agency retry_kvan 재요청 session_id={sid}")
@@ -4244,8 +4613,8 @@ def agency_admin():
         elif action == "refresh_kvan":
             # 대행사 어드민에서 수동으로 K-VAN 크롤링 매크로를 한 번 더 실행
             try:
-                trigger_auto_kvan_async(session_id=None)
-                message = "K-VAN 크롤링이 백그라운드에서 다시 실행되었습니다. 잠시 후 새로고침하면 최신 결제/정산 데이터가 반영됩니다."
+                trigger_kvan_crawler_refresh()
+                message = "K-VAN 크롤러 새로고침 신호를 보냈습니다. 잠시 후 최신 데이터가 반영됩니다."
             except Exception as e:  # noqa: BLE001
                 print(f"[WARN] Agency에서 refresh_kvan 실행 중 오류: {e}")
                 message = "K-VAN 크롤링 재실행 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
@@ -4266,6 +4635,32 @@ def agency_admin():
                         pass
                 sessions = [s for s in sessions if str(s.get("id")) != sid]
             return redirect(url_for("agency_admin"))
+        elif action == "bulk_delete_agency_tx":
+            tx_ids = request.form.getlist("tx_ids")
+            tx_id_set = {str(x).strip() for x in tx_ids if str(x).strip()}
+            if tx_id_set:
+                try:
+                    conn = get_db()
+                    with conn.cursor() as cur:
+                        placeholders = ",".join(["%s"] * len(tx_id_set))
+                        cur.execute(
+                            f"DELETE FROM transactions WHERE agency_id = %s AND id IN ({placeholders})",
+                            (agency_id, *list(tx_id_set)),
+                        )
+                    conn.commit()
+                    conn.close()
+                    message = f"{len(tx_id_set)}건의 거래 내역을 삭제했습니다."
+                except Exception as e:  # noqa: BLE001
+                    message = f"거래 내역 삭제 중 오류: {e}"
+            return redirect(url_for("agency_admin"))
+        elif action == "mark_payment_notifications_seen":
+            _mark_payment_notifications_seen(agency_id=session.get("agency_id"))
+            message = "결제 완료 알림을 확인 처리했습니다."
+            return redirect(url_for("agency_admin"))
+
+    # 미확인 결제 알림 건수 (현재 로그인한 대행사만)
+    _agency_id = session.get("agency_id")
+    payment_notifications_count = len(_load_payment_notifications(agency_id=_agency_id))
 
     template = """
     <!DOCTYPE html>
@@ -4289,13 +4684,30 @@ def agency_admin():
             location.reload();
           }, 7000);
         }
-        // 결제 페이지의 결과 모달이 남아 있는 경우를 대비해, 어드민 진입 시에는 강제로 숨긴다.
-        window.addEventListener('load', function () {
-          var modal = document.getElementById('result-modal');
-          if (modal) {
-            modal.style.display = 'none';
-          }
-        });
+        // 결제 페이지의 결과 모달/오버레이가 남아 있는 경우를 대비해 강제로 숨긴다.
+        function hideStaleOverlays() {
+          var sels = [
+            '#result-modal',
+            '.result-backdrop',
+            "[data-slot='dialog-overlay']",
+            '.dialog-overlay',
+            '.modal-backdrop'
+          ];
+          sels.forEach(function (sel) {
+            document.querySelectorAll(sel).forEach(function (el) {
+              el.style.setProperty('display', 'none', 'important');
+              el.style.setProperty('pointer-events', 'none', 'important');
+            });
+          });
+        }
+        function runOverlayCleanupBurst() {
+          hideStaleOverlays();
+          setTimeout(hideStaleOverlays, 300);
+          setTimeout(hideStaleOverlays, 1200);
+        }
+        window.addEventListener('load', runOverlayCleanupBurst);
+        // 뒤로가기 캐시 복원 시에도 검은 오버레이를 즉시 정리한다.
+        window.addEventListener('pageshow', runOverlayCleanupBurst);
       </script>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
       <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
@@ -4315,14 +4727,30 @@ def agency_admin():
       <style>
         body { background-color: #2f4b9f; }
         .glass-card { background: rgba(30, 50, 107, 0.6); backdrop-filter: blur(12px); }
+        .loading-backdrop { position:fixed; inset:0; background:rgba(2,6,23,0.78); display:none; align-items:center; justify-content:center; z-index:2000; }
+        .loading-backdrop.show { display:flex; }
+        .loading-card { background:#0f172a; border:1px solid #334155; border-radius:14px; padding:16px 18px; color:#e2e8f0; min-width:240px; text-align:center; box-shadow:0 18px 44px rgba(2,6,23,0.65); }
+        .loading-spinner { width:28px; height:28px; border:3px solid #475569; border-top-color:#60a5fa; border-radius:50%; margin:0 auto 10px; animation:spin2 0.8s linear infinite; }
+        @keyframes spin2 { to { transform: rotate(360deg); } }
         /* 결제 폼에서 사용하던 결과 모달 오버레이가 남아 있어도 대행사 어드민에서는 항상 숨긴다. */
         #result-modal,
-        .result-backdrop {
+        .result-backdrop,
+        [data-slot='dialog-overlay'],
+        .dialog-overlay,
+        .modal-backdrop {
           display: none !important;
+          pointer-events: none !important;
         }
       </style>
     </head>
     <body class="bg-brand-blue text-white font-sans overflow-x-hidden antialiased min-h-screen flex flex-col">
+      <div id="link-loading-overlay" class="loading-backdrop" aria-hidden="true">
+        <div class="loading-card">
+          <div class="loading-spinner"></div>
+          <div id="link-loading-text" style="font-size:13px;font-weight:600;">링크 생성중입니다...</div>
+          <div style="margin-top:4px;font-size:11px;color:#94a3b8;">잠시만 기다려 주세요.</div>
+        </div>
+      </div>
       <header class="fixed top-0 left-0 right-0 z-30 bg-brand-dark/80 backdrop-blur border-b border-white/10">
         <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
           <div class="flex items-center gap-2">
@@ -4352,13 +4780,24 @@ def agency_admin():
             {{ message }}
           </div>
           {% endif %}
+          {% if payment_notifications_count and payment_notifications_count > 0 %}
+          <div class="p-3 rounded-lg bg-amber-500/20 border border-amber-400/40 flex items-center justify-between gap-2 flex-wrap">
+            <span class="text-amber-200 text-sm">
+              <i class="fa-solid fa-bell mr-1"></i> 미확인 결제 완료 알림 {{ payment_notifications_count }}건
+            </span>
+            <form method="post" action="{{ url_for('agency_admin') }}" onsubmit="return confirm('선택한 거래 내역을 삭제할까요?');">
+              <input type="hidden" name="action" value="mark_payment_notifications_seen" />
+              <button type="submit" class="px-2 py-1 rounded bg-amber-600/80 text-white text-xs hover:bg-amber-600">확인</button>
+            </form>
+          </div>
+          {% endif %}
 
           <!-- 세션 생성 -->
           <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
             <h2 class="text-lg font-semibold mb-3 flex items-center gap-2">
               <i class="fa-solid fa-link text-brand-accent"></i> 결제 요청 링크 생성
             </h2>
-            <form method="post" class="flex flex-wrap gap-3 items-end text-sm">
+            <form method="post" class="flex flex-wrap gap-3 items-end text-sm" data-loading-msg="링크 생성중입니다...">
               <input type="hidden" name="action" value="create">
               <div>
                 <label class="block text-xs mb-1 text-white/70">결제 금액 (선택)</label>
@@ -4402,7 +4841,7 @@ def agency_admin():
           <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
             <h2 class="text-lg font-semibold mb-3 flex items-center gap-2">
               <i class="fa-solid fa-clock text-brand-accent"></i> 진행 중인 결제 세션
-              <form method="post" action="{{ url_for('agency_admin') }}" class="ml-2">
+              <form method="post" action="{{ url_for('agency_admin') }}" class="ml-2" data-loading-msg="크롤러를 새로고침하는 중입니다...">
                 <input type="hidden" name="action" value="refresh_kvan" />
                 <button type="submit"
                         class="px-3 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25 flex items-center gap-1 text-xs">
@@ -4438,7 +4877,7 @@ def agency_admin():
                     {% if s.error_reason %}
                     <div class="text-red-200 mt-1">{{ s.error_reason[:80] }}</div>
                     {% endif %}
-                    <form method="post" action="{{ url_for('agency_admin') }}" class="mt-2">
+                    <form method="post" action="{{ url_for('agency_admin') }}" class="mt-2" data-loading-msg="링크 재생성 요청중입니다...">
                       <input type="hidden" name="action" value="retry_kvan">
                       <input type="hidden" name="session_id" value="{{ s.id }}">
                       <button type="submit"
@@ -4526,10 +4965,18 @@ def agency_admin():
               </div>
             </div>
             {% if agency_transactions %}
+            <form method="post" action="{{ url_for('agency_admin') }}">
+            <input type="hidden" name="action" value="bulk_delete_agency_tx" />
             <div class="overflow-x-auto">
               <table class="min-w-full text-xs border-separate border-spacing-y-2">
                 <thead class="text-white/70">
                   <tr>
+                    <th class="px-3 py-1 text-center">
+                      <input type="checkbox" id="agency_tx_check_all" onclick="
+                        var cbs = document.querySelectorAll('.agency-tx-check');
+                        cbs.forEach(function(cb){ cb.checked = this.checked; }.bind(this));
+                      ">
+                    </th>
                     <th class="px-3 py-1 text-left">시간</th>
                     <th class="px-3 py-1 text-right">금액</th>
                     <th class="px-3 py-1 text-right">수수료율</th>
@@ -4548,6 +4995,9 @@ def agency_admin():
                   <tr class="bg-black/20 hover:bg-black/30 transition align-top"
                       data-date="{{ t.created_at.strftime('%Y-%m-%d') if t.created_at else '' }}"
                       data-status="{{ t.status or '' }}">
+                    <td class="px-3 py-2 text-center">
+                      <input type="checkbox" class="agency-tx-check" name="tx_ids" value="{{ t.id }}">
+                    </td>
                     <td class="px-3 py-2 whitespace-nowrap">{{ t.created_at }}</td>
                     <td class="px-3 py-2 text-right">{{ amount }} 원</td>
                     <td class="px-3 py-2 text-right">{{ fee }}%</td>
@@ -4574,12 +5024,36 @@ def agency_admin():
                 </tbody>
               </table>
             </div>
+            <div class="mt-3 text-right">
+              <button type="submit" class="px-3 py-1 rounded-full bg-red-500/40 text-red-100 font-semibold hover:bg-red-500/60 transition text-xs">
+                선택 거래 삭제
+              </button>
+            </div>
+            </form>
             {% else %}
               <p class="text-xs text-white/60">아직 이 대행사에 대한 거래 내역이 없습니다.</p>
             {% endif %}
           </section>
         </div>
       </main>
+      <script>
+        function showLinkLoading(msg) {
+          var overlay = document.getElementById("link-loading-overlay");
+          var textEl = document.getElementById("link-loading-text");
+          if (!overlay) return;
+          if (textEl && msg) textEl.textContent = msg;
+          overlay.classList.add("show");
+        }
+        (function () {
+          var forms = document.querySelectorAll("form[data-loading-msg]");
+          forms.forEach(function (f) {
+            f.addEventListener("submit", function () {
+              var msg = f.getAttribute("data-loading-msg") || "처리중입니다...";
+              showLinkLoading(msg);
+            });
+          });
+        })();
+      </script>
     </body>
     </html>
     """
@@ -4591,6 +5065,7 @@ def agency_admin():
         base_url=base_url,
         message=message,
         agency_transactions=agency_transactions,
+        payment_notifications_count=payment_notifications_count,
     )
 
 
