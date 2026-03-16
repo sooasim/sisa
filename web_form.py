@@ -342,7 +342,14 @@ def _create_code_backup() -> None:
 KVAN_QUEUE_PATH = DATA_DIR / "kvan_queue.json"
 KVAN_LOCK_PATH = DATA_DIR / "kvan_running.lock"
 PAYMENT_NOTIFICATIONS_PATH = DATA_DIR / "payment_notifications.json"
+EXPIRED_WITH_TRANSACTIONS_PATH = DATA_DIR / "expired_with_transactions.json"
 KVAN_CRAWLER_LOCK_PATH = DATA_DIR / "kvan_crawler.lock"
+# 거래 내역 엑셀형 리스트용 컬럼 순서 (DB transactions 테이블 전체 양식)
+TX_EXCEL_COLUMNS = [
+    "id", "created_at", "agency_id", "amount", "customer_name", "phone_number",
+    "card_type", "resident_front", "status", "message", "settlement_status", "settled_at",
+    "kvan_mid", "kvan_approval_no", "kvan_tx_type", "kvan_registered_at",
+]
 KVAN_CRAWLER_WAKEUP_PATH = DATA_DIR / "crawler_wakeup.flag"
 KVAN_CRAWLER_HEARTBEAT_PATH = DATA_DIR / "kvan_crawler.heartbeat"
 
@@ -2583,6 +2590,11 @@ def admin():
         except Exception:
             sessions = []
 
+    # 진행 중(결제중만) vs 완료/종료(history + 세션 중 만료·결제완료·실패 등) 구분 표시
+    _status = lambda s: (str(s.get("status") or "결제중").strip())
+    active_sessions = [s for s in sessions if _status(s) == "결제중"]
+    completed_sessions = list(history) + [s for s in sessions if _status(s) != "결제중"]
+
     # 결제중인데 아직 K-VAN 링크가 없는 세션이 있는지 여부 (자동 새로고침/팝업 트리거 용)
     has_pending_link = any(
         (s.get("status", "결제중") == "결제중") and not s.get("kvan_link")
@@ -2862,6 +2874,8 @@ def admin():
         .btn-secondary:hover { background:#111827; }
         .hint { font-size:12px; color:#9ca3af; margin-top:4px; }
         .status-card { margin-top:18px; padding:14px 12px; border-radius:16px; background:#020617; border:1px dashed #374151; font-size:13px; }
+        .box-schema { position:sticky; top:72px; z-index:4; margin:6px 0 10px; padding:6px 8px; border-radius:8px; border:1px solid #334155; background:#0b1220; color:#93c5fd; font-size:10px; line-height:1.35; }
+        .box-schema code { color:#bfdbfe; }
         .table-sticky thead th { position: sticky; top: 0; background: #0b1220; z-index: 3; }
         .status-title { font-size:13px; font-weight:600; color:#9ca3af; margin-bottom:6px; display:flex; align-items:center; gap:6px; }
         .status-row { display:flex; justify-content:space-between; margin-bottom:4px; gap:8px; }
@@ -2956,10 +2970,10 @@ def admin():
     <body class="bg-brand-blue text-white font-sans overflow-x-hidden antialiased flex flex-col min-h-screen">
       <div id="pending-create-banner" class="pending-top-banner" aria-hidden="true">
         <i class="fa-solid fa-spinner fa-spin"></i>
-        <span>K-VAN 링크 생성 중</span>
+        <span>K-VAN 링크 생성 중 (1분정도 소요됩니다.)</span>
       </div>
       <div id="pending-create-popup" class="pending-popup" aria-hidden="true">
-        <div style="font-size:13px;font-weight:700; margin-bottom:6px;">링크 생성중입니다</div>
+        <div style="font-size:13px;font-weight:700; margin-bottom:6px;">링크 생성중입니다 (1분정도 소요됩니다.)</div>
         <div style="font-size:11px; color:#94a3b8; margin-bottom:8px;">생성이 완료되면 자동으로 반영됩니다.</div>
         <div style="display:flex; justify-content:center; gap:6px;">
           <span class="pending-dot"></span><span class="pending-dot"></span><span class="pending-dot"></span>
@@ -2984,7 +2998,7 @@ def admin():
       <div id="link-loading-overlay" class="loading-backdrop" aria-hidden="true">
         <div class="loading-card">
           <div class="loading-spinner"></div>
-          <div id="link-loading-text" style="font-size:13px;font-weight:600;">링크 생성중입니다...</div>
+          <div id="link-loading-text" style="font-size:13px;font-weight:600;">링크 생성중입니다... (1분정도 소요됩니다.)</div>
           <div style="margin-top:4px;font-size:11px;color:#94a3b8;">잠시만 기다려 주세요.</div>
         </div>
       </div>
@@ -3008,7 +3022,7 @@ def admin():
                 </div>
               </div>
 
-              <form method="post" action="{{ url_for('admin') }}" data-loading-msg="링크 생성중입니다...">
+              <form method="post" action="{{ url_for('admin') }}" data-loading-msg="링크 생성중입니다... (1분정도 소요됩니다.)">
                 <div class="grid">
                   <div>
                     <label for="admin_amount">결제 금액 (원 단위)</label>
@@ -3043,8 +3057,9 @@ def admin():
                     </button>
                   </form>
                 </div>
-                {% if sessions %}
-                  {% for s in sessions %}
+                <div class="box-schema"><code>admin_state.sessions</code> (진행 중 = 결제중만 표시)</div>
+                {% if active_sessions %}
+                  {% for s in active_sessions %}
                     <div style="margin:8px 0; padding:10px 11px; border-radius:12px; background:#020617; border:1px solid #111827;">
                       <div class="status-row">
                         <span class="status-label">세션 ID</span>
@@ -3060,7 +3075,9 @@ def admin():
                       </div>
                       <div class="status-row">
                         <span class="status-label">상태</span>
-                        <span class="status-value">{{ s.status or '결제중' }}</span>
+                        <span class="status-value">
+                          <span style="display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600;background:#065f46;color:#a7f3d0;border:1px solid #047857;">결제중</span>
+                        </span>
                       </div>
                       {% if s.status == '만료' %}
                       <div class="status-row">
@@ -3094,7 +3111,7 @@ def admin():
                           </form>
                         </div>
                         {% else %}
-                        <div class="pending-inline">K-VAN 링크를 생성 중입니다. 잠시 후 새로고침 해 주세요.</div>
+                        <div class="pending-inline">K-VAN 링크를 생성 중입니다. 1분정도 소요됩니다. 잠시 후 새로고침 해 주세요.</div>
                         {% endif %}
                       </div>
                       <form method="post" action="{{ url_for('admin') }}" style="margin-top:6px; display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
@@ -3118,8 +3135,9 @@ def admin():
                   <i class="fa-solid fa-clipboard-list text-indigo-300 text-xs"></i>
                   결제관리 (완료/종료된 세션)
                 </div>
-                {% if history %}
-                  {% for h in history %}
+                <div class="box-schema">크롤링 결과에 따라 만료·결제완료·실패 등은 이 섹션으로 표시됩니다.</div>
+                {% if completed_sessions %}
+                  {% for h in completed_sessions %}
                     <div style="margin:8px 0; padding:10px 11px; border-radius:12px; background:#020617; border:1px solid #1f2937;">
                       <div class="status-row">
                         <span class="status-label">세션 ID</span>
@@ -3140,7 +3158,16 @@ def admin():
                       <div class="status-row">
                         <span class="status-label">상태</span>
                         <span class="status-value">
-                          {{ h.status }}
+                          {% set st = (h.status or '') %}
+                          {% if '만료' in st or st == '만료' %}
+                            <span style="display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600;background:#78350f;color:#fde68a;border:1px solid #b45309;">링크만료</span>
+                          {% elif st in ['결제완료','성공','success'] or h.get('has_transaction') %}
+                            <span style="display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600;background:#065f46;color:#a7f3d0;border:1px solid #047857;">결제완료</span>
+                          {% elif st in ['실패','fail','링크생성실패'] %}
+                            <span style="display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600;background:#7f1d1d;color:#fecaca;border:1px solid #b91c1c;">결제 실패</span>
+                          {% else %}
+                            <span style="display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;background:#374151;color:#d1d5db;">{{ h.status or '-' }}</span>
+                          {% endif %}
                           {% if h.deleted_in_kvan %}<span style="color:#fca5a5;"> · 삭제됨</span>{% endif %}
                         </span>
                       </div>
@@ -3184,6 +3211,7 @@ def admin():
                   <i class="fa-solid fa-database text-sky-300 text-xs"></i>
                   K-VAN 링크 DB 요약 (최근 10건)
                 </div>
+                <div class="box-schema"><code>kvan_links</code> 항목: <code>captured_at, title, amount, ttl_label, status, kvan_link, mid, kvan_session_id</code></div>
                 {% if recent_links %}
                   <div style="max-height:200px; overflow-y:auto; font-size:11px; margin-top:4px;">
                     <table class="table-sticky" style="width:100%; border-collapse:collapse;">
@@ -3221,6 +3249,7 @@ def admin():
                   <i class="fa-solid fa-receipt text-emerald-300 text-xs"></i>
                   내부 거래 DB 요약 (최근 10건)
                 </div>
+                <div class="box-schema"><code>transactions</code> 항목: <code>created_at, amount, customer_name, status, settlement_status</code></div>
                 {% if recent_tx %}
                   <div style="max-height:200px; overflow-y:auto; font-size:11px; margin-top:4px;">
                     <table class="table-sticky" style="width:100%; border-collapse:collapse;">
@@ -3322,6 +3351,8 @@ def admin():
         ADMIN_TEMPLATE,
         sessions=sessions,
         history=history,
+        active_sessions=active_sessions,
+        completed_sessions=completed_sessions,
         message=message,
         base_url=base_url,
         recent_links=recent_links,
@@ -3749,6 +3780,19 @@ def hq_admin():
         elif action == "mark_payment_notifications_seen":
             _mark_payment_notifications_seen(agency_id=None)
             message = "결제 완료 알림을 모두 확인 처리했습니다."
+        elif action == "mark_expired_with_transactions_seen":
+            try:
+                if EXPIRED_WITH_TRANSACTIONS_PATH.exists():
+                    items = json.loads(EXPIRED_WITH_TRANSACTIONS_PATH.read_text(encoding="utf-8"))
+                    if isinstance(items, list):
+                        for it in items:
+                            it["seen"] = True
+                        EXPIRED_WITH_TRANSACTIONS_PATH.write_text(
+                            json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8"
+                        )
+                message = "만료+거래있음 목록을 확인 처리했습니다."
+            except Exception as e:
+                message = f"확인 처리 중 오류: {e}"
 
     # POST 처리 후 화면은 항상 DB 기준 최신 상태를 다시 로드한다.
     state = _load_hq_state()
@@ -3758,6 +3802,18 @@ def hq_admin():
 
     # 미확인 결제 알림 건수 (본사는 전체)
     payment_notifications_count = len(_load_payment_notifications(agency_id=None))
+
+    # 만료되었으나 거래 내역이 있는 링크 목록 (크롤러가 저장, 어드민 알림용)
+    expired_with_transactions: list = []
+    try:
+        if EXPIRED_WITH_TRANSACTIONS_PATH.exists():
+            raw = EXPIRED_WITH_TRANSACTIONS_PATH.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            expired_with_transactions = data if isinstance(data, list) else []
+    except Exception:
+        expired_with_transactions = []
+    expired_with_tx_unseen = sum(1 for x in expired_with_transactions if not x.get("seen"))
+    expired_with_transactions_reversed = list(reversed(expired_with_transactions))  # 최신순 표시
 
     # 대행사 관리 페이징 (20개씩)
     try:
@@ -3809,10 +3865,8 @@ def hq_admin():
         }
       </script>
       <script>
-        // 5분마다 자동 새로고침 (본사 어드민)
-        setInterval(function () {
-          location.reload();
-        }, 300000);
+        // 본사 어드민은 자동 새로고침을 사용하지 않는다.
+        // (수동 새로고침 버튼/크롤링 상태 폴링만 사용)
         // 혹시 이전 페이지에서 남은 오버레이가 DOM에 섞여 있으면 강제로 숨긴다.
         function hideStaleOverlays() {
           var sels = [
@@ -3889,6 +3943,8 @@ def hq_admin():
         .loading-spinner { width:28px; height:28px; border:3px solid #475569; border-top-color:#60a5fa; border-radius:50%; margin:0 auto 10px; animation:spinHQ 0.8s linear infinite; }
         @keyframes spinHQ { to { transform: rotate(360deg); } }
         .overflow-x-auto thead th { position: sticky; top: 0; background: rgba(15,23,42,0.96); z-index: 3; }
+        .box-schema { position:sticky; top:72px; z-index:4; margin:6px 0 10px; padding:6px 8px; border-radius:8px; border:1px solid #334155; background:#0b1220; color:#93c5fd; font-size:10px; line-height:1.35; }
+        .box-schema code { color:#bfdbfe; }
       </style>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
       <script src="https://cdn.tailwindcss.com"></script>
@@ -3994,6 +4050,53 @@ def hq_admin():
             {% endif %}
           </section>
 
+          <!-- 만료되었으나 거래 내역 있음 (크롤러 저장 → 어드민 알림) -->
+          <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
+            <div class="flex items-center justify-between mb-2">
+              <h2 class="text-sm font-semibold flex items-center gap-2">
+                <i class="fa-solid fa-link-slash text-amber-400"></i> 만료된 결제 링크 (거래 내역 있음)
+              </h2>
+              {% if expired_with_transactions %}
+              <form method="post" action="{{ url_for('hq_admin') }}">
+                <input type="hidden" name="action" value="mark_expired_with_transactions_seen" />
+                <button type="submit" class="px-2 py-1 rounded bg-amber-600/80 text-white text-xs hover:bg-amber-600">전체 확인</button>
+              </form>
+              {% endif %}
+            </div>
+            <p class="text-[10px] text-white/50 mb-2">만료되었지만 결제가 발생한 링크 목록입니다. DB에 저장되어 있으며 정산 대상에 포함됩니다.</p>
+            {% if expired_with_transactions %}
+            <div class="overflow-x-auto max-h-48 overflow-y-auto">
+              <table class="min-w-full text-sm border-separate border-spacing-y-1">
+                <thead class="text-xs text-white/70 sticky top-0 bg-brand-blue">
+                  <tr>
+                    <th class="px-2 py-1 text-left">세션 ID</th>
+                    <th class="px-2 py-1 text-left">제목</th>
+                    <th class="px-2 py-1 text-left">대행사 ID</th>
+                    <th class="px-2 py-1 text-left">만료 시각</th>
+                    <th class="px-2 py-1 text-center">확인</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for e in expired_with_transactions_reversed %}
+                  <tr class="bg-black/20 hover:bg-black/30 text-[11px] {{ 'opacity-70' if e.seen else '' }}">
+                    <td class="px-2 py-1 font-mono text-blue-200">{{ e.session_id or '' }}</td>
+                    <td class="px-2 py-1 max-w-[200px] truncate" title="{{ e.title or '' }}">{{ e.title or '-' }}</td>
+                    <td class="px-2 py-1 text-white/80">{{ e.agency_id or '본사' }}</td>
+                    <td class="px-2 py-1 text-white/60">{{ e.finished_at or '' }}</td>
+                    <td class="px-2 py-1 text-center">{{ '확인함' if e.seen else '미확인' }}</td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            {% if expired_with_tx_unseen and expired_with_tx_unseen > 0 %}
+            <p class="mt-2 text-amber-200 text-xs"><i class="fa-solid fa-bell mr-1"></i> 미확인 {{ expired_with_tx_unseen }}건</p>
+            {% endif %}
+            {% else %}
+            <p class="text-[11px] text-white/60">해당 목록이 없습니다.</p>
+            {% endif %}
+          </section>
+
           <!-- 1. 대행사 신청 현황 -->
           <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
             <div class="flex items-center justify-between mb-3">
@@ -4002,6 +4105,7 @@ def hq_admin():
               </h2>
               <p class="text-[11px] text-white/60">신청서 양식과 동일한 정보가 리스트로 표시됩니다.</p>
             </div>
+            <div class="box-schema"><code>applications</code> 항목: <code>created_at, company_name, domain, phone, bank_name, account_number, email_or_sheet, login_id, login_password, fee_percent</code></div>
             {% if applications %}
             <div class="overflow-x-auto">
               <table class="min-w-full text-sm border-separate border-spacing-y-2">
@@ -4134,6 +4238,7 @@ def hq_admin():
                 </a>
               </div>
             </div>
+            <div class="box-schema"><code>transactions</code> 항목: <code>created_at, agency_id, amount, customer_name, status, settlement_status, message, card_type, resident_front, phone_number</code></div>
             {% if transactions %}
             <form method="post" action="{{ url_for('hq_admin') }}" class="space-y-3" onsubmit="return confirm('선택한 거래 내역 처리(삭제/정산완료)를 진행할까요?');">
               <div class="overflow-x-auto">
@@ -4256,6 +4361,37 @@ def hq_admin():
             {% else %}
               <p class="text-xs text-white/60">아직 집계된 거래 내역이 없습니다.</p>
             {% endif %}
+            <div class="mt-6 pt-4 border-t border-white/10">
+              <h3 class="text-sm font-semibold mb-2 text-white/90">거래 내역 (엑셀형 전체 컬럼)</h3>
+              <p class="text-[11px] text-white/50 mb-2">DB transactions 테이블의 모든 컬럼을 리스트로 표시합니다. 가로 스크롤 가능.</p>
+              {% if transactions %}
+              <div class="overflow-x-auto max-h-[420px] overflow-y-auto border border-white/20 rounded-xl">
+                <table class="min-w-max text-[11px] border-collapse">
+                  <thead class="text-white/80 bg-black/40 sticky top-0 z-10">
+                    <tr>
+                      {% for col in tx_excel_columns %}
+                      <th class="px-2 py-1.5 text-left whitespace-nowrap border-b border-r border-white/20 font-semibold">{{ col }}</th>
+                      {% endfor %}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for t in transactions|sort(attribute="created_at", reverse=True) %}
+                    <tr class="bg-black/20 hover:bg-black/30 border-b border-white/10">
+                      {% for col in tx_excel_columns %}
+                      <td class="px-2 py-1.5 whitespace-nowrap border-r border-white/10 text-white/90">
+                        {% set val = t.get(col) %}
+                        {% if col == 'amount' and val is not none and val != '' %}{{ val }} 원{% elif val is not none and val != '' %}{{ val }}{% else %}-{% endif %}
+                      </td>
+                      {% endfor %}
+                    </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+              {% else %}
+              <p class="text-xs text-white/60">표시할 거래가 없습니다.</p>
+              {% endif %}
+            </div>
           </section>
 
           <!-- 3. 대행사별 거래 내역 및 정산 시스템 (요약) -->
@@ -4272,6 +4408,7 @@ def hq_admin():
                 </a>
               </div>
             </div>
+            <div class="box-schema"><code>agencies + transactions(집계)</code> 항목: <code>company_name, domain, login_id, fee_percent, total_amount, unsettled_amount, net_amount, status</code></div>
             {% if agencies %}
             <div class="overflow-x-auto">
               <table class="min-w-full text-sm border-separate border-spacing-y-2">
@@ -4342,6 +4479,7 @@ def hq_admin():
                 </a>
               </div>
             </div>
+            <div class="box-schema"><code>agencies + transactions(관리/정산)</code> 항목: <code>company_name, phone, bank_name, account_number, email_or_sheet, fee_percent, status, kvan_mid, kvan_login_id, kvan_login_password, kvan_login_pin</code></div>
             {% if paged_agencies %}
             <div class="overflow-x-auto">
               <table class="min-w-full text-sm border-separate border-spacing-y-2">
@@ -4468,6 +4606,7 @@ def hq_admin():
               </h2>
               <p class="text-[11px] text-white/60">자동 결제 매크로가 수집한 OneQue 대시보드 요약 정보를 공유합니다.</p>
             </div>
+            <div class="box-schema"><code>kvan_dashboard</code> 항목: <code>captured_at, monthly_sales_amount, monthly_approved_count, monthly_approved_amount, monthly_canceled_count, monthly_canceled_amount, yesterday_sales_amount, settlement_expected_amount, today_settlement_expected_amount, credit_amount</code></div>
             {% if latest_dashboard %}
             <div class="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
               <div class="bg-black/30 rounded-xl border border-white/10 p-4 space-y-2">
@@ -4647,6 +4786,15 @@ def hq_admin():
         admin_log_path=str(ADMIN_LOG_PATH),
         payment_notifications_count=payment_notifications_count,
         crawler_refresh_since=crawler_refresh_since,
+        expired_with_transactions=expired_with_transactions,
+        expired_with_transactions_reversed=expired_with_transactions_reversed,
+        expired_with_tx_unseen=expired_with_tx_unseen,
+        tx_excel_columns=TX_EXCEL_COLUMNS,
+        latest_dashboard=latest_dashboard,
+        paged_agencies=paged_agencies,
+        page=page,
+        total_pages=total_pages,
+        today_str=today_str,
     )
 
 
@@ -4684,6 +4832,11 @@ def agency_admin():
             history = [h for h in all_history if aid and str(h.get("agency_id") or "").strip() == aid]
         except Exception:
             sessions, history = [], []
+
+    # 진행 중(결제중만) vs 완료/종료 구분
+    _st = lambda s: (str(s.get("status") or "결제중").strip())
+    agency_active_sessions = [s for s in sessions if _st(s) == "결제중"]
+    agency_completed_sessions = list(history) + [s for s in sessions if _st(s) != "결제중"]
 
     # DB 기반 거래 내역 (transactions 테이블에서 이 대행사 건만)
     agency_transactions: list[dict] = []
@@ -5005,6 +5158,8 @@ def agency_admin():
         @keyframes pulseBanner2 { 0%,100% { opacity:.92; } 50% { opacity:1; } }
         @keyframes pulseDot2 { 0%,100% { opacity:.2; transform:translateY(0);} 50% { opacity:1; transform:translateY(-2px);} }
         .overflow-x-auto thead th { position: sticky; top: 0; background: rgba(15,23,42,0.96); z-index: 3; }
+        .box-schema { position:sticky; top:72px; z-index:4; margin:6px 0 10px; padding:6px 8px; border-radius:8px; border:1px solid #334155; background:#0b1220; color:#93c5fd; font-size:10px; line-height:1.35; }
+        .box-schema code { color:#bfdbfe; }
         /* 결제 폼에서 사용하던 결과 모달 오버레이가 남아 있어도 대행사 어드민에서는 항상 숨긴다. */
         #result-modal,
         .result-backdrop,
@@ -5019,10 +5174,10 @@ def agency_admin():
     <body class="bg-brand-blue text-white font-sans overflow-x-hidden antialiased min-h-screen flex flex-col">
       <div id="pending-create-banner" class="pending-top-banner" aria-hidden="true">
         <i class="fa-solid fa-spinner fa-spin"></i>
-        <span>K-VAN 링크 생성 중</span>
+        <span>K-VAN 링크 생성 중 (1분정도 소요됩니다.)</span>
       </div>
       <div id="pending-create-popup" class="pending-popup" aria-hidden="true">
-        <div style="font-size:13px;font-weight:700; margin-bottom:6px;">링크 생성중입니다</div>
+        <div style="font-size:13px;font-weight:700; margin-bottom:6px;">링크 생성중입니다 (1분정도 소요됩니다.)</div>
         <div style="font-size:11px; color:#94a3b8; margin-bottom:8px;">생성이 완료되면 자동으로 반영됩니다.</div>
         <div style="display:flex; justify-content:center; gap:6px;">
           <span class="pending-dot"></span><span class="pending-dot"></span><span class="pending-dot"></span>
@@ -5031,7 +5186,7 @@ def agency_admin():
       <div id="link-loading-overlay" class="loading-backdrop" aria-hidden="true">
         <div class="loading-card">
           <div class="loading-spinner"></div>
-          <div id="link-loading-text" style="font-size:13px;font-weight:600;">링크 생성중입니다...</div>
+          <div id="link-loading-text" style="font-size:13px;font-weight:600;">링크 생성중입니다... (1분정도 소요됩니다.)</div>
           <div style="margin-top:4px;font-size:11px;color:#94a3b8;">잠시만 기다려 주세요.</div>
         </div>
       </div>
@@ -5088,7 +5243,7 @@ def agency_admin():
             <h2 class="text-lg font-semibold mb-3 flex items-center gap-2">
               <i class="fa-solid fa-link text-brand-accent"></i> 결제 요청 링크 생성
             </h2>
-            <form method="post" class="flex flex-wrap gap-3 items-end text-sm" data-loading-msg="링크 생성중입니다...">
+            <form method="post" class="flex flex-wrap gap-3 items-end text-sm" data-loading-msg="링크 생성중입니다... (1분정도 소요됩니다.)">
               <input type="hidden" name="action" value="create">
               <div>
                 <label class="block text-xs mb-1 text-white/70">결제 금액 (선택)</label>
@@ -5141,9 +5296,10 @@ def agency_admin():
                 </button>
               </form>
             </h2>
-            {% if sessions %}
+            <div class="box-schema">진행 중 = 결제중만 표시. 완료/종료된 세션은 아래 섹션에 표시됩니다.</div>
+            {% if agency_active_sessions %}
             <div class="space-y-2 text-sm">
-              {% for s in sessions %}
+              {% for s in agency_active_sessions %}
               <div class="bg-black/25 border border-white/15 rounded-xl px-3 py-2 flex flex-wrap items-center justify-between gap-2">
                 <div class="text-[11px]">
                   <div class="font-mono text-blue-200">SESSION: {{ s.id }}</div>
@@ -5151,10 +5307,9 @@ def agency_admin():
                     금액: {{ s.amount or '고객 입력' }} / 할부: {{ s.installment or '일시불' }}
                   </div>
                   <div class="text-white/60">생성일: {{ s.created_at }}</div>
-                  <div class="text-white/70">상태: {{ s.status or '결제중' }}</div>
-                  {% if s.status == '만료' %}
-                  <div class="text-red-300">만료 감지됨{% if s.deleted_in_kvan %} · K-VAN에서 삭제됨{% endif %}</div>
-                  {% endif %}
+                  <div class="text-white/70">
+                    상태: <span class="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-900/50 text-emerald-200 border border-emerald-600/50">결제중</span>
+                  </div>
                 </div>
                 <div class="flex flex-col items-end gap-1 text-[11px]">
                   {% set kvan_link = s.kvan_link %}
@@ -5181,7 +5336,7 @@ def agency_admin():
                     </form>
                   </div>
                   {% else %}
-                  <span class="pending-inline">K-VAN 링크를 생성 중입니다. 잠시 후 새로고침 해 주세요.</span>
+                  <span class="pending-inline">K-VAN 링크를 생성 중입니다. 1분정도 소요됩니다. 잠시 후 새로고침 해 주세요.</span>
                   {% endif %}
                   <form method="post" action="{{ url_for('agency_admin') }}">
                     <input type="hidden" name="action" value="delete_session">
@@ -5204,7 +5359,8 @@ def agency_admin():
             <h2 class="text-lg font-semibold mb-3 flex items-center gap-2">
               <i class="fa-solid fa-list-check text-brand-accent"></i> 완료/종료된 세션 요약
             </h2>
-            {% if history %}
+            <div class="box-schema">크롤링 결과에 따라 링크만료·결제완료·결제 실패 등이 이 섹션에 표시됩니다.</div>
+            {% if agency_completed_sessions %}
             <div class="overflow-x-auto">
               <table class="min-w-full text-xs border-separate border-spacing-y-2">
                 <thead class="text-white/70">
@@ -5217,13 +5373,23 @@ def agency_admin():
                   </tr>
                 </thead>
                 <tbody>
-                  {% for h in history %}
+                  {% for h in agency_completed_sessions %}
                   <tr class="bg-black/20 hover:bg-black/30 transition">
                     <td class="px-3 py-2 font-mono text-blue-200">{{ h.id }}</td>
                     <td class="px-3 py-2 text-right">{{ h.amount }}</td>
                     <td class="px-3 py-2">{{ h.installment }}</td>
                     <td class="px-3 py-2 text-[11px] text-white/80">
-                      {{ h.status }}{% if h.deleted_in_kvan %} · 삭제됨{% endif %}
+                      {% set st = (h.status or '') %}
+                      {% if st == '만료' or '만료' in st %}
+                        <span class="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-900/50 text-amber-200 border border-amber-600/50">링크만료</span>
+                      {% elif st in ['결제완료','성공','success'] or h.has_transaction %}
+                        <span class="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-900/50 text-emerald-200 border border-emerald-600/50">결제완료</span>
+                      {% elif st in ['실패','fail','링크생성실패'] %}
+                        <span class="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-red-900/50 text-red-200 border border-red-600/50">결제 실패</span>
+                      {% else %}
+                        {{ st or '-' }}
+                      {% endif %}
+                      {% if h.deleted_in_kvan %}<span class="text-red-300"> · 삭제됨</span>{% endif %}
                     </td>
                     <td class="px-3 py-2 text-[11px] text-white/70 max-w-[200px] truncate">{{ h.result_message }}</td>
                   </tr>
@@ -5260,6 +5426,7 @@ def agency_admin():
                 </div>
               </div>
             </div>
+            <div class="box-schema"><code>transactions (agency_id 필터)</code> 항목: <code>created_at, amount, customer_name, status, settlement_status, fee_percent(계산), payable_amount(계산)</code></div>
             {% if agency_transactions %}
             <form method="post" action="{{ url_for('agency_admin') }}">
             <input type="hidden" name="action" value="bulk_delete_agency_tx" />
@@ -5326,6 +5493,33 @@ def agency_admin():
               </button>
             </div>
             </form>
+            <div class="mt-6 pt-4 border-t border-white/10">
+              <h3 class="text-sm font-semibold mb-2 text-white/90">거래 내역 (엑셀형 전체 컬럼)</h3>
+              <p class="text-[11px] text-white/50 mb-2">DB transactions 테이블의 모든 컬럼을 리스트로 표시합니다. 가로 스크롤 가능.</p>
+              <div class="overflow-x-auto max-h-[360px] overflow-y-auto border border-white/20 rounded-xl">
+                <table class="min-w-max text-[11px] border-collapse">
+                  <thead class="text-white/80 bg-black/40 sticky top-0 z-10">
+                    <tr>
+                      {% for col in tx_excel_columns %}
+                      <th class="px-2 py-1.5 text-left whitespace-nowrap border-b border-r border-white/20 font-semibold">{{ col }}</th>
+                      {% endfor %}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for t in agency_transactions|sort(attribute="created_at", reverse=True) %}
+                    <tr class="bg-black/20 hover:bg-black/30 border-b border-white/10">
+                      {% for col in tx_excel_columns %}
+                      <td class="px-2 py-1.5 whitespace-nowrap border-r border-white/10 text-white/90">
+                        {% set val = t.get(col) %}
+                        {% if col == 'amount' and val is not none and val != '' %}{{ val }} 원{% elif val is not none and val != '' %}{{ val }}{% else %}-{% endif %}
+                      </td>
+                      {% endfor %}
+                    </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            </div>
             {% else %}
               <p class="text-xs text-white/60">아직 이 대행사에 대한 거래 내역이 없습니다.</p>
             {% endif %}
@@ -5358,9 +5552,12 @@ def agency_admin():
         agency=agency,
         sessions=sessions,
         history=history,
+        agency_active_sessions=agency_active_sessions,
+        agency_completed_sessions=agency_completed_sessions,
         base_url=base_url,
         message=message,
         agency_transactions=agency_transactions,
+        tx_excel_columns=TX_EXCEL_COLUMNS,
         payment_notifications_count=payment_notifications_count,
         has_pending_link=has_pending_link,
         crawler_refresh_since=crawler_refresh_since,

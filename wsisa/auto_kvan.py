@@ -106,6 +106,16 @@ def _has_payment_links_quick(driver: webdriver.Chrome, retries: int = 5, delay: 
             if key_tokens:
                 print(f"[EMPTY_CHECK] KEY 세션ID 감지 → 링크 존재 (attempt={attempt}, count={len(key_tokens)})")
                 return True
+
+            # 4) 카드 컨테이너(rounded+border) 안에 KEY가 있는 경우 (텍스트가 자식 노드에 분리된 경우)
+            card_containers = driver.find_elements(
+                By.XPATH,
+                "//div[contains(@class,'rounded') and contains(@class,'border')]"
+                "[.//*[contains(text(),'KEY') or contains(.,'KEY20')]]",
+            )
+            if card_containers:
+                print(f"[EMPTY_CHECK] 결제링크 카드 컨테이너 감지 → 링크 존재 (attempt={attempt}, count={len(card_containers)})")
+                return True
         except Exception as e:
             print(f"[EMPTY_CHECK] 링크 존재 여부 확인 중 예외 (attempt={attempt}): {e}")
 
@@ -181,6 +191,45 @@ def _go_to_payment_link(driver: webdriver.Chrome, max_attempts: int = 12) -> boo
 
     print("[NAV][ERROR] 여러 차례 시도했으나 /payment-link 로 진입하지 못했습니다.")
     return False
+
+
+def _wait_payment_link_page_ready(driver: webdriver.Chrome, timeout_sec: float = 18.0) -> bool:
+    """
+    결제링크 관리 페이지가 로드 완료될 때까지 대기한다.
+    '권한 확인 중...' 스피너가 사라지고, 빈 화면 문구 또는 카드/KEY/거래내역 버튼이 보이면 준비된 것으로 본다.
+    """
+    wait = WebDriverWait(driver, max(1.0, timeout_sec))
+    try:
+        def _page_ready(drv):
+            try:
+                # 1) 빈 화면 문구가 보이면 준비 완료
+                empty = drv.find_elements(
+                    By.XPATH,
+                    "//*[contains(normalize-space(.),'생성된 결제 링크가 없습니다')]",
+                )
+                if empty:
+                    return True
+                # 2) 거래 내역 버튼 또는 KEY 세션ID가 보이면 준비 완료
+                icons = drv.find_elements(
+                    By.XPATH,
+                    "//button[@title='거래 내역']"
+                    " | //button[contains(normalize-space(.),'거래 내역')]"
+                    " | //button[contains(normalize-space(.),'거래내역')]"
+                    " | //*[contains(normalize-space(.),'KEY20')]",
+                )
+                if icons:
+                    return True
+                return False
+            except Exception:
+                return False
+
+        wait.until(_page_ready)
+        print("[PAGE_READY] 결제링크 관리 페이지 로드 완료.")
+        return True
+    except TimeoutException:
+        print("[WARN] 결제링크 관리 페이지 준비 대기 타임아웃 - 현재 상태로 진행.")
+        return False
+
 
 # 경로는 파일 상단에서 이미 초기화된 DATA_DIR(/app/data 또는 SISA_DATA_DIR)를 그대로 사용한다.
 # (중복 재정의 시 web_form.py 와 경로가 갈라져 lock/heartbeat/wakeup 파일 불일치가 발생할 수 있음)
@@ -428,6 +477,9 @@ DB_NAME = (
     or os.environ.get("MYSQL_DB")
     or "railway"
 )
+DB_CONNECT_TIMEOUT = int(os.environ.get("MYSQL_CONNECT_TIMEOUT", "5"))
+DB_READ_TIMEOUT = int(os.environ.get("MYSQL_READ_TIMEOUT", "10"))
+DB_WRITE_TIMEOUT = int(os.environ.get("MYSQL_WRITE_TIMEOUT", "10"))
 
 
 def get_db():
@@ -440,7 +492,47 @@ def get_db():
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=False,
+        connect_timeout=DB_CONNECT_TIMEOUT,
+        read_timeout=DB_READ_TIMEOUT,
+        write_timeout=DB_WRITE_TIMEOUT,
     )
+
+
+def _is_retryable_db_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return any(
+        k in msg
+        for k in (
+            "2013",
+            "2006",
+            "lost connection",
+            "server has gone away",
+            "connection reset",
+            "connection refused",
+            "broken pipe",
+        )
+    )
+
+
+def _get_db_with_retry(max_attempts: int = 3, delay_sec: float = 0.8):
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            conn = get_db()
+            try:
+                conn.ping(reconnect=True)
+            except Exception:
+                pass
+            return conn
+        except Exception as e:
+            last_exc = e
+            if attempt >= max_attempts or not _is_retryable_db_error(e):
+                raise
+            _append_admin_log("AUTO", f"[WARN] DB 재연결 재시도 {attempt}/{max_attempts}: {e}")
+            time.sleep(delay_sec * attempt)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("DB connection retry failed without exception")
 
 # JSON / 결과 엑셀에서 공통으로 사용하는 필드 목록
 HEADERS: List[str] = [
@@ -1341,11 +1433,11 @@ def _sync_kvan_to_transactions() -> bool:
             except Exception as e_ag:
                 print(f"[WARN] agencies.kvan_mid 조회 중 오류(계속 진행): {e_ag}")
 
-            # 1) 최근 K-VAN 거래 200건만 사용
+            # 1) 최근 K-VAN 거래 200건만 사용 (raw_text로 세션 KEY 추출 → 대행사 구분)
             cur.execute(
                 """
                 SELECT id, captured_at, merchant_name, mid, tx_type,
-                       amount, approval_no, registered_at
+                       amount, approval_no, registered_at, raw_text
                 FROM kvan_transactions
                 ORDER BY captured_at DESC
                 LIMIT 200
@@ -1359,6 +1451,7 @@ def _sync_kvan_to_transactions() -> bool:
                 mid = (kr.get("mid") or "").strip()
                 tx_type = (kr.get("tx_type") or "").strip()
                 reg = (kr.get("registered_at") or "").strip()
+                raw_text = (kr.get("raw_text") or "").strip()
                 if not amt or not approval:
                     # 금액/승인번호가 없으면 내부 거래와 매핑하기 어려우므로 건너뜀
                     continue
@@ -1366,9 +1459,12 @@ def _sync_kvan_to_transactions() -> bool:
                 # 등록일에서 날짜 부분만 추출 (예: '2026-03-12 10:20:30' -> '2026-03-12')
                 reg_date = reg.split(" ")[0] if reg else ""
 
-                # MID -> agency_id 매핑
+                # 대행사/본사 구분: KEY로 시작하는 세션ID 추출 → admin_state에서 agency_id 조회, 없으면 MID 폴백
                 agency_id: str | None = None
-                if mid and mid in agency_mid_map:
+                session_match = re.search(r"KEY[0-9A-Za-z]+", raw_text) if raw_text else None
+                if session_match:
+                    agency_id = _get_agency_id_for_session(session_match.group(0))
+                if not agency_id and mid and mid in agency_mid_map:
                     agency_id = agency_mid_map[mid]
 
                 # K-VAN 결제유형 기준으로 내부 status 유추
@@ -1544,6 +1640,7 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
         if not _go_to_payment_link(driver):
             raise RuntimeError("[NAV] LOCAL_TEST 모드에서 /payment-link 로 진입하지 못했습니다.")
         driver.refresh()
+        _wait_payment_link_page_ready(driver)
         return
 
     try:
@@ -1552,6 +1649,7 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
         if not _go_to_payment_link(driver):
             raise RuntimeError("[NAV] /payment-link 로 진입하지 못해 링크 리스트 크롤링을 중단합니다.")
         driver.refresh()
+        _wait_payment_link_page_ready(driver)
         wait = WebDriverWait(driver, 10)
 
         # 실제 카드/테이블이 렌더링될 때까지 대기:
@@ -1842,6 +1940,38 @@ def _extract_status_from_link_lines(lines: list[str]) -> str:
     return ""
 
 
+def _extract_expire_at_from_lines(lines: list[str]) -> datetime | None:
+    """
+    카드 텍스트 라인에서 만료일시를 추출한다.
+    예: "만료일: 2026-03-16 16:20:31"
+    """
+    for raw in lines or []:
+        ln = str(raw or "").strip()
+        if "만료일" not in ln:
+            continue
+        m = re.search(r"(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", ln)
+        if not m:
+            continue
+        ts = m.group(1).strip()
+        try:
+            return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            continue
+    return None
+
+
+def _kvan_now() -> datetime:
+    """
+    K-VAN 화면의 시각 기준으로 현재 시간을 계산한다.
+    기본값은 KST(+9)이며, 필요 시 K_VAN_TZ_OFFSET_HOURS 로 조정 가능.
+    """
+    try:
+        offset_hours = int(os.environ.get("K_VAN_TZ_OFFSET_HOURS", "9"))
+    except Exception:
+        offset_hours = 9
+    return datetime.utcnow() + timedelta(hours=offset_hours)
+
+
 def mark_expired_sessions_from_kvan_links() -> None:
     """
     kvan_links 테이블에서 상태가 '만료'인 링크 URL 목록을 조회한 뒤,
@@ -1853,78 +1983,98 @@ def mark_expired_sessions_from_kvan_links() -> None:
     - admin_state 의 진행중 세션은 즉시 제거하고, history에
       status='만료', deleted_in_kvan=True 로 남긴다.
     """
-    if LOCAL_TEST:
-        return
-    try:
-        conn = get_db()
-        expired_urls: set[str] = set()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT kvan_link, status
-                FROM kvan_links
-                WHERE kvan_link IS NOT NULL AND kvan_link != ''
-                """,
-            )
-            for row in cur.fetchall() or []:
-                url = (row.get("kvan_link") or "").strip()
-                status_text = str(row.get("status") or "").strip()
-                if url and _is_expired_link_status(status_text):
-                    expired_urls.add(url)
-        if not expired_urls:
+    for attempt in range(1, 4):
+        conn = None
+        try:
+            conn = _get_db_with_retry()
+            expired_urls: set[str] = set()
+            # 만료+거래있음 세션은 삭제 제외 (어드민 알림용으로 유지)
+            excluded_sids: set[str] = set()
+            if EXPIRED_WITH_TRANSACTIONS_PATH.exists():
+                try:
+                    data = json.loads(EXPIRED_WITH_TRANSACTIONS_PATH.read_text(encoding="utf-8"))
+                    for item in (data if isinstance(data, list) else []):
+                        sid = (item.get("session_id") or "").strip()
+                        if sid:
+                            excluded_sids.add(sid)
+                except Exception:
+                    pass
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT kvan_link, status, kvan_session_id
+                    FROM kvan_links
+                    WHERE kvan_link IS NOT NULL AND kvan_link != ''
+                    """,
+                )
+                for row in cur.fetchall() or []:
+                    url = (row.get("kvan_link") or "").strip()
+                    status_text = str(row.get("status") or "").strip()
+                    sid = (row.get("kvan_session_id") or "").strip()
+                    if url and _is_expired_link_status(status_text) and sid not in excluded_sids:
+                        expired_urls.add(url)
+            if not expired_urls:
+                conn.close()
+                return
+            st = _load_admin_state()
+            sessions = list(st.get("sessions") or [])
+            history = list(st.get("history") or [])
+            remaining_sessions: list[dict] = []
+            removed_count = 0
+            now_iso = datetime.utcnow().isoformat()
+
+            for s in sessions:
+                link = (s.get("kvan_link") or "").strip()
+                if link and link in expired_urls:
+                    removed_count += 1
+                    sid = str(s.get("id") or "")
+                    s["status"] = "만료"
+                    s["deleted"] = True
+                    s["deleted_in_kvan"] = True
+                    s["deleted_at"] = now_iso
+                    s["finished_at"] = s.get("finished_at") or now_iso
+                    old_msg = str(s.get("result_message") or "").strip()
+                    mark_msg = "만료 감지로 K-VAN 링크가 삭제되었습니다."
+                    s["result_message"] = f"{old_msg}\n{mark_msg}".strip() if old_msg else mark_msg
+                    history = _upsert_history_by_session_id(history, dict(s))
+                    _append_admin_log(
+                        "AUTO",
+                        f"만료 링크 세션 정리 session_id={sid}, link={link[:50]}...",
+                    )
+                else:
+                    remaining_sessions.append(s)
+
+            st["sessions"] = remaining_sessions
+            st["history"] = history
+            _save_admin_state(st)
+            if expired_urls:
+                with conn.cursor() as cur:
+                    placeholders = ",".join(["%s"] * len(expired_urls))
+                    cur.execute(
+                        f"DELETE FROM kvan_links WHERE kvan_link IN ({placeholders})",
+                        tuple(expired_urls),
+                    )
+            conn.commit()
             conn.close()
-            return
-        st = _load_admin_state()
-        sessions = list(st.get("sessions") or [])
-        history = list(st.get("history") or [])
-        remaining_sessions: list[dict] = []
-        removed_count = 0
-        now_iso = datetime.utcnow().isoformat()
-
-        for s in sessions:
-            link = (s.get("kvan_link") or "").strip()
-            if link and link in expired_urls:
-                removed_count += 1
-                sid = str(s.get("id") or "")
-                s["status"] = "만료"
-                s["deleted"] = True
-                s["deleted_in_kvan"] = True
-                s["deleted_at"] = now_iso
-                s["finished_at"] = s.get("finished_at") or now_iso
-                old_msg = str(s.get("result_message") or "").strip()
-                mark_msg = "만료 감지로 K-VAN 링크가 삭제되었습니다."
-                s["result_message"] = f"{old_msg}\n{mark_msg}".strip() if old_msg else mark_msg
-
-                # 동일 세션이 history에 이미 있으면 업데이트, 없으면 추가
-                history = _upsert_history_by_session_id(history, dict(s))
-
+            if removed_count:
                 _append_admin_log(
                     "AUTO",
-                    f"만료 링크 세션 정리 session_id={sid}, link={link[:50]}...",
+                    f"만료/취소 링크 DB 정리 완료 (세션 {removed_count}건, 링크 {len(expired_urls)}건)",
                 )
-            else:
-                remaining_sessions.append(s)
-
-        st["sessions"] = remaining_sessions
-        st["history"] = history
-        _save_admin_state(st)
-        # 상태 문자열 LIKE 광역 삭제를 피하고, 위에서 판별한 URL만 정확히 삭제한다.
-        if expired_urls:
-            with conn.cursor() as cur:
-                placeholders = ",".join(["%s"] * len(expired_urls))
-                cur.execute(
-                    f"DELETE FROM kvan_links WHERE kvan_link IN ({placeholders})",
-                    tuple(expired_urls),
-                )
-        conn.commit()
-        conn.close()
-        if removed_count:
-            _append_admin_log(
-                "AUTO",
-                f"만료/취소 링크 DB 정리 완료 (세션 {removed_count}건, 링크 {len(expired_urls)}건)",
-            )
-    except Exception as e:
-        print(f"[WARN] 링크 만료 세션 반영 실패: {e}")
+            return
+        except Exception as e:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+            if attempt < 3 and _is_retryable_db_error(e):
+                _append_admin_log("AUTO", f"[WARN] 링크 만료 세션 반영 재시도 {attempt}/3: {e}")
+                time.sleep(0.7 * attempt)
+                continue
+            print(f"[WARN] 링크 만료 세션 반영 실패: {e}")
+            return
 
 
 def _sync_popup_transaction_to_internal(
@@ -2081,16 +2231,16 @@ def _append_payment_notification(
         print(f"[WARN] 결제 알림 큐 추가 실패: {e}")
 
 
-def _close_dialog(dialog) -> None:
+def _close_dialog(driver: webdriver.Chrome, dialog) -> None:
     """
-    '거래 내역' 팝업을 안전하게 닫고, 오버레이까지 사라질 때까지 잠시 대기한다.
+    '거래 내역' 팝업을 안전하게 닫고, 오버레이가 사라질 때까지 짧게 대기한다.
+    대기 시간 0.3초로 제한해 리스트 크롤링 속도를 높인다.
 
     - dialog 내부의 닫기 버튼(data-slot='dialog-close')를 우선 클릭
-    - 실패하면 오버레이(div[data-slot='dialog-overlay'])를 클릭 시도
-    - 마지막으로, 해당 dialog 자체가 DOM 에서 사라질 때까지 최대 2초 대기
+    - 실패하면 오버레이 클릭 시도
+    - dialog가 DOM에서 사라질 때까지 최대 0.3초 대기
     """
     try:
-        driver = dialog.parent  # WebElement 가 생성된 WebDriver 인스턴스
         # 1차: X 버튼 클릭
         try:
             close_btn = dialog.find_element(
@@ -2108,9 +2258,9 @@ def _close_dialog(dialog) -> None:
             except Exception:
                 pass
 
-        # 3차: dialog/오버레이가 실제로 사라질 때까지 잠시 대기
+        # 3차: dialog가 사라질 때까지 최대 0.3초만 대기 (기존 2초 → 0.3초)
         try:
-            WebDriverWait(driver, 2).until_not(
+            WebDriverWait(driver, 0.3).until_not(
                 EC.presence_of_element_located(
                     (
                         By.XPATH,
@@ -2119,7 +2269,6 @@ def _close_dialog(dialog) -> None:
                 )
             )
         except TimeoutException:
-            # 완전히 사라지지 않아도, 이후 로직에서 다시 한 번 시도하게 둔다.
             pass
         time.sleep(0.05)
     except Exception:
@@ -2313,11 +2462,116 @@ def _mark_session_deleted(session_id: str, title: str) -> None:
         st["sessions"] = remaining_sessions
         st["history"] = history
         _save_admin_state(st)
+
+        # 만료+거래없음 → kvan_links에서 해당 행 삭제 대상으로 표시 (status='만료' 반영 후 mark_expired_sessions_from_kvan_links가 DELETE)
+        if not LOCAL_TEST and session_id:
+            try:
+                conn = _get_db_with_retry()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE kvan_links
+                            SET status = '만료'
+                            WHERE (kvan_session_id = %s OR kvan_link LIKE %s)
+                            """,
+                            (session_id, f"%{session_id}%"),
+                        )
+                    conn.commit()
+                finally:
+                    conn.close()
+            except Exception as e_db:
+                print(f"[WARN] _mark_session_deleted kvan_links 반영 실패: {e_db}")
     except Exception as e:
         print(f"[WARN] _mark_session_deleted 실패: {e}")
 
 
-def _scan_payment_link_popups_and_sync(driver: webdriver.Chrome) -> bool:
+# 만료되었으나 거래 내역이 있는 링크 목록 (어드민 페이지 알림용)
+EXPIRED_WITH_TRANSACTIONS_PATH = DATA_DIR / "expired_with_transactions.json"
+
+
+def _mark_session_expired_with_transactions(
+    session_id: str,
+    title: str,
+    agency_id: str | None = None,
+) -> None:
+    """
+    만료되었지만 거래 내역이 있는 세션: history에 만료로 남기고,
+    has_transaction=True, deleted=False 로 표시. 어드민 알림 목록에 추가.
+    """
+    try:
+        st = _load_admin_state()
+        sessions = list(st.get("sessions") or [])
+        history = list(st.get("history") or [])
+        now_iso = datetime.utcnow().isoformat()
+
+        remaining_sessions: list[dict] = []
+        moved: dict | None = None
+        for s in sessions:
+            if str(s.get("id") or "") == str(session_id):
+                moved = dict(s)
+            else:
+                remaining_sessions.append(s)
+        if moved is None:
+            moved = {"id": session_id}
+        moved["status"] = "만료"
+        moved["has_transaction"] = True
+        moved["deleted"] = False
+        moved["deleted_in_kvan"] = False
+        moved["checked_title"] = title
+        moved["finished_at"] = moved.get("finished_at") or now_iso
+        moved["agency_id"] = (agency_id or moved.get("agency_id") or "").strip() or None
+        history = _upsert_history_by_session_id(history, moved)
+        st["sessions"] = remaining_sessions
+        st["history"] = history
+        _save_admin_state(st)
+
+        # 어드민 알림용 목록에 추가 (최근 200건 유지)
+        try:
+            items: list[dict] = []
+            if EXPIRED_WITH_TRANSACTIONS_PATH.exists():
+                try:
+                    items = json.loads(EXPIRED_WITH_TRANSACTIONS_PATH.read_text(encoding="utf-8"))
+                except Exception:
+                    items = []
+            items.append({
+                "session_id": session_id,
+                "title": (title or "")[:200],
+                "agency_id": agency_id or "",
+                "finished_at": now_iso,
+                "seen": False,
+            })
+            items = items[-200:]
+            EXPIRED_WITH_TRANSACTIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            EXPIRED_WITH_TRANSACTIONS_PATH.write_text(
+                json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            _append_admin_log("CRAWLER", f"만료+거래있음 세션 기록 session_id={session_id} (어드민 알림)")
+        except Exception as e:
+            print(f"[WARN] 만료+거래있음 목록 저장 실패: {e}")
+    except Exception as e:
+        print(f"[WARN] _mark_session_expired_with_transactions 실패: {e}")
+
+
+def _get_agency_id_for_session(session_id: str) -> str | None:
+    """admin_state.json 에서 session_id(KEY...)에 해당하는 agency_id 반환. 본사/대행사 구분용."""
+    if not session_id:
+        return None
+    try:
+        st = _load_admin_state()
+        for s in (st.get("sessions") or []) + (st.get("history") or []):
+            if str(s.get("id") or "") == str(session_id):
+                aid = (s.get("agency_id") or "").strip()
+                return aid or None
+        return None
+    except Exception:
+        return None
+
+
+def _scan_payment_link_popups_and_sync(
+    driver: webdriver.Chrome,
+    allow_popup_for_non_expired: bool = True,
+) -> bool:
     """
     결제링크 관리(/payment-link) 화면에서 각 카드의 '거래 내역' 버튼을 클릭해
     팝업의 '결제 승인' 정보를 읽고 내부 DB와 세션에 반영한다.
@@ -2335,16 +2589,19 @@ def _scan_payment_link_popups_and_sync(driver: webdriver.Chrome) -> bool:
         if not _go_to_payment_link(driver):
             _step_end("결제링크 관리 팝업 기반 동기화", t0)
             raise RuntimeError("[NAV] /payment-link 로 진입하지 못해 팝업 기반 동기화를 중단합니다.")
+        _wait_payment_link_page_ready(driver)
 
         max_tries = 12  # 0.5초 * 12 ≈ 6초
         icons_found = False
+        icons: list = []
         for attempt in range(max_tries):
             icons = driver.find_elements(
                 By.XPATH,
                 "//button[@title='거래 내역']"
                 " | //button[contains(normalize-space(.),'거래 내역')]"
                 " | //button[contains(normalize-space(.),'거래내역')]"
-                " | //button[.//svg[contains(@class,'lucide-receipt')]]",
+                " | //button[.//svg[contains(@class,'lucide-receipt')]]"
+                " | //button[contains(@aria-label,'거래') or contains(@aria-label,'내역')]",
             )
             if icons:
                 print(
@@ -2354,61 +2611,192 @@ def _scan_payment_link_popups_and_sync(driver: webdriver.Chrome) -> bool:
                 break
             else:
                 print(
-                    f"[POPUP_DEBUG] 아이콘 없음 (attempt={attempt}, url={driver.current_url}) – 0.5초 후 재시도"
+                    f"[POPUP_DEBUG] 아이콘 없음 (attempt={attempt}, url={driver.current_url}) – 0.2초 후 재시도"
                 )
-            time.sleep(0.5)
+            time.sleep(0.2)
 
         if not icons_found:
             print("[INFO] 결제링크 관리 화면에서 '거래 내역' 아이콘이 없어 팝업 기반 동기화를 건너뜁니다. (transactions 동기화는 계속 진행)")
             _step_end("결제링크 관리 팝업 기반 동기화", t0)
             return False
 
-        # 버튼 기준으로 실제 "행/카드" 컨테이너를 좁혀 잡는다.
-        # (기존의 광범위 div 탐색은 페이지 전체를 1개 카드로 오인할 수 있음)
+        # JS 기준으로 버튼/행을 1:1 매핑해 추출한다.
+        # 각 버튼에서 시작해 "단일 KEY 세션ID를 가진 최소 조상"만 채택한다.
+        row_infos = driver.execute_script(
+            """
+const list = Array.from(arguments[0] || []);
+const out = [];
+for (let i = 0; i < list.length; i++) {
+  const btn = list[i];
+  let cur = btn;
+  let picked = null;
+  let fallback = null;
+  for (let d = 0; d < 9 && cur; d++) {
+    const txt = (cur.innerText || "").trim();
+    if (txt) {
+      const keys = Array.from(new Set(txt.match(/KEY[0-9A-Za-z]+/g) || []));
+      if (keys.length === 1 && txt.length <= 1200) {
+        const badges = Array.from(cur.querySelectorAll("span[data-slot='badge']")).map(el => (el.innerText || "").trim()).filter(Boolean);
+        const hasStatusBadges = badges.length > 0;
+        const cand = { sid: keys[0], text: txt, badges: badges, hasStatusBadges: hasStatusBadges };
+        if (hasStatusBadges) {
+          picked = cand;
+          break;
+        }
+        if (!fallback || txt.length > fallback.text.length) {
+          fallback = cand;
+        }
+      }
+    }
+    cur = cur.parentElement;
+  }
+  if (!picked) picked = fallback;
+  if (!picked) continue;
+  const badges = Array.from(picked.badges || []);
+  const lines = picked.text.split("\\n").map(s => s.trim()).filter(Boolean);
+  let expiredByLine = lines.some(v => {
+    const t = (v || "").replace(/\\s+/g, "");
+    return t === "만료" || t === "취소" || t === "취소됨" || t === "취소완료";
+  });
+  out.push({
+    icon_index: i,
+    session_id: picked.sid,
+    title: lines.length ? lines[0] : "",
+    is_expired: badges.some(t => t.includes("만료")) || expiredByLine,
+    badge_texts: badges,
+    raw_text: picked.text
+  });
+}
+return out;
+""",
+            icons,
+        ) or []
         card_items: list[tuple] = []
-        for btn in icons:
+        for info in row_infos:
             try:
-                card = btn.find_element(
-                    By.XPATH,
-                    "./ancestor::tr[1]"
-                    " | ./ancestor::*[@role='row'][1]"
-                    " | ./ancestor::div[contains(@class,'rounded')][1]",
-                )
-                card_items.append((card, btn))
+                idx_js = int(info.get("icon_index"))
+                sid = str(info.get("session_id") or "").strip()
+                title = str(info.get("title") or "").strip()
+                expired = bool(info.get("is_expired"))
+                badge_texts = list(info.get("badge_texts") or [])
+                raw_text = str(info.get("raw_text") or "")
+                if idx_js < 0 or idx_js >= len(icons) or not sid:
+                    continue
+                card_items.append((icons[idx_js], sid, title, expired, badge_texts, raw_text))
             except Exception:
                 continue
+
+        # 아이콘은 찾았지만 버튼→카드 매칭이 안 된 경우: 카드 컨테이너 기준으로 폴백 (카드별 거래내역 버튼 직접 찾기)
+        if not card_items and icons:
+            print("[POPUP_DEBUG] 버튼→카드 매칭 실패, 카드 컨테이너 기준 폴백 시도")
+            fallback_infos = driver.execute_script(
+                """
+var cards = document.querySelectorAll('div.rounded-lg.border, div[class*="rounded"][class*="border"]');
+var out = [];
+for (var c = 0; c < cards.length; c++) {
+  var card = cards[c];
+  var txt = (card.innerText || '').trim();
+  var keys = txt.match(/KEY[0-9A-Za-z]+/g);
+  if (!keys) continue;
+  var uniq = Array.from(new Set(keys));
+  if (uniq.length !== 1) continue;
+  var sid = uniq[0];
+  var badges = Array.from(card.querySelectorAll("span[data-slot='badge']")).map(function(el){ return (el.innerText||'').trim(); }).filter(Boolean);
+  var lines = txt.split('\\n').map(function(s){ return s.trim(); }).filter(Boolean);
+  var expiredByLine = lines.some(function(v){ var t = (v||'').replace(/\\s+/g,''); return t==='만료'||t==='취소'||t==='취소됨'||t==='취소완료'; });
+  var receiptBtn = card.querySelector('button[title="거래 내역"]') || card.querySelector('button[aria-label*="거래"]') || card.querySelector('button[aria-label*="내역"]');
+  if (!receiptBtn) {
+    var btns = card.querySelectorAll('button');
+    for (var b = 0; b < btns.length; b++) {
+      var btn = btns[b];
+      var label = (btn.getAttribute('aria-label')||'') + (btn.title||'') + (btn.innerText||'');
+      if (label.indexOf('거래') >= 0 || label.indexOf('내역') >= 0) { receiptBtn = btn; break; }
+    }
+  }
+  if (!receiptBtn && card.querySelector('div.flex.gap-2')) receiptBtn = card.querySelector('div.flex.gap-2 button');
+  if (!receiptBtn) receiptBtn = card.querySelector('button');
+  if (!receiptBtn) continue;
+  out.push({ session_id: sid, title: lines[0]||'', is_expired: badges.some(function(b){ return b.indexOf('만료')>=0; }) || expiredByLine, badge_texts: badges, raw_text: txt, button: receiptBtn });
+}
+return out;
+""",
+            )
+            for info in (fallback_infos or []):
+                try:
+                    sid = str(info.get("session_id") or "").strip()
+                    if not sid:
+                        continue
+                    btn_el = info.get("button")
+                    if not btn_el:
+                        continue
+                    title = str(info.get("title") or "").strip()
+                    expired = bool(info.get("is_expired"))
+                    badge_texts = list(info.get("badge_texts") or [])
+                    raw_text = str(info.get("raw_text") or "")
+                    card_items.append((btn_el, sid, title, expired, badge_texts, raw_text))
+                except Exception:
+                    continue
+            if card_items:
+                print(f"[POPUP_DEBUG] 카드 폴백으로 {len(card_items)}건 수집")
+
         if not card_items:
+            print("[WARN] 결제링크 카드 매칭 실패: 아이콘은 있으나 카드 정보를 추출하지 못했습니다.")
             _step_end("결제링크 관리 팝업 기반 동기화", t0)
             return False
+        # 동일 session_id가 여러 번 잡히는 경우가 있어 세션 단위로 병합한다.
+        # 병합 규칙: is_expired=True 가 하나라도 있으면 만료 우선.
+        merged_by_sid: dict[str, tuple] = {}
+        for item in card_items:
+            btn, sid, title, expired, badges, raw_text = item
+            prev = merged_by_sid.get(sid)
+            if prev is None:
+                merged_by_sid[sid] = item
+                continue
+            prev_btn, _, prev_title, prev_expired, prev_badges, prev_raw = prev
+            if expired and not prev_expired:
+                merged_by_sid[sid] = item
+                continue
+            if prev_expired and not expired:
+                continue
+            merged_title = prev_title if len(str(prev_title or "")) >= len(str(title or "")) else title
+            merged_badges = list(prev_badges or [])
+            for b in list(badges or []):
+                if b not in merged_badges:
+                    merged_badges.append(b)
+            merged_by_sid[sid] = (
+                prev_btn,
+                sid,
+                merged_title,
+                bool(prev_expired or expired),
+                merged_badges,
+                prev_raw if len(str(prev_raw or "")) >= len(str(raw_text or "")) else raw_text,
+            )
+        card_items = list(merged_by_sid.values())
+        _append_admin_log(
+            "CRAWLER",
+            f"결제링크 행 스캔 시작 rows={len(card_items)}, allow_popup_for_non_expired={allow_popup_for_non_expired}",
+        )
 
         # 모든 카드를 순차적으로 처리 (세션ID 기준으로 신규만)
-        for idx, (card, btn) in enumerate(card_items, start=1):
+        processed_count = 0
+        expired_count = 0
+        duplicate_count = 0
+        no_session_count = 0
+        seen_session_ids: set[str] = set()
+        for idx, (btn, sid_hint, title_hint, expired_hint, badge_texts, raw_text_hint) in enumerate(card_items, start=1):
             try:
-                card_text = card.text or ""
-                lines = [ln.strip() for ln in card_text.splitlines() if ln.strip()]
+                card_text = str(raw_text_hint or "")
+                lines: list[str] = [ln.strip() for ln in card_text.splitlines() if ln.strip()]
                 print(f"[CARD_DEBUG] 원시 카드 텍스트 (index={idx}): {lines}")
-                # 1단계: 상태 배지(span[data-slot='badge'])에 '만료' 가 있는지 최우선으로 확인
-                is_expired = False
-                try:
-                    badge_spans = card.find_elements(
-                        By.XPATH, ".//span[@data-slot='badge']"
-                    )
-                    badge_texts = [b.text.strip() for b in badge_spans if b.text.strip()]
-                    if any("만료" in bt for bt in badge_texts):
-                        is_expired = True
-                        print(f"[TTL_DEBUG] 상태 배지에서 '만료' 감지 → is_expired=True (badges={badge_texts})")
-                    else:
-                        print(f"[TTL_DEBUG] 상태 배지들={badge_texts} → '만료' 없음")
-                except Exception as e:
-                    print(f"[TTL_DEBUG] 상태 배지 확인 중 오류: {e}")
 
-                # 2단계: 배지에서 '만료'가 아니고, 유효시간 줄에 '분' 이 있으면 만료 아님으로 강제
-                if not is_expired and any("분" in ln for ln in lines):
-                    print("[TTL_DEBUG] 상태 배지에는 '만료' 없고, 유효시간 라인에 '분' 포함 → 만료 아님으로 간주")
-                    is_expired = False
+                is_expired = bool(expired_hint)
+                if is_expired:
+                    print(f"[TTL_DEBUG] 상태 배지에서 '만료' 감지 → is_expired=True (badges={badge_texts})")
+                else:
+                    print(f"[TTL_DEBUG] 상태 배지들={badge_texts} → '만료' 없음")
 
-                session_id = ""
-                product_title = ""
+                session_id = sid_hint or ""
+                product_title = title_hint or ""
                 for ln in lines:
                     if not product_title:
                         product_title = ln  # 첫 줄 정도를 제목으로 사용
@@ -2424,18 +2812,130 @@ def _scan_payment_link_popups_and_sync(driver: webdriver.Chrome) -> bool:
                         if m:
                             session_id = m.group(1)
 
+                # 한 카드/행 안에 세션ID가 여러 개 보이면 비정상 컨테이너로 판단하고 건너뛴다.
+                all_keys = list(dict.fromkeys(re.findall(r"(KEY[0-9A-Za-z]+)", card_text)))
+                if len(all_keys) > 1:
+                    print(f"[CARD_DEBUG] 다중 세션ID 컨테이너 감지(index={idx}, keys={all_keys[:4]}...) → 스킵")
+                    continue
+
+                # 배지 만료가 없더라도 만료일시가 현재보다 이전이면 만료로 간주한다.
+                # (가상 스크롤/축약 렌더링으로 배지 추출이 누락되는 경우 보정)
+                if not is_expired:
+                    expire_at = _extract_expire_at_from_lines(lines)
+                    now_kvan = _kvan_now()
+                    if expire_at and expire_at <= now_kvan:
+                        is_expired = True
+                        print(
+                            "[TTL_DEBUG] 만료일시 경과 감지 → is_expired=True "
+                            f"(expire_at={expire_at.isoformat()}, now_kvan={now_kvan.isoformat()})"
+                        )
+
                 # 세션 ID 가 없는 행(헤더/틀 행 등)은 실제 결제링크 카드가 아니므로 건너뜀
                 if not session_id:
+                    no_session_count += 1
                     print(f"[CARD_DEBUG] 세션ID 없음 → 헤더/비카드로 판단, 건너뜀 (index={idx}, title={product_title})")
                     continue
 
+                # 동일 세션을 한 사이클에서 반복 처리하지 않는다.
+                if session_id in seen_session_ids:
+                    duplicate_count += 1
+                    print(f"[CARD_DEBUG] 중복 세션ID 스킵 (session_id={session_id}, index={idx})")
+                    continue
+                seen_session_ids.add(session_id)
+                processed_count += 1
+
                 print(f"[CARD_DEBUG] 인덱스={idx}, 세션ID={session_id}, 제목={product_title}, is_expired={is_expired}")
+                # 만료 카드: 거래 내역 유무에 따라 삭제(거래없음) vs DB저장+어드민 알림(거래있음)
+                # 다이얼로그 대기/닫기 0.3초로 짧게 해서 리스트 크롤링 속도 확보
+                if is_expired:
+                    # 거래 내역 버튼 클릭 → 팝업에서 유무 확인 (재시도 시 0.15초만 대기)
+                    click_ok = False
+                    for _ in range(10):
+                        try:
+                            driver.execute_script(
+                                "arguments[0].scrollIntoView({behavior:'instant',block:'center'});",
+                                btn,
+                            )
+                            time.sleep(0.03)
+                            driver.execute_script("arguments[0].click();", btn)
+                            click_ok = True
+                            break
+                        except Exception:
+                            time.sleep(0.15)
+                    if not click_ok:
+                        _mark_session_deleted(session_id, product_title)
+                        expired_count += 1
+                        changed = True
+                        continue
+                    # 만료 카드용 팝업 대기: 최대 2초 (5초 대기 축소)
+                    try:
+                        short_wait = WebDriverWait(driver, 2)
+                        dialog = short_wait.until(
+                            EC.visibility_of_element_located(
+                                (
+                                    By.XPATH,
+                                    "//div[@role='dialog' and .//h2[normalize-space()='거래 내역']]",
+                                )
+                            )
+                        )
+                    except TimeoutException:
+                        _mark_session_deleted(session_id, product_title)
+                        expired_count += 1
+                        changed = True
+                        continue
+                    popup_text = dialog.text or ""
+                    has_no_history = (
+                        "거래 내역이 없습니다" in popup_text
+                        or "거래 내역 없음" in popup_text
+                    )
+                    if has_no_history:
+                        _close_dialog(driver, dialog)
+                        _mark_session_deleted(session_id, product_title)
+                        expired_count += 1
+                        _append_admin_log("CRAWLER", f"만료+거래없음 세션 삭제 session_id={session_id}")
+                        changed = True
+                        continue
+                    # 만료 but 거래 내역 있음 → DB 저장 후 어드민 알림 목록에 추가
+                    rows = dialog.find_elements(By.XPATH, ".//table//tbody//tr")
+                    agency_id = _get_agency_id_for_session(session_id)
+                    if rows:
+                        try:
+                            row = rows[0]
+                            tx_type = row.find_element(
+                                By.XPATH, ".//span[contains(@data-slot,'badge')]"
+                            ).text.strip()
+                            amount_text = row.find_element(By.XPATH, ".//td[3]//span").text.strip()
+                            amt = _parse_amount(amount_text)
+                            approval_no = row.find_element(By.XPATH, ".//td[4]").text.strip()
+                            customer_name = row.find_element(By.XPATH, ".//td[5]").text.strip()
+                            card_number = row.find_element(By.XPATH, ".//td[6]//span").text.strip()
+                            registered_at = row.find_element(By.XPATH, ".//td[7]").text.strip()
+                            if "결제 승인" in tx_type and amt:
+                                _sync_popup_transaction_to_internal(
+                                    session_id=session_id,
+                                    amount=amt,
+                                    approval_no=approval_no,
+                                    card_number=card_number,
+                                    registered_at=registered_at,
+                                    customer_name=customer_name,
+                                )
+                        except Exception as e_parse:
+                            print(f"[WARN] 만료+거래있음 행 파싱 실패: {e_parse}")
+                    _mark_session_expired_with_transactions(session_id, product_title, agency_id)
+                    _close_dialog(driver, dialog)
+                    expired_count += 1
+                    changed = True
+                    continue
+
                 if _is_session_already_processed(session_id):
                     print(f"[CARD_DEBUG] 이미 처리된 세션 → 건너뜀 (session_id={session_id})")
                     continue
 
-                # 거래 내역 버튼 클릭은 DOM 변동/레이아웃 지연 때문에 실패할 수 있으므로
-                # 0.3초 간격으로 여러 번 재시도하면서, 한 번이라도 성공하면 다음 단계로 진행한다.
+                if not allow_popup_for_non_expired:
+                    _mark_session_checked(session_id, product_title, has_approval=False)
+                    continue
+
+                # 거래 내역 버튼 클릭 재시도 시 0.15초 대기 (기존 0.3초 → 0.15초)
                 click_ok = False
                 for _ in range(10):
                     try:
@@ -2443,13 +2943,13 @@ def _scan_payment_link_popups_and_sync(driver: webdriver.Chrome) -> bool:
                             "arguments[0].scrollIntoView({behavior:'instant',block:'center'});",
                             btn,
                         )
-                        time.sleep(0.05)
+                        time.sleep(0.03)
                         driver.execute_script("arguments[0].click();", btn)
                         click_ok = True
                         break
                     except Exception as e_click:
                         print(f"[CARD_DEBUG] 거래 내역 버튼 클릭 재시도: {e_click}")
-                        time.sleep(0.3)
+                        time.sleep(0.15)
 
                 if not click_ok:
                     print("[WARN] 거래 내역 버튼 클릭 실패(여러 차례 재시도 후) → 다음 카드로 진행")
@@ -2477,14 +2977,8 @@ def _scan_payment_link_popups_and_sync(driver: webdriver.Chrome) -> bool:
                 )
 
                 if has_no_history:
-                    _close_dialog(dialog)
-                    if is_expired:
-                        if _click_trash_and_confirm(card, wait):
-                            print(f"[INFO] 만료 + 거래내역 없음 세션 삭제 시도: {session_id}")
-                            _mark_session_deleted(session_id, product_title)
-                            changed = True
-                    else:
-                        _mark_session_checked(session_id, product_title, has_approval=False)
+                    _close_dialog(driver, dialog)
+                    _mark_session_checked(session_id, product_title, has_approval=False)
                     continue
 
                 # 거래 내역이 하나 이상 있는 경우: 첫 번째 행 기준으로 승인 정보 파싱
@@ -2550,7 +3044,7 @@ def _scan_payment_link_popups_and_sync(driver: webdriver.Chrome) -> bool:
                 except Exception as e_row:
                     print(f"[WARN] '거래 내역' 팝업 파싱 중 오류: {e_row}")
                 finally:
-                    _close_dialog(dialog)
+                    _close_dialog(driver, dialog)
 
             except StaleElementReferenceException as e_card:
                 # 카드가 DOM 에서 사라진 경우(이미 삭제되었거나 새로고침됨)는
@@ -2561,6 +3055,11 @@ def _scan_payment_link_popups_and_sync(driver: webdriver.Chrome) -> bool:
                 print(f"[WARN] 결제링크 카드 처리 중 오류: {e_card}")
                 continue
 
+        _append_admin_log(
+            "CRAWLER",
+            "결제링크 행 스캔 종료 "
+            f"processed={processed_count}, expired={expired_count}, duplicate_skipped={duplicate_count}, no_session={no_session_count}, changed={changed}",
+        )
         _step_end("결제링크 관리 팝업 기반 동기화", t0)
     except Exception as e:
         print(f"[WARN] 결제링크 팝업 동기화 전반 오류: {e}")

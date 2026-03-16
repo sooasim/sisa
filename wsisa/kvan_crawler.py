@@ -1,5 +1,6 @@
 import os
 import time
+import argparse
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -24,6 +25,7 @@ from auto_kvan import (
     LOCAL_TEST,
     _go_to_payment_link,
     _has_payment_links_quick,
+    _wait_payment_link_page_ready,
     WAKEUP_FLAG_PATH,
     DATA_DIR,
 )
@@ -171,17 +173,19 @@ arguments[1].dispatchEvent(new Event('input', {bubbles:true}));
     submit_btn.click()
     _dbg(f"로그인 버튼 클릭 완료 (elapsed={time.time() - t0_submit:.2f}s)")
 
-    # 2026-03: PIN 입력 단계가 사라짐 → 더 이상 PIN 팝업을 기다리지 않고 바로 리다이렉트만 확인
-
-    # 리다이렉트 확인 (최대 2초)
+    # 2026-03: PIN 입력 단계가 사라짐. SSO(Keycloak) 경유 시 리다이렉트가 수 초 걸리므로 18초 대기.
+    # 로그인 후 반드시 store.k-van.app 으로 와야 크롤링 가능 (sso.oneque.net 에 머물면 결제링크 크롤링 실패).
     try:
         t0_redirect = time.time()
-        WebDriverWait(driver, 2).until(
-            EC.url_contains("store.k-van.app")
-        )
-        _dbg(f"로그인 후 URL 리다이렉트 감지 (elapsed={time.time() - t0_redirect:.2f}s)")
+
+        def _store_ready(d):
+            cur = d.current_url or ""
+            return "store.k-van.app" in cur and "sso.oneque.net" not in cur
+
+        WebDriverWait(driver, 18).until(_store_ready)
+        _dbg(f"로그인 후 store.k-van.app 안정 도달 (elapsed={time.time() - t0_redirect:.2f}s)")
     except TimeoutException:
-        print("[WARN][crawler] 로그인 후 리다이렉트 URL 확인 실패(계속 진행).")
+        print("[WARN][crawler] 로그인 후 store.k-van.app 리다이렉트 실패(18초). 현재 URL로 진행.")
     finally:
         _dbg(f"_simple_sign_in 전체 완료 (total_elapsed={time.time() - t0_all:.2f}s, url={driver.current_url})")
 
@@ -213,7 +217,7 @@ def _wait_with_wakeup(total_delay: int) -> None:
             pass
 
 
-def run_crawler_loop() -> None:
+def run_crawler_loop(max_cycles: int = 0, max_runtime_sec: int = 0) -> None:
     """
     링크/거래/대시보드 상태 추적용 크롤러 메인 루프.
     - 링크 생성/결제는 auto_kvan.py 가 담당
@@ -234,6 +238,8 @@ def run_crawler_loop() -> None:
         _alog("로그인 완료. 주기 크롤링 루프 시작")
         if LOCAL_TEST:
             print("[crawler] LOCAL_TEST 모드: DB 관련 쓰기는 auto_kvan 에서 모두 건너뜁니다.")
+            print("[crawler] 참고: DB 저장/동기화까지 검증하려면 SISA_LOCAL_TEST=0 으로 실행하세요.")
+            print("[crawler] LOCAL_TEST 시 mark_expired_sessions_from_kvan_links 는 호출하지 않아 대기 없이 바로 팝업 스캔으로 진행합니다.")
         _dbg(f"로그인 직후 current_url={driver.current_url}")
 
         # 로그인 직후에는 대시보드 크롤링을 하지 말고,
@@ -253,7 +259,13 @@ def run_crawler_loop() -> None:
         cycle = 0
         empty_cycles = 0  # 연속으로 "링크 없음"으로 판정된 사이클 수
 
+        started_ts = time.time()
         while True:
+            if max_runtime_sec > 0 and (time.time() - started_ts) >= max_runtime_sec:
+                msg = f"테스트 종료: 최대 실행시간 도달 ({max_runtime_sec}s)"
+                print(f"[crawler] {msg}")
+                _alog(msg)
+                break
             _touch_heartbeat()
             loop_start = time.strftime("%Y-%m-%d %H:%M:%S")
             print(f"[crawler] 크롤링 사이클 시작: {loop_start}")
@@ -261,6 +273,17 @@ def run_crawler_loop() -> None:
             _dbg(f"사이클 {cycle} 시작, 현재 URL={driver.current_url}")
 
             had_new = False
+            stop_by_runtime = False
+
+            def _runtime_guard() -> bool:
+                nonlocal stop_by_runtime
+                if max_runtime_sec > 0 and (time.time() - started_ts) >= max_runtime_sec:
+                    stop_by_runtime = True
+                    msg = f"테스트 종료: 최대 실행시간 도달 ({max_runtime_sec}s)"
+                    print(f"[crawler] {msg}")
+                    _alog(msg)
+                    return True
+                return False
 
             try:
                 # 2026-03: 대시보드 화면이 '권한 확인 중...' 스피너와 리다이렉트 구조로 바뀌어
@@ -273,25 +296,35 @@ def run_crawler_loop() -> None:
                 _dbg("결제링크 목록 크롤링 시작 (_scrape_payment_links_and_store)")
                 _scrape_payment_links_and_store(driver)
                 _dbg(f"결제링크 목록 크롤링 종료 (elapsed={time.time() - t_links:.2f}s, url={driver.current_url})")
-                try:
-                    mark_expired_sessions_from_kvan_links()
-                except Exception as _e:
-                    _dbg(f"링크 만료 세션 반영 스킵: {_e}")
+                # LOCAL_TEST 시 DB 미연결로 타임아웃 대기 방지 → mark_expired 생략 후 바로 다음 단계(팝업 스캔 등) 진행
+                if not LOCAL_TEST:
+                    try:
+                        mark_expired_sessions_from_kvan_links()
+                    except Exception as _e:
+                        _dbg(f"링크 만료 세션 반영 스킵: {_e}")
+                if _runtime_guard():
+                    break
 
                 # 1-1) 현재 결제링크가 화면에 남아 있는지 간단히 확인
                 # (팝업 스캔 여부를 결정하는 용도, empty_cycles 업데이트는 루프 끝에서 수행)
                 has_links = _has_payment_links_quick(driver)
 
-                # 2) 결제링크 관리 화면의 '거래 내역' 팝업을 통해
-                #    세션ID/금액/승인번호/카드번호 정보를 내부 DB와 세션에 반영
-                #    (링크가 있을 때만 의미가 있으므로, 링크가 전혀 없으면 스킵)
+                # 2) 결제링크 관리 화면 동기화
+                #    - 리스트는 항상 순회해 만료를 즉시 처리
+                #    - 활성 세션이 없으면 비만료 건의 팝업 파싱은 생략해 사이클을 단축
+                active_for_popup = _has_active_sessions(window_minutes=30)
                 if has_links:
                     t_popup = time.time()
                     _dbg("결제링크 팝업 스캔 시작 (_scan_payment_link_popups_and_sync)")
-                    if _scan_payment_link_popups_and_sync(driver):
+                    if _scan_payment_link_popups_and_sync(
+                        driver,
+                        allow_popup_for_non_expired=active_for_popup,
+                    ):
                         had_new = True
                         _dbg("결제링크 팝업 스캔에서 신규 변화 감지 (had_new=True)")
                     _dbg(f"결제링크 팝업 스캔 종료 (elapsed={time.time() - t_popup:.2f}s, url={driver.current_url})")
+                if _runtime_guard():
+                    break
 
                 # 3) 결제 및 취소 내역(/transactions)으로 이동해서 새로고침 후
                 #    추가 승인/취소 내역을 DB(kvan_transactions)에 반영
@@ -299,6 +332,8 @@ def run_crawler_loop() -> None:
                 _dbg("거래내역 크롤링 시작 (_scrape_transactions_and_store)")
                 _scrape_transactions_and_store(driver)
                 _dbg(f"거래내역 크롤링 종료 (elapsed={time.time() - t_tx:.2f}s, url={driver.current_url})")
+                if _runtime_guard():
+                    break
 
                 # 4) K-VAN 테이블(kvan_transactions, kvan_links) → 내부 transactions 매핑/갱신
                 t_sync = time.time()
@@ -307,12 +342,15 @@ def run_crawler_loop() -> None:
                     had_new = True
                     _dbg("K-VAN → transactions 동기화에서 신규/갱신 발생 (had_new=True)")
                 _dbg(f"K-VAN → transactions 동기화 종료 (elapsed={time.time() - t_sync:.2f}s)")
+                if _runtime_guard():
+                    break
 
                 # 5) 한 사이클을 마무리하기 전에 다시 결제링크 관리 화면으로 돌아와
                 #    새로고침 후 "링크 존재 여부"를 최종적으로 한 번 더 확인한다.
                 try:
                     if _go_to_payment_link(driver):
                         driver.refresh()
+                        _wait_payment_link_page_ready(driver)
                         has_links_end = _has_payment_links_quick(driver)
                         if has_links_end:
                             empty_cycles = 0
@@ -348,7 +386,16 @@ def run_crawler_loop() -> None:
                     _alog(f"[ERROR] 재로그인 시도 중 오류: {e2}")
                     _dbg(f"재로그인 단계에서 예외 발생: {e2!r}")
 
+            if stop_by_runtime:
+                break
+
             cycle += 1
+
+            if max_cycles > 0 and cycle >= max_cycles:
+                msg = f"테스트 종료: 최대 사이클 도달 ({cycle}/{max_cycles})"
+                print(f"[crawler] {msg}")
+                _alog(msg)
+                break
 
             # 활성 세션/신규 변화/링크 존재 여부에 따라 대기 시간 결정
             # - 링크가 없고(empty_cycles>=3) 최근 3사이클 연속으로 비어 있으면: 10분에 한 번만 체크
@@ -380,9 +427,32 @@ def run_crawler_loop() -> None:
     finally:
         _alog("크롤러 종료 (driver.quit)")
         _touch_heartbeat()
-        driver.quit()
+        try:
+            driver.quit()
+        except Exception as e:
+            # 드라이버 세션이 이미 종료된 경우는 정상 종료로 간주
+            print(f"[crawler][WARN] driver.quit 종료 처리 중 예외(무시): {e}")
+
+
+def _parse_args() -> tuple[int, int]:
+    p = argparse.ArgumentParser(description="K-VAN 크롤러 실행")
+    p.add_argument(
+        "--max-cycles",
+        type=int,
+        default=int(os.environ.get("K_VAN_CRAWLER_MAX_CYCLES", "0")),
+        help="테스트용 최대 사이클 수 (0=무제한)",
+    )
+    p.add_argument(
+        "--max-seconds",
+        type=int,
+        default=int(os.environ.get("K_VAN_CRAWLER_MAX_SECONDS", "0")),
+        help="테스트용 최대 실행 시간(초) (0=무제한)",
+    )
+    args = p.parse_args()
+    return max(0, args.max_cycles), max(0, args.max_seconds)
 
 
 if __name__ == "__main__":
-    run_crawler_loop()
+    mc, ms = _parse_args()
+    run_crawler_loop(max_cycles=mc, max_runtime_sec=ms)
 
