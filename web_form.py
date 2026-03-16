@@ -515,6 +515,67 @@ def trigger_kvan_crawler_refresh() -> None:
         _append_hq_log("WEB", f"[ERROR] crawler 시작 실패: {e}")
 
 
+def _parse_log_ts(line: str) -> datetime | None:
+    """로그 한 줄에서 ISO 타임스탬프를 파싱한다."""
+    try:
+        ts_part = (line or "").split(" [", 1)[0].strip()
+        if not ts_part:
+            return None
+        return datetime.fromisoformat(ts_part)
+    except Exception:
+        return None
+
+
+def _detect_crawler_refresh_done(since_iso: str) -> tuple[bool, str]:
+    """
+    since_iso 이후 로그에 "한 사이클 완료/오류" 신호가 있으면 True를 반환.
+    """
+    try:
+        since_dt = datetime.fromisoformat((since_iso or "").strip())
+    except Exception:
+        since_dt = datetime.utcnow() - timedelta(seconds=120)
+
+    done_markers = (
+        "결제링크 목록 크롤링 종료",
+        "다음 크롤링까지",
+        "크롤링 중 오류",
+        "내비게이션 오류로 중단",
+        "crawler 시작 pid=",
+    )
+    latest_line = ""
+    if ADMIN_LOG_PATH.exists():
+        try:
+            with open(ADMIN_LOG_PATH, "r", encoding="utf-8") as f:
+                lines = f.readlines()[-1200:]
+            for ln in lines:
+                ts = _parse_log_ts(ln)
+                if not ts or ts < since_dt:
+                    continue
+                latest_line = ln.strip()
+                if any(m in ln for m in done_markers):
+                    return True, latest_line
+        except Exception:
+            pass
+    return False, latest_line
+
+
+@app.route("/api/crawler-refresh-status", methods=["GET"])
+def api_crawler_refresh_status():
+    """새로고침 요청 이후 크롤러 사이클 완료 여부를 반환."""
+    since = (request.args.get("since") or "").strip()
+    done, latest = _detect_crawler_refresh_done(since)
+    running = _crawler_is_running()
+    # 크롤러가 아예 꺼져 있고 새 로그가 없더라도, 무한 대기를 피하기 위해 done을 True로 처리.
+    if not running and not done:
+        done = True
+    return jsonify({
+        "ok": True,
+        "done": bool(done),
+        "running": bool(running),
+        "latest": latest,
+    })
+
+
 def trigger_auto_kvan_async(session_id: str | None = None) -> None:
     """결제 폼에서 주문 저장 후 auto_kvan.py 를 비동기로 실행.
 
@@ -2488,6 +2549,7 @@ def admin():
     sessions: list[dict] = []
     history: list[dict] = []
     message = ""
+    crawler_refresh_since = ""
     if Path(ADMIN_STATE_PATH).exists():
         try:
             with open(ADMIN_STATE_PATH, "r", encoding="utf-8") as f:
@@ -2667,6 +2729,7 @@ def admin():
         elif action == "refresh_kvan":
             try:
                 trigger_kvan_crawler_refresh()
+                crawler_refresh_since = datetime.utcnow().isoformat()
                 message = "K-VAN 크롤러 새로고침 신호를 보냈습니다. 잠시 후 최신 상태가 반영됩니다."
             except Exception as e:  # noqa: BLE001
                 message = f"K-VAN 새로고침 중 오류: {e}"
@@ -2795,6 +2858,7 @@ def admin():
         .btn-secondary:hover { background:#111827; }
         .hint { font-size:12px; color:#9ca3af; margin-top:4px; }
         .status-card { margin-top:18px; padding:14px 12px; border-radius:16px; background:#020617; border:1px dashed #374151; font-size:13px; }
+        .table-sticky thead th { position: sticky; top: 0; background: #0b1220; z-index: 3; }
         .status-title { font-size:13px; font-weight:600; color:#9ca3af; margin-bottom:6px; display:flex; align-items:center; gap:6px; }
         .status-row { display:flex; justify-content:space-between; margin-bottom:4px; gap:8px; }
         .status-label { color:#9ca3af; font-size:12px; }
@@ -2813,24 +2877,31 @@ def admin():
         @keyframes spin1 { to { transform: rotate(360deg); } }
         .pending-popup { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); z-index:2100; min-width:260px; max-width:90vw; background:#0f172a; border:1px solid #334155; border-radius:14px; padding:14px 16px; text-align:center; color:#e2e8f0; box-shadow:0 18px 48px rgba(2,6,23,.72); display:none; }
         .pending-popup.show { display:block; }
+        .pending-top-banner { position:fixed; top:76px; left:50%; transform:translateX(-50%); z-index:2090; display:none; align-items:center; gap:8px; background:#7c2d12; border:1px solid #fdba74; color:#fff7ed; border-radius:999px; padding:8px 14px; font-size:12px; font-weight:700; box-shadow:0 10px 24px rgba(124,45,18,.45); }
+        .pending-top-banner.show { display:flex; animation:pulseBanner 1.2s ease-in-out infinite; }
+        .pending-inline { margin-top:2px; padding:7px 10px; border-radius:10px; background:#7c2d12; border:1px solid #fdba74; color:#fff7ed; font-size:11px; font-weight:700; line-height:1.45; box-shadow:0 8px 16px rgba(124,45,18,.35); animation:pulseBanner 1.2s ease-in-out infinite; }
         .pending-dot { width:10px; height:10px; border-radius:999px; background:#60a5fa; display:inline-block; animation:pulseDot 1s infinite ease-in-out; }
         .pending-dot:nth-child(2) { animation-delay:.2s; }
         .pending-dot:nth-child(3) { animation-delay:.4s; }
+        @keyframes pulseBanner { 0%,100% { opacity:.92; } 50% { opacity:1; } }
         @keyframes pulseDot { 0%,100% { opacity:.2; transform:translateY(0);} 50% { opacity:1; transform:translateY(-2px);} }
       </style>
       <script>
         // /admin 페이지에서: 결제중인데 아직 K-VAN 링크가 없는 세션이 있으면
         // 한 번만 7초 후 자동 새로고침하고, 링크가 생성된 뒤에는 새로고침하지 않는다.
-        (function () {
+        window.addEventListener('DOMContentLoaded', function () {
           var hasPending = {{ 'true' if has_pending_link else 'false' }};
           var pendingPopup = document.getElementById("pending-create-popup");
+          var pendingBanner = document.getElementById("pending-create-banner");
           if (hasPending) {
             if (pendingPopup) pendingPopup.classList.add("show");
+            if (pendingBanner) pendingBanner.classList.add("show");
             setTimeout(function () {
               window.location.reload();
             }, 7000);
-          } else if (pendingPopup) {
-            pendingPopup.classList.remove("show");
+          } else {
+            if (pendingPopup) pendingPopup.classList.remove("show");
+            if (pendingBanner) pendingBanner.classList.remove("show");
           }
           // 새 링크 생성 후 리다이렉트된 경우(new=1)에는 팝업으로 한 번 안내
           var params = new URLSearchParams(window.location.search || "");
@@ -2838,10 +2909,51 @@ def admin():
           if (isNew && !hasPending) {
             alert("새 결제 링크 생성 작업이 완료되었습니다. 아래 '결제 요청 링크' 영역에서 복사 버튼을 확인해 주세요.");
           }
-        })();
+
+          // 수동 새로고침(refresh_kvan) 요청은 완료/오류 신호를 받을 때까지 진행 표시를 유지한다.
+          var refreshSince = "{{ crawler_refresh_since or '' }}";
+          var refreshOverlay = document.getElementById("crawler-refresh-overlay");
+          var refreshText = document.getElementById("crawler-refresh-text");
+          if (!refreshSince || !refreshOverlay) return;
+          var startedAt = Date.now();
+          refreshOverlay.classList.add("show");
+          function stopRefreshOverlay(finalText) {
+            if (refreshText && finalText) refreshText.textContent = finalText;
+            setTimeout(function () {
+              refreshOverlay.classList.remove("show");
+            }, 400);
+          }
+          function pollRefresh() {
+            fetch("/api/crawler-refresh-status?since=" + encodeURIComponent(refreshSince), { cache: "no-store" })
+              .then(function (r) { return r.json(); })
+              .then(function (d) {
+                if (d && d.ok && d.done) {
+                  stopRefreshOverlay("크롤러 상태 확인이 완료되었습니다.");
+                  return;
+                }
+                if (Date.now() - startedAt > 90000) {
+                  stopRefreshOverlay("크롤러 확인 시간이 초과되어 표시를 종료합니다.");
+                  return;
+                }
+                setTimeout(pollRefresh, 2500);
+              })
+              .catch(function () {
+                if (Date.now() - startedAt > 90000) {
+                  stopRefreshOverlay("네트워크 확인 시간 초과로 표시를 종료합니다.");
+                  return;
+                }
+                setTimeout(pollRefresh, 3000);
+              });
+          }
+          pollRefresh();
+        });
       </script>
     </head>
     <body class="bg-brand-blue text-white font-sans overflow-x-hidden antialiased flex flex-col min-h-screen">
+      <div id="pending-create-banner" class="pending-top-banner" aria-hidden="true">
+        <i class="fa-solid fa-spinner fa-spin"></i>
+        <span>K-VAN 링크 생성 중</span>
+      </div>
       <div id="pending-create-popup" class="pending-popup" aria-hidden="true">
         <div style="font-size:13px;font-weight:700; margin-bottom:6px;">링크 생성중입니다</div>
         <div style="font-size:11px; color:#94a3b8; margin-bottom:8px;">생성이 완료되면 자동으로 반영됩니다.</div>
@@ -2851,7 +2963,7 @@ def admin():
       </div>
       <!-- 헤더 -->
       <header class="fixed top-0 left-0 right-0 z-30 glass-card border-b border-white/10">
-        <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
+        <div class="max-w-[96vw] mx-auto px-4 py-3 flex items-center justify-between">
           <div class="flex items-center gap-2">
             <i class="fa-solid fa-globe text-white text-xl drop-shadow-sm"></i>
             <div class="flex flex-col leading-tight">
@@ -2872,8 +2984,15 @@ def admin():
           <div style="margin-top:4px;font-size:11px;color:#94a3b8;">잠시만 기다려 주세요.</div>
         </div>
       </div>
+      <div id="crawler-refresh-overlay" class="loading-backdrop" aria-hidden="true">
+        <div class="loading-card">
+          <div class="loading-spinner"></div>
+          <div id="crawler-refresh-text" style="font-size:13px;font-weight:600;">크롤러 작업 진행중...</div>
+          <div style="margin-top:4px;font-size:11px;color:#94a3b8;">결과를 확인하면 자동으로 종료됩니다.</div>
+        </div>
+      </div>
       <main class="flex-grow pt-24 pb-12 px-3 sm:px-4">
-        <div class="max-w-4xl mx-auto">
+        <div class="max-w-[96vw] mx-auto">
           <div class="glass-card rounded-[2rem] border border-white/20 shadow-2xl">
             <div class="admin-card-inner">
               <div class="flex items-center justify-between mb-4">
@@ -2971,7 +3090,7 @@ def admin():
                           </form>
                         </div>
                         {% else %}
-                        <div class="hint">K-VAN 링크를 생성 중입니다. 잠시 후 새로고침 해 주세요.</div>
+                        <div class="pending-inline">K-VAN 링크를 생성 중입니다. 잠시 후 새로고침 해 주세요.</div>
                         {% endif %}
                       </div>
                       <form method="post" action="{{ url_for('admin') }}" style="margin-top:6px; display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
@@ -3063,7 +3182,7 @@ def admin():
                 </div>
                 {% if recent_links %}
                   <div style="max-height:200px; overflow-y:auto; font-size:11px; margin-top:4px;">
-                    <table style="width:100%; border-collapse:collapse;">
+                    <table class="table-sticky" style="width:100%; border-collapse:collapse;">
                       <thead>
                         <tr style="border-bottom:1px solid rgba(148,163,184,0.4);">
                           <th style="padding:3px 4px; text-align:left;">생성시각</th>
@@ -3100,7 +3219,7 @@ def admin():
                 </div>
                 {% if recent_tx %}
                   <div style="max-height:200px; overflow-y:auto; font-size:11px; margin-top:4px;">
-                    <table style="width:100%; border-collapse:collapse;">
+                    <table class="table-sticky" style="width:100%; border-collapse:collapse;">
                       <thead>
                         <tr style="border-bottom:1px solid rgba(148,163,184,0.4);">
                           <th style="padding:3px 4px; text-align:left;">시간</th>
@@ -3204,6 +3323,7 @@ def admin():
         recent_links=recent_links,
         recent_tx=recent_tx,
         has_pending_link=has_pending_link,
+        crawler_refresh_since=crawler_refresh_since,
     )
 
 
@@ -3363,6 +3483,7 @@ def hq_admin():
     agencies = state.get("agencies") or []
     transactions = state.get("transactions") or []
     message = ""
+    crawler_refresh_since = ""
 
     # 최신 K-VAN 대시보드 스냅샷 1건 조회
     latest_dashboard = None
@@ -3423,6 +3544,7 @@ def hq_admin():
             # 수동으로 K-VAN 크롤링 매크로를 한 번 더 실행
             try:
                 trigger_kvan_crawler_refresh()
+                crawler_refresh_since = datetime.utcnow().isoformat()
                 message = "K-VAN 크롤러 새로고침 신호를 보냈습니다. 로그 박스에서 상세 진행 상태를 확인해 주세요."
             except Exception as e:  # noqa: BLE001
                 print(f"[WARN] HQ에서 refresh_kvan 실행 중 오류: {e}")
@@ -3711,6 +3833,41 @@ def hq_admin():
         window.addEventListener('load', runOverlayCleanupBurst);
         // Safari/Chrome의 뒤로가기 캐시(bfcache) 복원 시 load가 실행되지 않을 수 있다.
         window.addEventListener('pageshow', runOverlayCleanupBurst);
+        window.addEventListener('DOMContentLoaded', function () {
+          var refreshSince = "{{ crawler_refresh_since or '' }}";
+          var overlay = document.getElementById("crawler-refresh-overlay");
+          var textEl = document.getElementById("crawler-refresh-text");
+          if (!refreshSince || !overlay) return;
+          var startedAt = Date.now();
+          overlay.classList.add("show");
+          function stopOverlay(msg) {
+            if (textEl && msg) textEl.textContent = msg;
+            setTimeout(function () { overlay.classList.remove("show"); }, 400);
+          }
+          function poll() {
+            fetch("/api/crawler-refresh-status?since=" + encodeURIComponent(refreshSince), { cache: "no-store" })
+              .then(function (r) { return r.json(); })
+              .then(function (d) {
+                if (d && d.ok && d.done) {
+                  stopOverlay("크롤러 상태 확인이 완료되었습니다.");
+                  return;
+                }
+                if (Date.now() - startedAt > 90000) {
+                  stopOverlay("크롤러 확인 시간이 초과되어 표시를 종료합니다.");
+                  return;
+                }
+                setTimeout(poll, 2500);
+              })
+              .catch(function () {
+                if (Date.now() - startedAt > 90000) {
+                  stopOverlay("네트워크 확인 시간 초과로 표시를 종료합니다.");
+                  return;
+                }
+                setTimeout(poll, 3000);
+              });
+          }
+          poll();
+        });
       </script>
       <style>
         /* 결제 폼에서 사용하던 결과 모달 오버레이가 남아 있어도 HQ 어드민에서는 항상 숨긴다. */
@@ -3722,6 +3879,12 @@ def hq_admin():
           display: none !important;
           pointer-events: none !important;
         }
+        .loading-backdrop { position:fixed; inset:0; background:rgba(2,6,23,0.78); display:none; align-items:center; justify-content:center; z-index:2000; }
+        .loading-backdrop.show { display:flex; }
+        .loading-card { background:#0f172a; border:1px solid #334155; border-radius:14px; padding:16px 18px; color:#e2e8f0; min-width:240px; text-align:center; box-shadow:0 18px 44px rgba(2,6,23,0.65); }
+        .loading-spinner { width:28px; height:28px; border:3px solid #475569; border-top-color:#60a5fa; border-radius:50%; margin:0 auto 10px; animation:spinHQ 0.8s linear infinite; }
+        @keyframes spinHQ { to { transform: rotate(360deg); } }
+        .overflow-x-auto thead th { position: sticky; top: 0; background: rgba(15,23,42,0.96); z-index: 3; }
       </style>
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
       <script src="https://cdn.tailwindcss.com"></script>
@@ -3740,7 +3903,7 @@ def hq_admin():
     </head>
     <body class="bg-brand-blue text-white font-sans overflow-x-hidden antialiased min-h-screen flex flex-col">
       <header class="fixed top-0 left-0 right-0 z-30 bg-brand-dark/80 backdrop-blur border-b border-white/10">
-        <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+        <div class="max-w-[96vw] mx-auto px-4 py-3 flex items-center justify-between">
           <div class="flex items-center gap-2">
             <i class="fa-solid fa-shield-halved text-white text-xl"></i>
             <div class="flex flex-col leading-tight">
@@ -3767,8 +3930,15 @@ def hq_admin():
           </div>
         </div>
       </header>
+      <div id="crawler-refresh-overlay" class="loading-backdrop" aria-hidden="true">
+        <div class="loading-card">
+          <div class="loading-spinner"></div>
+          <div id="crawler-refresh-text" style="font-size:13px;font-weight:600;">크롤러 작업 진행중...</div>
+          <div style="margin-top:4px;font-size:11px;color:#94a3b8;">결과를 확인하면 자동으로 종료됩니다.</div>
+        </div>
+      </div>
       <main class="flex-grow pt-20 pb-10 px-3 sm:px-4">
-        <div class="max-w-6xl mx-auto space-y-8">
+        <div class="max-w-[96vw] mx-auto space-y-8">
           {% if history_warnings.warn_7_days or history_warnings.warn_3_days %}
           <script>
             window.addEventListener('load', function () {
@@ -4472,6 +4642,7 @@ def hq_admin():
         admin_logs=admin_logs,
         admin_log_path=str(ADMIN_LOG_PATH),
         payment_notifications_count=payment_notifications_count,
+        crawler_refresh_since=crawler_refresh_since,
     )
 
 
@@ -4550,6 +4721,7 @@ def agency_admin():
                 _append_hq_log("WEB", f"[AUTO-HEAL][WARN] 대행사 주문 JSON 재생성 실패 session_id={sid}: {_e}")
 
     message = ""
+    crawler_refresh_since = ""
     base_url = request.url_root.rstrip("/")
 
     if request.method == "POST":
@@ -4653,6 +4825,7 @@ def agency_admin():
             # 대행사 어드민에서 수동으로 K-VAN 크롤링 매크로를 한 번 더 실행
             try:
                 trigger_kvan_crawler_refresh()
+                crawler_refresh_since = datetime.utcnow().isoformat()
                 message = "K-VAN 크롤러 새로고침 신호를 보냈습니다. 잠시 후 최신 데이터가 반영됩니다."
             except Exception as e:  # noqa: BLE001
                 print(f"[WARN] Agency에서 refresh_kvan 실행 중 오류: {e}")
@@ -4720,16 +4893,55 @@ def agency_admin():
           if (vp) vp.setAttribute('content', 'width=1280');
         }
         // 결제중이면서 링크가 아직 없는 세션이 있을 때만 7초 후 한 번 자동 새로고침한다.
-        var hasPending = {{ 'true' if has_pending_link else 'false' }};
-        var pendingPopup = document.getElementById("pending-create-popup");
-        if (hasPending) {
-          if (pendingPopup) pendingPopup.classList.add("show");
-          setTimeout(function () {
-            location.reload();
-          }, 7000);
-        } else if (pendingPopup) {
-          pendingPopup.classList.remove("show");
-        }
+        window.addEventListener('DOMContentLoaded', function () {
+          var hasPending = {{ 'true' if has_pending_link else 'false' }};
+          var pendingPopup = document.getElementById("pending-create-popup");
+          var pendingBanner = document.getElementById("pending-create-banner");
+          if (hasPending) {
+            if (pendingPopup) pendingPopup.classList.add("show");
+            if (pendingBanner) pendingBanner.classList.add("show");
+            setTimeout(function () {
+              location.reload();
+            }, 7000);
+          } else {
+            if (pendingPopup) pendingPopup.classList.remove("show");
+            if (pendingBanner) pendingBanner.classList.remove("show");
+          }
+
+          var refreshSince = "{{ crawler_refresh_since or '' }}";
+          var refreshOverlay = document.getElementById("crawler-refresh-overlay");
+          var refreshText = document.getElementById("crawler-refresh-text");
+          if (!refreshSince || !refreshOverlay) return;
+          var startedAt = Date.now();
+          refreshOverlay.classList.add("show");
+          function stopRefresh(msg) {
+            if (refreshText && msg) refreshText.textContent = msg;
+            setTimeout(function () { refreshOverlay.classList.remove("show"); }, 400);
+          }
+          function pollRefresh() {
+            fetch("/api/crawler-refresh-status?since=" + encodeURIComponent(refreshSince), { cache: "no-store" })
+              .then(function (r) { return r.json(); })
+              .then(function (d) {
+                if (d && d.ok && d.done) {
+                  stopRefresh("크롤러 상태 확인이 완료되었습니다.");
+                  return;
+                }
+                if (Date.now() - startedAt > 90000) {
+                  stopRefresh("크롤러 확인 시간이 초과되어 표시를 종료합니다.");
+                  return;
+                }
+                setTimeout(pollRefresh, 2500);
+              })
+              .catch(function () {
+                if (Date.now() - startedAt > 90000) {
+                  stopRefresh("네트워크 확인 시간 초과로 표시를 종료합니다.");
+                  return;
+                }
+                setTimeout(pollRefresh, 3000);
+              });
+          }
+          pollRefresh();
+        });
         // 결제 페이지의 결과 모달/오버레이가 남아 있는 경우를 대비해 강제로 숨긴다.
         function hideStaleOverlays() {
           var sels = [
@@ -4780,10 +4992,15 @@ def agency_admin():
         @keyframes spin2 { to { transform: rotate(360deg); } }
         .pending-popup { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); z-index:2100; min-width:260px; max-width:90vw; background:#0f172a; border:1px solid #334155; border-radius:14px; padding:14px 16px; text-align:center; color:#e2e8f0; box-shadow:0 18px 48px rgba(2,6,23,.72); display:none; }
         .pending-popup.show { display:block; }
+        .pending-top-banner { position:fixed; top:72px; left:50%; transform:translateX(-50%); z-index:2090; display:none; align-items:center; gap:8px; background:#7c2d12; border:1px solid #fdba74; color:#fff7ed; border-radius:999px; padding:8px 14px; font-size:12px; font-weight:700; box-shadow:0 10px 24px rgba(124,45,18,.45); }
+        .pending-top-banner.show { display:flex; animation:pulseBanner2 1.2s ease-in-out infinite; }
+        .pending-inline { margin-top:2px; padding:7px 10px; border-radius:10px; background:#7c2d12; border:1px solid #fdba74; color:#fff7ed; font-size:11px; font-weight:700; line-height:1.45; box-shadow:0 8px 16px rgba(124,45,18,.35); animation:pulseBanner2 1.2s ease-in-out infinite; }
         .pending-dot { width:10px; height:10px; border-radius:999px; background:#60a5fa; display:inline-block; animation:pulseDot2 1s infinite ease-in-out; }
         .pending-dot:nth-child(2) { animation-delay:.2s; }
         .pending-dot:nth-child(3) { animation-delay:.4s; }
+        @keyframes pulseBanner2 { 0%,100% { opacity:.92; } 50% { opacity:1; } }
         @keyframes pulseDot2 { 0%,100% { opacity:.2; transform:translateY(0);} 50% { opacity:1; transform:translateY(-2px);} }
+        .overflow-x-auto thead th { position: sticky; top: 0; background: rgba(15,23,42,0.96); z-index: 3; }
         /* 결제 폼에서 사용하던 결과 모달 오버레이가 남아 있어도 대행사 어드민에서는 항상 숨긴다. */
         #result-modal,
         .result-backdrop,
@@ -4796,6 +5013,10 @@ def agency_admin():
       </style>
     </head>
     <body class="bg-brand-blue text-white font-sans overflow-x-hidden antialiased min-h-screen flex flex-col">
+      <div id="pending-create-banner" class="pending-top-banner" aria-hidden="true">
+        <i class="fa-solid fa-spinner fa-spin"></i>
+        <span>K-VAN 링크 생성 중</span>
+      </div>
       <div id="pending-create-popup" class="pending-popup" aria-hidden="true">
         <div style="font-size:13px;font-weight:700; margin-bottom:6px;">링크 생성중입니다</div>
         <div style="font-size:11px; color:#94a3b8; margin-bottom:8px;">생성이 완료되면 자동으로 반영됩니다.</div>
@@ -4810,8 +5031,15 @@ def agency_admin():
           <div style="margin-top:4px;font-size:11px;color:#94a3b8;">잠시만 기다려 주세요.</div>
         </div>
       </div>
+      <div id="crawler-refresh-overlay" class="loading-backdrop" aria-hidden="true">
+        <div class="loading-card">
+          <div class="loading-spinner"></div>
+          <div id="crawler-refresh-text" style="font-size:13px;font-weight:600;">크롤러 작업 진행중...</div>
+          <div style="margin-top:4px;font-size:11px;color:#94a3b8;">결과를 확인하면 자동으로 종료됩니다.</div>
+        </div>
+      </div>
       <header class="fixed top-0 left-0 right-0 z-30 bg-brand-dark/80 backdrop-blur border-b border-white/10">
-        <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
+        <div class="max-w-[96vw] mx-auto px-4 py-3 flex items-center justify-between">
           <div class="flex items-center gap-2">
             <i class="fa-solid fa-store text-white text-xl"></i>
             <div class="flex flex-col leading-tight">
@@ -4833,7 +5061,7 @@ def agency_admin():
         </div>
       </header>
       <main class="flex-grow pt-20 pb-10 px-3 sm:px-4">
-        <div class="max-w-5xl mx-auto space-y-8">
+        <div class="max-w-[96vw] mx-auto space-y-8">
           {% if message %}
           <div class="bg-emerald-500/10 border border-emerald-400/40 text-emerald-100 text-sm px-4 py-3 rounded-xl">
             {{ message }}
@@ -4949,7 +5177,7 @@ def agency_admin():
                     </form>
                   </div>
                   {% else %}
-                  <span class="font-mono text-white/60 text-[10px]">K-VAN 링크를 생성 중입니다. 잠시 후 자동으로 표시됩니다.</span>
+                  <span class="pending-inline">K-VAN 링크를 생성 중입니다. 잠시 후 새로고침 해 주세요.</span>
                   {% endif %}
                   <form method="post" action="{{ url_for('agency_admin') }}">
                     <input type="hidden" name="action" value="delete_session">
@@ -5131,6 +5359,7 @@ def agency_admin():
         agency_transactions=agency_transactions,
         payment_notifications_count=payment_notifications_count,
         has_pending_link=has_pending_link,
+        crawler_refresh_since=crawler_refresh_since,
     )
 
 

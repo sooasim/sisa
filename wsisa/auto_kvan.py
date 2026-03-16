@@ -1583,7 +1583,8 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
             fallback_rows = driver.find_elements(
                 By.XPATH,
                 "//tr[.//*[contains(normalize-space(.),'KEY20')]]"
-                " | //div[.//*[contains(normalize-space(.),'KEY20')]]",
+                " | //*[@role='row'][.//*[contains(normalize-space(.),'KEY20')]]"
+                " | //div[contains(@class,'rounded') and .//*[contains(normalize-space(.),'KEY20')]]",
             )
             if not fallback_rows:
                 print("[INFO] /payment-link 에 표시된 결제링크가 없습니다.")
@@ -1647,11 +1648,7 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
                             break
 
                     # 상태: '사용중', '만료', '취소' 등 단어가 포함된 줄 추출
-                    status = ""
-                    for ln in lines:
-                        if any(k in ln for k in ("사용", "만료", "취소", "대기", "완료")):
-                            status = ln
-                            break
+                    status = _extract_status_from_link_lines(lines)
 
                     # MID / 세션ID: 'MID' 또는 '세션' 텍스트 기반
                     mid = ""
@@ -1754,8 +1751,8 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
                                 amount = _parse_amount(ln) or 0
                             if not ttl_label and ("분" in ln):
                                 ttl_label = ln
-                            if not status and any(k in ln for k in ("사용", "만료", "취소", "대기", "완료")):
-                                status = ln
+                            if not status:
+                                status = _extract_status_from_link_lines([ln])
                             if not mid and "MID" in ln.upper():
                                 mid = ln
                         cur.execute("DELETE FROM kvan_links WHERE kvan_link = %s", (link_text,))
@@ -1802,6 +1799,9 @@ def _is_expired_link_status(status_text: str) -> bool:
     s = str(status_text or "").strip()
     if not s:
         return False
+    # 테이블 헤더/설명 텍스트(예: "만료일시")는 만료 상태로 보지 않는다.
+    if "만료일시" in s:
+        return False
     if "만료" in s:
         return True
     if "취소 가능" in s or "취소가능" in s:
@@ -1809,6 +1809,37 @@ def _is_expired_link_status(status_text: str) -> bool:
     if s in ("취소", "취소됨", "취소 완료", "취소완료"):
         return True
     return False
+
+
+def _extract_status_from_link_lines(lines: list[str]) -> str:
+    """
+    결제링크 카드/행 텍스트에서 실제 상태 문구만 추출한다.
+    (헤더 문구의 '만료일시' 같은 단어로 인한 오탐 방지)
+    """
+    if not lines:
+        return ""
+    header_markers = (
+        "생성일시", "만료일시", "세션ID", "작업", "상호명", "상품명",
+        "유효시간", "본인인증", "결제 방식", "PG사", "MID"
+    )
+    exact_statuses = {
+        "사용", "사용중", "사용 중", "대기", "완료", "만료",
+        "취소", "취소됨", "취소 완료", "취소완료",
+    }
+    for raw in lines:
+        ln = str(raw or "").strip()
+        if not ln:
+            continue
+        if "취소 가능" in ln or "취소가능" in ln:
+            continue
+        if any(h in ln for h in header_markers):
+            continue
+        compact = ln.replace(" ", "")
+        if ln in exact_statuses or compact in {x.replace(" ", "") for x in exact_statuses}:
+            return ln
+        if "상태" in ln and any(k in ln for k in ("사용", "대기", "완료", "만료", "취소")):
+            return ln
+    return ""
 
 
 def mark_expired_sessions_from_kvan_links() -> None:
