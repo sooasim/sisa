@@ -2346,6 +2346,93 @@ def _click_trash_and_confirm(card, wait: WebDriverWait) -> bool:
         return False
 
 
+def _delete_kvan_link_by_receipt_btn(driver: webdriver.Chrome, receipt_btn, wait: WebDriverWait) -> bool:
+    """
+    거래내역(receipt) 버튼을 기준으로 같은 카드/행 안의 휴지통(삭제) 버튼을 찾아 클릭한다.
+    삭제 확인 다이얼로그가 나오면 '삭제' 버튼을 눌러 최종 확인한다.
+    반환값: 삭제 성공이면 True, 실패면 False.
+    """
+    try:
+        # receipt_btn 에서 위로 최대 12단계 부모를 탐색하며 휴지통 버튼을 찾는다.
+        trash_btn = driver.execute_script(
+            """
+var btn = arguments[0];
+var cur = btn;
+for (var d = 0; d < 12; d++) {
+  cur = cur.parentElement;
+  if (!cur) break;
+  // title='삭제' 버튼 직접 탐색
+  var trash = cur.querySelector('button[title="삭제"]');
+  if (!trash) {
+    // lucide-trash / lucide-trash-2 SVG 클래스로 탐색
+    var allBtns = cur.querySelectorAll('button');
+    for (var i = 0; i < allBtns.length; i++) {
+      var svgs = allBtns[i].querySelectorAll('svg');
+      for (var j = 0; j < svgs.length; j++) {
+        var cls = svgs[j].getAttribute('class') || '';
+        if (cls.indexOf('lucide-trash') >= 0) { trash = allBtns[i]; break; }
+      }
+      if (trash) break;
+    }
+  }
+  if (trash) return trash;
+}
+return null;
+""",
+            receipt_btn,
+        )
+        if not trash_btn:
+            print("[WARN] _delete_kvan_link_by_receipt_btn: 휴지통 버튼을 찾지 못했습니다.")
+            return False
+
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", trash_btn)
+        time.sleep(0.05)
+        driver.execute_script("arguments[0].click();", trash_btn)
+
+        # 삭제 확인 alertdialog 대기 (최대 3초)
+        try:
+            alert = WebDriverWait(driver, 3).until(
+                EC.visibility_of_element_located(
+                    (
+                        By.XPATH,
+                        "//div[@role='alertdialog']"
+                        " | //div[@data-slot='alert-dialog-content']",
+                    )
+                )
+            )
+        except TimeoutException:
+            print("[WARN] _delete_kvan_link_by_receipt_btn: 삭제 확인 다이얼로그를 찾지 못했습니다.")
+            return False
+
+        try:
+            confirm_btn = alert.find_element(By.XPATH, ".//button[normalize-space()='삭제']")
+        except Exception:
+            confirm_btn = WebDriverWait(driver, 2).until(
+                EC.element_to_be_clickable((By.XPATH, "//button[normalize-space()='삭제']"))
+            )
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", confirm_btn)
+        time.sleep(0.05)
+        driver.execute_script("arguments[0].click();", confirm_btn)
+
+        # 오버레이가 사라질 때까지 대기 (최대 2초)
+        try:
+            WebDriverWait(driver, 2).until_not(
+                EC.presence_of_element_located(
+                    (
+                        By.XPATH,
+                        "//div[@data-slot='alert-dialog-overlay' and @data-state='open']",
+                    )
+                )
+            )
+        except TimeoutException:
+            pass
+        time.sleep(0.2)
+        return True
+    except Exception as e:
+        print(f"[WARN] _delete_kvan_link_by_receipt_btn 오류: {e}")
+        return False
+
+
 def _is_session_already_processed(session_id: str) -> bool:
     """
     admin_state.json.history 에서 이미 has_approval 또는 deleted 플래그가 있는 세션이면 True.
@@ -2846,9 +2933,13 @@ return out;
 
                 print(f"[CARD_DEBUG] 인덱스={idx}, 세션ID={session_id}, 제목={product_title}, is_expired={is_expired}")
                 # 만료 카드: 거래 내역 유무에 따라 삭제(거래없음) vs DB저장+어드민 알림(거래있음)
-                # 다이얼로그 대기/닫기 0.3초로 짧게 해서 리스트 크롤링 속도 확보
                 if is_expired:
-                    # 거래 내역 버튼 클릭 → 팝업에서 유무 확인 (재시도 시 0.15초만 대기)
+                    # 이미 처리(삭제 또는 거래있음 기록)된 만료 세션은 재처리하지 않는다.
+                    if _is_session_already_processed(session_id):
+                        print(f"[CARD_DEBUG] 만료 세션 이미 처리됨 → 건너뜀 (session_id={session_id})")
+                        continue
+
+                    # 거래 내역 버튼 클릭 → 팝업에서 유무 확인
                     click_ok = False
                     for _ in range(10):
                         try:
@@ -2863,14 +2954,15 @@ return out;
                         except Exception:
                             time.sleep(0.15)
                     if not click_ok:
+                        # 버튼 클릭 자체가 불가능하면 K-VAN에서 이미 사라진 것으로 간주
                         _mark_session_deleted(session_id, product_title)
                         expired_count += 1
                         changed = True
                         continue
-                    # 만료 카드용 팝업 대기: 최대 2초 (5초 대기 축소)
+                    # 만료 카드용 팝업 대기: 최대 5초
+                    dialog = None
                     try:
-                        short_wait = WebDriverWait(driver, 2)
-                        dialog = short_wait.until(
+                        dialog = WebDriverWait(driver, 5).until(
                             EC.visibility_of_element_located(
                                 (
                                     By.XPATH,
@@ -2879,52 +2971,83 @@ return out;
                             )
                         )
                     except TimeoutException:
+                        pass
+                    if dialog is None:
+                        # 팝업이 안 뜨면 거래없음으로 간주하고 K-VAN 링크를 삭제
+                        _delete_kvan_link_by_receipt_btn(driver, btn, wait)
                         _mark_session_deleted(session_id, product_title)
                         expired_count += 1
                         changed = True
                         continue
+                    # 팝업 내용이 로드될 때까지 짧게 대기
+                    time.sleep(0.5)
                     popup_text = dialog.text or ""
+                    # 테이블 행 수로 거래 유무 1차 판단, 텍스트 문구로 2차 판단
+                    tx_rows = dialog.find_elements(By.XPATH, ".//table//tbody//tr")
                     has_no_history = (
-                        "거래 내역이 없습니다" in popup_text
+                        len(tx_rows) == 0
+                        or "거래 내역이 없습니다" in popup_text
                         or "거래 내역 없음" in popup_text
+                        or "내역이 없습니다" in popup_text
+                        or "내역이 없" in popup_text
                     )
                     if has_no_history:
+                        # 팝업 닫기 → K-VAN에서 실제 링크 삭제 → 내부 상태 업데이트
                         _close_dialog(driver, dialog)
+                        deleted_ok = _delete_kvan_link_by_receipt_btn(driver, btn, wait)
                         _mark_session_deleted(session_id, product_title)
                         expired_count += 1
-                        _append_admin_log("CRAWLER", f"만료+거래없음 세션 삭제 session_id={session_id}")
+                        _append_admin_log(
+                            "CRAWLER",
+                            f"만료+거래없음 세션 삭제 session_id={session_id} (kvan_deleted={deleted_ok})",
+                        )
                         changed = True
                         continue
                     # 만료 but 거래 내역 있음 → DB 저장 후 어드민 알림 목록에 추가
-                    rows = dialog.find_elements(By.XPATH, ".//table//tbody//tr")
                     agency_id = _get_agency_id_for_session(session_id)
-                    if rows:
-                        try:
-                            row = rows[0]
-                            tx_type = row.find_element(
-                                By.XPATH, ".//span[contains(@data-slot,'badge')]"
-                            ).text.strip()
-                            amount_text = row.find_element(By.XPATH, ".//td[3]//span").text.strip()
-                            amt = _parse_amount(amount_text)
-                            approval_no = row.find_element(By.XPATH, ".//td[4]").text.strip()
-                            customer_name = row.find_element(By.XPATH, ".//td[5]").text.strip()
-                            card_number = row.find_element(By.XPATH, ".//td[6]//span").text.strip()
-                            registered_at = row.find_element(By.XPATH, ".//td[7]").text.strip()
-                            if "결제 승인" in tx_type and amt:
-                                _sync_popup_transaction_to_internal(
-                                    session_id=session_id,
-                                    amount=amt,
-                                    approval_no=approval_no,
-                                    card_number=card_number,
-                                    registered_at=registered_at,
-                                    customer_name=customer_name,
-                                )
-                        except Exception as e_parse:
-                            print(f"[WARN] 만료+거래있음 행 파싱 실패: {e_parse}")
-                    _mark_session_expired_with_transactions(session_id, product_title, agency_id)
-                    _close_dialog(driver, dialog)
-                    expired_count += 1
-                    changed = True
+                    try:
+                        if tx_rows:
+                            try:
+                                row = tx_rows[0]
+                                tx_type = row.find_element(
+                                    By.XPATH, ".//span[contains(@data-slot,'badge')]"
+                                ).text.strip()
+                                # 금액: td[3] 내 span, 없으면 td[3] 전체 텍스트
+                                try:
+                                    amount_text = row.find_element(By.XPATH, ".//td[3]//span").text.strip()
+                                except Exception:
+                                    amount_text = row.find_element(By.XPATH, ".//td[3]").text.strip()
+                                amt = _parse_amount(amount_text)
+                                approval_no = row.find_element(By.XPATH, ".//td[4]").text.strip()
+                                # 고객명/카드번호/등록일시 - 없으면 빈 문자열로 처리
+                                try:
+                                    customer_name = row.find_element(By.XPATH, ".//td[5]").text.strip()
+                                except Exception:
+                                    customer_name = ""
+                                try:
+                                    card_number = row.find_element(By.XPATH, ".//td[6]//span").text.strip()
+                                except Exception:
+                                    card_number = ""
+                                try:
+                                    registered_at = row.find_element(By.XPATH, ".//td[7]").text.strip()
+                                except Exception:
+                                    registered_at = ""
+                                if "결제 승인" in tx_type and amt:
+                                    _sync_popup_transaction_to_internal(
+                                        session_id=session_id,
+                                        amount=amt,
+                                        approval_no=approval_no,
+                                        card_number=card_number,
+                                        registered_at=registered_at,
+                                        customer_name=customer_name,
+                                    )
+                            except Exception as e_parse:
+                                print(f"[WARN] 만료+거래있음 행 파싱 실패: {e_parse}")
+                        _mark_session_expired_with_transactions(session_id, product_title, agency_id)
+                        expired_count += 1
+                        changed = True
+                    finally:
+                        _close_dialog(driver, dialog)
                     continue
 
                 if _is_session_already_processed(session_id):
