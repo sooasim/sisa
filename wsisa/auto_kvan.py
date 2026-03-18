@@ -2659,9 +2659,8 @@ def _delete_kvan_link_by_receipt_btn(driver: webdriver.Chrome, receipt_btn, wait
     삭제 확인 다이얼로그가 나오면 '삭제' 버튼을 눌러 최종 확인한다.
     반환값: 삭제 성공이면 True, 실패면 False.
     """
-    if LOCAL_TEST:
-        print("[LOCAL_TEST] K-VAN 실제 삭제 클릭 건너뜀 (_delete_kvan_link_by_receipt_btn)")
-        return False  # 테스트 모드에서는 실제 K-VAN UI 수정하지 않음
+    # LOCAL_TEST 여부와 관계없이 K-VAN UI 조작은 실제로 수행한다.
+    # LOCAL_TEST 는 DB 쓰기를 막는 용도이며, K-VAN 웹 UI 삭제는 항상 실행해야 한다.
     try:
         # receipt_btn 에서 위로 최대 12단계 부모를 탐색하며 휴지통 버튼을 찾는다.
         trash_btn = driver.execute_script(
@@ -2748,9 +2747,8 @@ def _delete_kvan_link_by_session_id(driver: webdriver.Chrome, session_id: str, w
     session_id를 포함하는 링크/행을 DOM에서 직접 찾아 휴지통(삭제) 버튼을 클릭한다.
     _close_dialog 이후 btn 이 stale해졌을 때 사용한다.
     """
-    if LOCAL_TEST:
-        print(f"[LOCAL_TEST] K-VAN 실제 삭제 클릭 건너뜀 (session_id={session_id[:30]}...)")
-        return False  # 테스트 모드에서는 실제 K-VAN UI 수정하지 않음
+    # LOCAL_TEST 여부와 관계없이 K-VAN UI 조작은 실제로 수행한다.
+    # LOCAL_TEST 는 DB 쓰기를 막는 용도이며, K-VAN 웹 UI 삭제는 항상 실행해야 한다.
     try:
         trash_btn = driver.execute_script(
             """
