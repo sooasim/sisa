@@ -196,34 +196,58 @@ def _go_to_payment_link(driver: webdriver.Chrome, max_attempts: int = 12) -> boo
 def _wait_payment_link_page_ready(driver: webdriver.Chrome, timeout_sec: float = 18.0) -> bool:
     """
     결제링크 관리 페이지가 로드 완료될 때까지 대기한다.
-    '권한 확인 중...' 스피너가 사라지고, 빈 화면 문구 또는 카드/KEY/거래내역 버튼이 보이면 준비된 것으로 본다.
+    '권한 확인 중...' 스피너가 사라지고, 카드/KEY/거래내역 버튼이 보이면 준비된 것으로 본다.
+
+    Next.js/React 는 초기 렌더링 시 '생성된 결제 링크가 없습니다' 플레이스홀더를
+    먼저 표시하고, API 응답이 오면 실제 카드로 교체하는 경우가 많다.
+    따라서 빈 화면 문구가 보여도 바로 종료하지 않고, 추가 2초 동안 카드가
+    나타나는지 확인한다.
     """
     wait = WebDriverWait(driver, max(1.0, timeout_sec))
+
+    def _has_cards(drv):
+        """실제 결제링크 카드(거래내역 버튼, KEY 세션ID)가 있는지 확인."""
+        try:
+            icons = drv.find_elements(
+                By.XPATH,
+                "//button[@title='거래 내역']"
+                " | //button[contains(normalize-space(.),'거래 내역')]"
+                " | //button[contains(normalize-space(.),'거래내역')]"
+                " | //*[contains(normalize-space(.),'KEY20')]",
+            )
+            return len(icons) > 0
+        except Exception:
+            return False
+
     try:
         def _page_ready(drv):
             try:
-                # 1) 빈 화면 문구가 보이면 준비 완료
+                # 1) 카드가 있으면 확실히 준비 완료
+                if _has_cards(drv):
+                    return True
+                # 2) 빈 화면 문구가 보이면 "일단" 준비 완료 후보
                 empty = drv.find_elements(
                     By.XPATH,
                     "//*[contains(normalize-space(.),'생성된 결제 링크가 없습니다')]",
                 )
                 if empty:
                     return True
-                # 2) 거래 내역 버튼 또는 KEY 세션ID가 보이면 준비 완료
-                icons = drv.find_elements(
-                    By.XPATH,
-                    "//button[@title='거래 내역']"
-                    " | //button[contains(normalize-space(.),'거래 내역')]"
-                    " | //button[contains(normalize-space(.),'거래내역')]"
-                    " | //*[contains(normalize-space(.),'KEY20')]",
-                )
-                if icons:
-                    return True
                 return False
             except Exception:
                 return False
 
         wait.until(_page_ready)
+
+        # 빈 화면 문구가 보이더라도 React 렌더링이 아직 진행 중일 수 있다.
+        # 카드가 없으면 추가 2초 동안 카드가 나타나는지 대기한다.
+        if not _has_cards(driver):
+            print("[PAGE_READY] '결제링크 없음' 문구 감지 → 카드 렌더링 추가 대기 (2초)...")
+            try:
+                WebDriverWait(driver, 2.0).until(lambda d: _has_cards(d))
+                print("[PAGE_READY] 추가 대기 중 카드 발견 (React 렌더링 완료).")
+            except TimeoutException:
+                print("[PAGE_READY] 추가 대기 후에도 카드 없음 → 실제로 결제링크 없는 상태.")
+
         print("[PAGE_READY] 결제링크 관리 페이지 로드 완료.")
         return True
     except TimeoutException:
@@ -2261,9 +2285,9 @@ def _close_dialog(driver: webdriver.Chrome, dialog) -> None:
             except Exception:
                 pass
 
-        # 3차: dialog가 사라질 때까지 최대 0.3초만 대기 (기존 2초 → 0.3초)
+        # 3차: dialog가 사라질 때까지 최대 1초 대기 (DOM 재렌더 안정화를 위해)
         try:
-            WebDriverWait(driver, 0.3).until_not(
+            WebDriverWait(driver, 1.0).until_not(
                 EC.presence_of_element_located(
                     (
                         By.XPATH,
@@ -2355,6 +2379,9 @@ def _delete_kvan_link_by_receipt_btn(driver: webdriver.Chrome, receipt_btn, wait
     삭제 확인 다이얼로그가 나오면 '삭제' 버튼을 눌러 최종 확인한다.
     반환값: 삭제 성공이면 True, 실패면 False.
     """
+    if LOCAL_TEST:
+        print("[LOCAL_TEST] K-VAN 실제 삭제 클릭 건너뜀 (_delete_kvan_link_by_receipt_btn)")
+        return False  # 테스트 모드에서는 실제 K-VAN UI 수정하지 않음
     try:
         # receipt_btn 에서 위로 최대 12단계 부모를 탐색하며 휴지통 버튼을 찾는다.
         trash_btn = driver.execute_script(
@@ -2441,6 +2468,9 @@ def _delete_kvan_link_by_session_id(driver: webdriver.Chrome, session_id: str, w
     session_id를 포함하는 링크/행을 DOM에서 직접 찾아 휴지통(삭제) 버튼을 클릭한다.
     _close_dialog 이후 btn 이 stale해졌을 때 사용한다.
     """
+    if LOCAL_TEST:
+        print(f"[LOCAL_TEST] K-VAN 실제 삭제 클릭 건너뜀 (session_id={session_id[:30]}...)")
+        return False  # 테스트 모드에서는 실제 K-VAN UI 수정하지 않음
     try:
         trash_btn = driver.execute_script(
             """
@@ -2634,7 +2664,12 @@ def _mark_session_checked(session_id: str, title: str, has_approval: bool) -> No
         print(f"[WARN] _mark_session_checked 실패: {e}")
 
 
-def _mark_session_deleted(session_id: str, title: str) -> None:
+def _mark_session_deleted(session_id: str, title: str, kvan_deleted: bool = False) -> None:
+    """만료+거래없음 세션을 내부 상태에서 삭제 처리한다.
+
+    kvan_deleted: 실제 K-VAN UI에서 휴지통 버튼을 눌러 삭제에 성공했으면 True.
+                  False 면 내부 상태만 정리하고, 다음 사이클에서 K-VAN 삭제를 재시도한다.
+    """
     try:
         st = _load_admin_state()
         sessions = list(st.get("sessions") or [])
@@ -2653,11 +2688,17 @@ def _mark_session_deleted(session_id: str, title: str) -> None:
             removed_session = {"id": session_id}
         removed_session["status"] = "만료"
         removed_session["deleted"] = True
-        removed_session["deleted_in_kvan"] = True
+        # K-VAN UI에서 실제 삭제된 경우에만 deleted_in_kvan=True
+        # False이면 다음 사이클에서 _is_session_already_processed가 True를 반환하되,
+        # K-VAN UI에는 아직 카드가 남아있을 수 있음
+        removed_session["deleted_in_kvan"] = kvan_deleted
         removed_session["checked_title"] = title
         removed_session["finished_at"] = removed_session.get("finished_at") or now_iso
         old_msg = str(removed_session.get("result_message") or "").strip()
-        mark_msg = "만료 감지로 K-VAN 링크가 삭제되었습니다."
+        if kvan_deleted:
+            mark_msg = "만료 감지로 K-VAN 링크가 삭제되었습니다."
+        else:
+            mark_msg = "만료 감지 (K-VAN 링크 삭제 대기중)."
         removed_session["result_message"] = f"{old_msg}\n{mark_msg}".strip() if old_msg else mark_msg
 
         history = _upsert_history_by_session_id(history, removed_session)
@@ -3069,7 +3110,7 @@ return out;
                             time.sleep(0.15)
                     if not click_ok:
                         # 버튼 클릭 자체가 불가능하면 K-VAN에서 이미 사라진 것으로 간주
-                        _mark_session_deleted(session_id, product_title)
+                        _mark_session_deleted(session_id, product_title, kvan_deleted=True)
                         expired_count += 1
                         changed = True
                         continue
@@ -3095,7 +3136,7 @@ return out;
                             print(f"[EXPIRED_DEBUG] _delete_kvan_link_by_receipt_btn 실패 → session_id 기반 재시도")
                             deleted_ok = _delete_kvan_link_by_session_id(driver, session_id, wait)
                         print(f"[EXPIRED_DEBUG] K-VAN 삭제 결과: {deleted_ok} session_id={session_id}")
-                        _mark_session_deleted(session_id, product_title)
+                        _mark_session_deleted(session_id, product_title, kvan_deleted=deleted_ok)
                         expired_count += 1
                         _append_admin_log(
                             "CRAWLER",
@@ -3132,7 +3173,7 @@ return out;
                         time.sleep(0.3)  # DOM 재렌더 대기
                         deleted_ok = _delete_kvan_link_by_session_id(driver, session_id, wait)
                         print(f"[EXPIRED_DEBUG] K-VAN 삭제 결과: {deleted_ok} session_id={session_id}")
-                        _mark_session_deleted(session_id, product_title)
+                        _mark_session_deleted(session_id, product_title, kvan_deleted=deleted_ok)
                         expired_count += 1
                         _append_admin_log(
                             "CRAWLER",
