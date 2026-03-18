@@ -673,6 +673,19 @@ def _run_cycle(driver: webdriver.Chrome, cycle: int) -> tuple:
         has_links = _has_payment_links_quick(driver)
         _dbg(f"STEP4-retry 완료: has_links={has_links}")
 
+    # ── STEP 4.5: 만료+거래없음 링크 즉시 삭제 ──
+    # 결제링크 카드가 있을 때만 실행. 거래내역 팝업을 열어 확인 후 삭제.
+    if has_links:
+        t0 = time.time()
+        _dbg("STEP4.5 시작: 만료+거래없음 링크 빠른 삭제")
+        deleted_count = _delete_expired_links_with_no_transactions(driver)
+        if deleted_count > 0:
+            had_changes = True
+            _dbg(f"STEP4.5: {deleted_count}건 삭제 (had_changes=True)")
+        _dbg(f"STEP4.5 완료: 삭제 루틴 (elapsed={time.time()-t0:.1f}s)")
+        # 삭제 후 링크 존재 여부 재확인
+        has_links = _has_payment_links_quick(driver)
+
     # ── STEP 5: 결제링크 팝업 스캔 ──
     # - 만료 카드: 거래 내역 버튼 클릭 → 팝업에서 거래 유무 확인
     #   거래없음 → 휴지통 버튼 클릭 → 삭제 확인 → K-VAN 에서 제거
