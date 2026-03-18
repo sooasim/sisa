@@ -296,22 +296,27 @@ def run_crawler_loop(max_cycles: int = 0, max_runtime_sec: int = 0) -> None:
                 t_links = time.time()
                 _dbg("결제링크 목록 크롤링 시작")
                 _scrape_payment_links_and_store(driver)
-                _dbg(f"결제링크 목록 크롤링 종료 (elapsed={time.time() - t_links:.2f}s)")
+                _dbg(f"결제링크 목록 크롤링 종료 (elapsed={time.time() - t_links:.2f}s, url={driver.current_url})")
                 if not LOCAL_TEST:
                     try:
                         mark_expired_sessions_from_kvan_links()
                     except Exception as _e:
                         _dbg(f"링크 만료 세션 반영 스킵: {_e}")
+                else:
+                    _dbg(f"LOCAL_TEST=True → mark_expired_sessions_from_kvan_links 호출 여부: False")
+                    print("[crawler] LOCAL_TEST 시 mark_expired_sessions_from_kvan_links 는 호출하지 않아 대기 없이 바로 팝업 스캔으로 진행합니다.")
                 if _runtime_guard():
                     break
 
+                t_check = time.time()
                 has_links = _has_payment_links_quick(driver)
+                _dbg(f"결제링크 존재 확인 완료 (has_links={has_links}, elapsed={time.time() - t_check:.2f}s)")
                 active_for_popup = _has_active_sessions(window_minutes=30)
 
                 if has_links:
                     # ── [링크 있음] 팝업 스캔 → 거래내역 → 동기화 ────────────
                     t_popup = time.time()
-                    _dbg("결제링크 팝업 스캔 시작")
+                    _dbg("결제링크 팝업 스캔 시작 (_scan_payment_link_popups_and_sync)")
                     if _scan_payment_link_popups_and_sync(
                         driver,
                         allow_popup_for_non_expired=active_for_popup,

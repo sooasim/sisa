@@ -67,7 +67,7 @@ def _step_end(label: str, t0: float) -> None:
 SIGN_IN_URL = "https://store.k-van.app/"
 FACE_TO_FACE_URL = "https://store.k-van.app/face-to-face-payment"
 
-def _has_payment_links_quick(driver: webdriver.Chrome, retries: int = 5, delay: float = 1.0) -> bool:
+def _has_payment_links_quick(driver: webdriver.Chrome, retries: int = 3, delay: float = 0.3) -> bool:
     """
     결제링크 관리 화면에 실제 결제 링크 카드가 존재하는지 가볍게 확인한다.
 
@@ -2668,6 +2668,7 @@ def _mark_session_deleted(session_id: str, title: str) -> None:
         st["sessions"] = remaining_sessions
         st["history"] = history
         _save_admin_state(st)
+        print(f"[EXPIRED_DEBUG] _mark_session_deleted 완료: history에 deleted=True 보존 session_id={session_id}")
 
         # 만료+거래없음 → kvan_links에서 해당 행 삭제 대상으로 표시 (status='만료' 반영 후 mark_expired_sessions_from_kvan_links가 DELETE)
         if not LOCAL_TEST and session_id:
@@ -2789,15 +2790,12 @@ def _scan_payment_link_popups_and_sync(
         t0 = _step_start("결제링크 관리 팝업 기반 동기화")
         wait = WebDriverWait(driver, 5)
 
-        # 항상 결제링크 관리 URL 을 강제로 맞추고,
-        # '권한 확인 중...' 스피너가 끝나고 실제 카드 리스트가 나올 때까지
-        # 0.5초 간격으로 짧게 여러 번 시도한다 (최대 약 5초).
+        # 이미 /payment-link 에 있으면 _wait_payment_link_page_ready 생략 (직전에 이미 대기 완료)
         if not _go_to_payment_link(driver):
             _step_end("결제링크 관리 팝업 기반 동기화", t0)
             raise RuntimeError("[NAV] /payment-link 로 진입하지 못해 팝업 기반 동기화를 중단합니다.")
-        _wait_payment_link_page_ready(driver)
 
-        max_tries = 12  # 0.5초 * 12 ≈ 6초
+        max_tries = 6  # 0.2초 * 6 ≈ 1.2초 (페이지 이미 로드 완료 상태)
         icons_found = False
         icons: list = []
         for attempt in range(max_tries):
@@ -3054,8 +3052,9 @@ return out;
                 # 만료 카드: 거래 내역 유무에 따라 삭제(거래없음) vs DB저장+어드민 알림(거래있음)
                 if is_expired:
                     # 이미 처리(삭제 또는 거래있음 기록)된 만료 세션은 재처리하지 않는다.
-                    if _is_session_already_processed(session_id):
-                        print(f"[CARD_DEBUG] 만료 세션 이미 처리됨 → 건너뜀 (session_id={session_id})")
+                    already = _is_session_already_processed(session_id)
+                    print(f"[EXPIRED_DEBUG] _is_session_already_processed={already} session_id={session_id}")
+                    if already:
                         continue
 
                     # 거래 내역 버튼 클릭 → 팝업에서 유무 확인
@@ -3094,9 +3093,12 @@ return out;
                     if dialog is None:
                         # 팝업이 안 뜨면 거래없음으로 간주하고 K-VAN 링크를 삭제
                         # btn 은 stale 가능성 없음(dialog가 열리지 않았으므로 DOM 재렌더 없음)
+                        print(f"[EXPIRED_DEBUG] 팝업 미표시 → 거래없음 간주, 삭제 시도 session_id={session_id}")
                         deleted_ok = _delete_kvan_link_by_receipt_btn(driver, btn, wait)
                         if not deleted_ok:
+                            print(f"[EXPIRED_DEBUG] _delete_kvan_link_by_receipt_btn 실패 → session_id 기반 재시도")
                             deleted_ok = _delete_kvan_link_by_session_id(driver, session_id, wait)
+                        print(f"[EXPIRED_DEBUG] K-VAN 삭제 결과: {deleted_ok} session_id={session_id}")
                         _mark_session_deleted(session_id, product_title)
                         expired_count += 1
                         _append_admin_log(
@@ -3120,8 +3122,11 @@ return out;
                     if has_no_history:
                         # 팝업 닫기 → K-VAN에서 실제 링크 삭제 → 내부 상태 업데이트
                         # _close_dialog 이후 btn이 stale해지므로 session_id 기반으로 trash 버튼 탐색
+                        print(f"[EXPIRED_DEBUG] 만료+거래없음 → 팝업 닫기 후 K-VAN 삭제 시도 session_id={session_id}")
                         _close_dialog(driver, dialog)
+                        time.sleep(0.3)  # DOM 재렌더 대기
                         deleted_ok = _delete_kvan_link_by_session_id(driver, session_id, wait)
+                        print(f"[EXPIRED_DEBUG] K-VAN 삭제 결과: {deleted_ok} session_id={session_id}")
                         _mark_session_deleted(session_id, product_title)
                         expired_count += 1
                         _append_admin_log(
