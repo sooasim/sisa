@@ -2440,6 +2440,118 @@ return null;
         return False
 
 
+def _delete_kvan_link_by_session_id(driver: webdriver.Chrome, session_id: str, wait: WebDriverWait) -> bool:
+    """
+    session_id를 포함하는 링크/행을 DOM에서 직접 찾아 휴지통(삭제) 버튼을 클릭한다.
+    _close_dialog 이후 btn 이 stale해졌을 때 사용한다.
+    """
+    try:
+        trash_btn = driver.execute_script(
+            """
+var sid = arguments[0];
+// session_id 를 href에 포함하는 <a> 태그로 카드/행 탐색
+var anchors = document.querySelectorAll('a[href*="' + sid + '"]');
+for (var i = 0; i < anchors.length; i++) {
+  var cur = anchors[i];
+  for (var d = 0; d < 15; d++) {
+    cur = cur.parentElement;
+    if (!cur) break;
+    var trash = cur.querySelector('button[title="삭제"]');
+    if (!trash) {
+      var allBtns = cur.querySelectorAll('button');
+      for (var j = 0; j < allBtns.length; j++) {
+        var svgs = allBtns[j].querySelectorAll('svg');
+        for (var k = 0; k < svgs.length; k++) {
+          var cls = svgs[k].getAttribute('class') || '';
+          if (cls.indexOf('lucide-trash') >= 0) { trash = allBtns[j]; break; }
+        }
+        if (trash) break;
+      }
+    }
+    if (trash) return trash;
+  }
+}
+// fallback: session_id 텍스트를 포함하는 모든 텍스트 노드의 부모 요소에서 탐색
+var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+var node;
+while ((node = walker.nextNode())) {
+  if (node.nodeValue && node.nodeValue.indexOf(sid) >= 0) {
+    var cur2 = node.parentElement;
+    for (var d2 = 0; d2 < 15; d2++) {
+      if (!cur2) break;
+      var trash2 = cur2.querySelector('button[title="삭제"]');
+      if (!trash2) {
+        var allBtns2 = cur2.querySelectorAll('button');
+        for (var j2 = 0; j2 < allBtns2.length; j2++) {
+          var svgs2 = allBtns2[j2].querySelectorAll('svg');
+          for (var k2 = 0; k2 < svgs2.length; k2++) {
+            var cls2 = svgs2[k2].getAttribute('class') || '';
+            if (cls2.indexOf('lucide-trash') >= 0) { trash2 = allBtns2[j2]; break; }
+          }
+          if (trash2) break;
+        }
+      }
+      if (trash2) return trash2;
+      cur2 = cur2.parentElement;
+    }
+  }
+}
+return null;
+""",
+            session_id,
+        )
+        if not trash_btn:
+            print(f"[WARN] _delete_kvan_link_by_session_id: 세션({session_id}) 휴지통 버튼을 찾지 못했습니다.")
+            return False
+
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", trash_btn)
+        time.sleep(0.05)
+        driver.execute_script("arguments[0].click();", trash_btn)
+
+        # 삭제 확인 alertdialog 대기 (최대 3초)
+        try:
+            alert = WebDriverWait(driver, 3).until(
+                EC.visibility_of_element_located(
+                    (
+                        By.XPATH,
+                        "//div[@role='alertdialog']"
+                        " | //div[@data-slot='alert-dialog-content']",
+                    )
+                )
+            )
+        except TimeoutException:
+            print(f"[WARN] _delete_kvan_link_by_session_id: 삭제 확인 다이얼로그를 찾지 못했습니다. session_id={session_id}")
+            return False
+
+        try:
+            confirm_btn = alert.find_element(By.XPATH, ".//button[normalize-space()='삭제']")
+        except Exception:
+            confirm_btn = WebDriverWait(driver, 2).until(
+                EC.element_to_be_clickable((By.XPATH, "//button[normalize-space()='삭제']"))
+            )
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", confirm_btn)
+        time.sleep(0.05)
+        driver.execute_script("arguments[0].click();", confirm_btn)
+
+        # 오버레이가 사라질 때까지 대기 (최대 2초)
+        try:
+            WebDriverWait(driver, 2).until_not(
+                EC.presence_of_element_located(
+                    (
+                        By.XPATH,
+                        "//div[@data-slot='alert-dialog-overlay' and @data-state='open']",
+                    )
+                )
+            )
+        except TimeoutException:
+            pass
+        time.sleep(0.2)
+        return True
+    except Exception as e:
+        print(f"[WARN] _delete_kvan_link_by_session_id 오류: {e}")
+        return False
+
+
 def _is_session_already_processed(session_id: str) -> bool:
     """
     admin_state.json.history 에서 이미 has_approval 또는 deleted 플래그가 있는 세션이면 True.
@@ -2553,11 +2665,6 @@ def _mark_session_deleted(session_id: str, title: str) -> None:
         removed_session["result_message"] = f"{old_msg}\n{mark_msg}".strip() if old_msg else mark_msg
 
         history = _upsert_history_by_session_id(history, removed_session)
-        # 거래 내역 없는 만료 세션은 히스토리에 남길 필요가 없으므로 즉시 제거
-        history = [
-            h for h in history
-            if not (bool(h.get("deleted_in_kvan")) and not bool(h.get("has_transaction")))
-        ]
         st["sessions"] = remaining_sessions
         st["history"] = history
         _save_admin_state(st)
@@ -2986,9 +3093,16 @@ return out;
                         pass
                     if dialog is None:
                         # 팝업이 안 뜨면 거래없음으로 간주하고 K-VAN 링크를 삭제
-                        _delete_kvan_link_by_receipt_btn(driver, btn, wait)
+                        # btn 은 stale 가능성 없음(dialog가 열리지 않았으므로 DOM 재렌더 없음)
+                        deleted_ok = _delete_kvan_link_by_receipt_btn(driver, btn, wait)
+                        if not deleted_ok:
+                            deleted_ok = _delete_kvan_link_by_session_id(driver, session_id, wait)
                         _mark_session_deleted(session_id, product_title)
                         expired_count += 1
+                        _append_admin_log(
+                            "CRAWLER",
+                            f"만료+팝업없음 세션 삭제 session_id={session_id} (kvan_deleted={deleted_ok})",
+                        )
                         changed = True
                         continue
                     # 팝업 내용이 로드될 때까지 짧게 대기
@@ -3005,8 +3119,9 @@ return out;
                     )
                     if has_no_history:
                         # 팝업 닫기 → K-VAN에서 실제 링크 삭제 → 내부 상태 업데이트
+                        # _close_dialog 이후 btn이 stale해지므로 session_id 기반으로 trash 버튼 탐색
                         _close_dialog(driver, dialog)
-                        deleted_ok = _delete_kvan_link_by_receipt_btn(driver, btn, wait)
+                        deleted_ok = _delete_kvan_link_by_session_id(driver, session_id, wait)
                         _mark_session_deleted(session_id, product_title)
                         expired_count += 1
                         _append_admin_log(
