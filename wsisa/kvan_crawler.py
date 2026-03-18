@@ -1,5 +1,5 @@
 """
-kvan_crawler.py - K-VAN 결제링크 모니터링 크롤러 (v3)
+kvan_crawler.py - K-VAN 결제링크 모니터링 크롤러 (v4)
 
 역할:
   - K-VAN(store.k-van.app) 에 로그인 후, 결제링크/거래내역을 주기적으로 크롤링
@@ -13,17 +13,22 @@ kvan_crawler.py - K-VAN 결제링크 모니터링 크롤러 (v3)
   2. 링크 존재 확인 (_has_payment_links_quick) 은 반드시 refresh/wait 이후에만 호출
   3. LOCAL_TEST=True 이어도 K-VAN UI 조작(팝업 스캔/삭제)은 항상 실행
      (LOCAL_TEST 는 DB 쓰기만 JSON 으로 대체하는 플래그)
+  4. 삭제 루틴은 사이클 진입 직후 최우선 실행 (추가 이동 없이 현재 페이지에서)
+     (로컬/서버 공통 적용 — 불필요한 navigate 중복을 제거)
 
 사이클 흐름:
-  1. /payment-link 이동 → refresh → 페이지 로드 완료 대기
-  2. 결제링크 목록 크롤링 → JSON/DB 저장
-  3. 링크 카드 존재 확인 (아이콘 우선 - "없음" 문구 후순위)
-  4. 링크 있음 → 팝업 스캔:
-     만료+거래없음 → 휴지통 버튼 클릭 → 삭제 확인 버튼 클릭
+  1. /payment-link 이동 → refresh → 페이지 로드 완료 대기  (1회만)
+  2. 만료+거래없음 링크 즉시 삭제 (추가 이동 없이 현재 페이지에서 바로 실행)
+  3. 결제링크 목록 크롤링 → DB 저장 (서버 모드만 / 로컬은 추가 이동 없이 스킵)
+  4. 만료 세션 DB/JSON 반영
+  5. 링크 카드 존재 확인 (아이콘 우선 - "없음" 문구 후순위)
+  6. 링크 있음 → 팝업 스캔:
      만료+거래있음 → DB/JSON 기록 + 어드민 알림
-  5. /transactions 이동 → 거래내역 크롤링 → 내부 DB 동기화
-  6. 대기: 활성 세션/변화 있으면 4-7초, 없으면 10분
-     (대기 중 wakeup 플래그 감지 시 즉시 재개)
+  7. /transactions 이동 → 거래내역 크롤링
+  8. 내부 DB 동기화 (서버 모드만)
+  9. 사이클 종료 최종 확인
+  10. 대기: 활성 세션/변화 있으면 4-7초, 없으면 10분
+      (대기 중 wakeup 플래그 감지 시 즉시 재개)
 
 환경변수:
   K_VAN_ID         로그인 아이디 (기본: m3313)
@@ -456,21 +461,24 @@ def _delete_one_expired_no_tx_row(driver) -> bool:
 def _delete_expired_links_with_no_transactions(
     driver,
     max_delete_per_cycle: int = 20,
+    skip_navigation: bool = False,
 ) -> int:
     """
     결제링크 관리 화면에서
     - '만료' 표시가 있고
     - 거래내역 아이콘을 눌렀을 때 '거래내역이 없습니다'가 보이는 행만
     즉시 휴지통 삭제한다.
-    """
-    if not _go_to_payment_link(driver):
-        _dbg("삭제 루틴: /payment-link 진입 실패")
-        return 0
 
-    try:
-        _wait_payment_link_page_ready(driver)
-    except Exception:
-        pass
+    skip_navigation=True: 이미 /payment-link 에 있을 때 재이동/wait 생략 (속도 최적화)
+    """
+    if not skip_navigation:
+        if not _go_to_payment_link(driver):
+            _dbg("삭제 루틴: /payment-link 진입 실패")
+            return 0
+        try:
+            _wait_payment_link_page_ready(driver)
+        except Exception:
+            pass
 
     deleted = 0
 
@@ -629,105 +637,106 @@ def _run_cycle(driver: webdriver.Chrome, cycle: int) -> tuple:
     반환: (has_links: bool, had_changes: bool)
       - has_links:   이번 사이클 종료 시점에 결제링크 카드가 남아 있는지
       - had_changes: 이번 사이클에서 신규 승인/삭제/갱신이 발생했는지
+
+    개선사항 (v4):
+      - /payment-link 이동은 STEP1 에서 1회만 수행 (루프 전·후 이중 이동 제거)
+      - 삭제 루틴(STEP2)을 사이클 최초 진입 직후 실행 (skip_navigation=True)
+      - LOCAL_TEST 에서 _scrape_payment_links_and_store 호출 생략
+        → 이전에는 이 함수가 내부에서 navigate+refresh 를 추가로 실행하여
+          불필요한 대기(멍때림)가 발생했음
     """
     had_changes = False
+    has_links = False
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[crawler] 사이클 {cycle} 시작: {ts}")
     _alog(f"크롤링 사이클 시작: {ts}")
     _dbg(f"사이클 {cycle} 시작, URL={driver.current_url}")
 
-    # ── STEP 1: /payment-link 이동 → refresh → 페이지 로드 완료 ──
-    # 반드시 refresh 수행: React placeholder 대신 실제 카드 DOM 확보
+    # ── STEP 1: /payment-link 이동 → refresh → 페이지 로드 완료 (1회) ──
     if not _navigate_and_refresh_payment_link(driver):
         raise RuntimeError("[NAV] /payment-link refresh 진입 실패")
-    _dbg(f"STEP1 완료: /payment-link refresh 후 URL={driver.current_url}")
+    _dbg(f"STEP1 완료: URL={driver.current_url}")
 
-    # ── STEP 2: 결제링크 목록 크롤링 → JSON(LOCAL_TEST) 또는 DB 저장 ──
-    # 주의: _scrape_payment_links_and_store 는 내부적으로 또 _go_to_payment_link +
-    #       driver.refresh() + _wait_payment_link_page_ready 를 수행한다.
-    #       STEP1 에서 이미 준비했더라도 함수 내 refresh 가 한 번 더 실행되는 것은 정상.
+    # ── STEP 2: 만료+거래없음 링크 즉시 삭제 ──
+    # STEP1 에서 이미 /payment-link + refresh + wait 완료.
+    # skip_navigation=True 로 추가 이동 없이 현재 DOM 에서 바로 삭제한다.
     t0 = time.time()
-    _dbg("STEP2 시작: 결제링크 목록 크롤링")
-    _scrape_payment_links_and_store(driver)
-    _dbg(f"STEP2 완료: 결제링크 크롤링 (elapsed={time.time()-t0:.1f}s)")
-
-    # ── STEP 3: 만료 세션 DB/JSON 반영 ──
-    try:
-        mark_expired_sessions_from_kvan_links()
-        _dbg("STEP3 완료: 만료 세션 반영")
-    except Exception as e:
-        _dbg(f"STEP3 스킵: 만료 세션 반영 중 예외 ({e})")
-
-    # ── STEP 4: 결제링크 카드 존재 확인 ──
-    # _scrape_payment_links_and_store 종료 후 driver 는 /payment-link 에 위치.
-    # refresh + wait 가 이미 완료된 상태이므로 아이콘이 DOM 에 있으면 즉시 True 반환.
-    has_links = _has_payment_links_quick(driver)
-    _dbg(f"STEP4 완료: 결제링크 존재 여부 has_links={has_links}")
-
-    if not has_links:
-        # /payment-link 에 링크가 없더라도 한 번 더 refresh 후 재확인
-        # (STEP2 내부 refresh 와 시간차가 있을 수 있으므로)
-        _dbg("STEP4-retry: 링크 없음 → 한 번 더 refresh 후 재확인")
+    _dbg("STEP2 시작: 만료+거래없음 링크 즉시 삭제")
+    deleted_count = _delete_expired_links_with_no_transactions(driver, skip_navigation=True)
+    if deleted_count > 0:
+        had_changes = True
+        _dbg(f"STEP2: {deleted_count}건 삭제 완료 → 페이지 갱신")
+        # 삭제 후 DOM 이 바뀌었으므로 한 번만 refresh 해서 최신 상태로 맞춘다.
         driver.refresh()
         _wait_payment_link_page_ready(driver)
-        has_links = _has_payment_links_quick(driver)
-        _dbg(f"STEP4-retry 완료: has_links={has_links}")
+    _dbg(f"STEP2 완료: 삭제 {deleted_count}건 (elapsed={time.time()-t0:.1f}s)")
 
-    # ── STEP 4.5: 만료+거래없음 링크 즉시 삭제 ──
-    # 결제링크 카드가 있을 때만 실행. 거래내역 팝업을 열어 확인 후 삭제.
-    if has_links:
+    # ── STEP 3: 결제링크 목록 크롤링 → DB 저장 (서버 모드만) ──
+    # LOCAL_TEST 모드에서는 이 함수가 내부적으로 navigate+refresh 를 추가 실행하므로
+    # 호출 자체를 생략한다 (UI 조작에는 영향 없음).
+    if not LOCAL_TEST:
         t0 = time.time()
-        _dbg("STEP4.5 시작: 만료+거래없음 링크 빠른 삭제")
-        deleted_count = _delete_expired_links_with_no_transactions(driver)
-        if deleted_count > 0:
-            had_changes = True
-            _dbg(f"STEP4.5: {deleted_count}건 삭제 (had_changes=True)")
-        _dbg(f"STEP4.5 완료: 삭제 루틴 (elapsed={time.time()-t0:.1f}s)")
-        # 삭제 후 링크 존재 여부 재확인
-        has_links = _has_payment_links_quick(driver)
+        _dbg("STEP3 시작: 결제링크 목록 크롤링 (서버)")
+        _scrape_payment_links_and_store(driver)
+        _dbg(f"STEP3 완료: 결제링크 크롤링 (elapsed={time.time()-t0:.1f}s)")
+    else:
+        _dbg("STEP3 스킵: LOCAL_TEST 모드 (DB 저장 불필요, 이동 생략)")
 
-    # ── STEP 5: 결제링크 팝업 스캔 ──
-    # - 만료 카드: 거래 내역 버튼 클릭 → 팝업에서 거래 유무 확인
-    #   거래없음 → 휴지통 버튼 클릭 → 삭제 확인 → K-VAN 에서 제거
-    #   거래있음 → 내부 DB/JSON 기록 + 어드민 알림
-    # - 비만료 카드: 활성 세션이 있을 때만 팝업 확인 (불필요한 클릭 방지)
+    # ── STEP 4: 만료 세션 DB/JSON 반영 ──
+    try:
+        mark_expired_sessions_from_kvan_links()
+        _dbg("STEP4 완료: 만료 세션 반영")
+    except Exception as e:
+        _dbg(f"STEP4 스킵: 만료 세션 반영 중 예외 ({e})")
+
+    # ── STEP 5: 결제링크 카드 존재 확인 ──
+    # 서버: _scrape_payment_links_and_store 종료 후 /payment-link 에 위치 (refresh 완료)
+    # 로컬: STEP1/STEP2 refresh 이후 그대로 /payment-link 에 위치
+    has_links = _has_payment_links_quick(driver)
+    _dbg(f"STEP5: has_links={has_links}")
+
+    # ── STEP 6: 결제링크 팝업 스캔 ──
+    # 만료+거래있음 → 내부 DB/JSON 기록 + 어드민 알림
+    # 비만료 카드 → 활성 세션 있을 때만 팝업 확인
     if has_links:
         active_for_popup = _has_active_sessions(window_minutes=30)
         t0 = time.time()
-        _dbg(f"STEP5 시작: 팝업 스캔 (active_sessions={active_for_popup})")
+        _dbg(f"STEP6 시작: 팝업 스캔 (active_sessions={active_for_popup})")
         if _scan_payment_link_popups_and_sync(driver, allow_popup_for_non_expired=active_for_popup):
             had_changes = True
-            _dbg("STEP5: 팝업 스캔에서 신규 변화 감지 (had_changes=True)")
-        _dbg(f"STEP5 완료: 팝업 스캔 (elapsed={time.time()-t0:.1f}s)")
+            _dbg("STEP6: 팝업 스캔에서 신규 변화 감지 (had_changes=True)")
+        _dbg(f"STEP6 완료: 팝업 스캔 (elapsed={time.time()-t0:.1f}s)")
 
-    # ── STEP 6: 거래내역 크롤링 ──
+    # ── STEP 7: 거래내역 크롤링 ──
     # /transactions 로 이동 → 새 거래내역을 kvan_transactions 에 저장
+    # LOCAL_TEST 에서도 실행 (페이지 이동 검증용; DB 쓰기는 내부에서 스킵됨)
     t0 = time.time()
-    _dbg("STEP6 시작: 거래내역 크롤링")
+    _dbg("STEP7 시작: 거래내역 크롤링")
     _scrape_transactions_and_store(driver)
-    _dbg(f"STEP6 완료: 거래내역 크롤링 (elapsed={time.time()-t0:.1f}s)")
+    _dbg(f"STEP7 완료: 거래내역 크롤링 (elapsed={time.time()-t0:.1f}s)")
 
-    # ── STEP 7: K-VAN 테이블 → 내부 transactions 동기화 ──
-    t0 = time.time()
-    _dbg("STEP7 시작: 내부 DB 동기화")
-    if _sync_kvan_to_transactions():
-        had_changes = True
-        _dbg("STEP7: 동기화에서 신규 데이터 발견 (had_changes=True)")
-    _dbg(f"STEP7 완료: 내부 DB 동기화 (elapsed={time.time()-t0:.1f}s)")
+    # ── STEP 8: K-VAN 테이블 → 내부 transactions 동기화 (서버 모드만) ──
+    if not LOCAL_TEST:
+        t0 = time.time()
+        _dbg("STEP8 시작: 내부 DB 동기화")
+        if _sync_kvan_to_transactions():
+            had_changes = True
+            _dbg("STEP8: 동기화에서 신규 데이터 발견 (had_changes=True)")
+        _dbg(f"STEP8 완료: 내부 DB 동기화 (elapsed={time.time()-t0:.1f}s)")
+    else:
+        _dbg("STEP8 스킵: LOCAL_TEST 모드")
 
-    # ── STEP 8: 사이클 종료 최종 확인 ──
-    # 팝업 스캔에서 카드가 삭제되었을 수 있으므로, /payment-link 에서 카드 수를 재확인한다.
-    # 다음 사이클의 대기 시간(짧은 사이클 vs 10분)을 결정하는 데 사용된다.
+    # ── STEP 9: 사이클 종료 최종 확인 ──
+    # 팝업 스캔/삭제로 카드 수가 바뀌었을 수 있으므로 /payment-link 에서 재확인.
+    # 다음 사이클 대기 시간(짧은 vs 10분)을 결정하는 데 사용된다.
     try:
         if _navigate_and_refresh_payment_link(driver):
             has_links = _has_payment_links_quick(driver)
-            _dbg(f"STEP8 완료: 사이클 종료 최종 확인 has_links={has_links}")
+            _dbg(f"STEP9 완료: 최종 확인 has_links={has_links}")
     except Exception as e:
-        _dbg(f"STEP8 스킵: 최종 확인 중 예외 ({e})")
+        _dbg(f"STEP9 스킵: 최종 확인 중 예외 ({e})")
 
-    _alog(
-        f"사이클 {cycle} 완료 (has_links={has_links}, had_changes={had_changes})"
-    )
+    _alog(f"사이클 {cycle} 완료 (has_links={has_links}, had_changes={had_changes})")
     return has_links, had_changes
 
 
@@ -759,18 +768,12 @@ def run_crawler_loop(max_cycles: int = 0, max_runtime_sec: int = 0) -> None:
         if LOCAL_TEST:
             print("[crawler] LOCAL_TEST 모드: 크롤링 데이터는 JSON 파일에 저장됩니다.")
             print(f"[crawler] 저장 경로: {DATA_DIR / 'local_db'}")
-
-        # ── 초기 /payment-link 진입 ─────────────────────────────
-        _dbg(f"로그인 직후 URL={driver.current_url}")
-        try:
-            if _navigate_and_refresh_payment_link(driver):
-                _dbg(f"초기 /payment-link refresh 진입 성공, URL={driver.current_url}")
-            else:
-                _dbg("초기 /payment-link 진입 실패 (첫 사이클에서 재시도)")
-        except Exception as e:
-            _dbg(f"초기 /payment-link 진입 중 예외: {e}")
+        _dbg(f"로그인 직후 URL={driver.current_url} → 첫 사이클 STEP1 에서 /payment-link 진입")
 
         # ── 크롤링 루프 ─────────────────────────────────────────
+        # 로그인 후 /payment-link 초기 진입은 각 사이클의 STEP1 에서 처리한다.
+        # 이전 버전처럼 루프 전에 미리 navigate+refresh 하면 STEP1 에서 이중 refresh 가
+        # 발생하여 불필요한 대기(멍때림)가 생기므로 제거했다.
         cycle = 0
         started_at = time.time()
 
