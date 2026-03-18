@@ -71,22 +71,15 @@ def _has_payment_links_quick(driver: webdriver.Chrome, retries: int = 3, delay: 
     """
     결제링크 관리 화면에 실제 결제 링크 카드가 존재하는지 가볍게 확인한다.
 
-    - '생성된 결제 링크가 없습니다' 문구가 보이면 즉시 False.
-    - '거래 내역' 아이콘/버튼이 보이면 True.
-    - 위 둘 다 아닌 경우, 짧게 여러 번 재시도 후 결과를 반환한다.
+    - '거래 내역' 아이콘/버튼이 보이면 즉시 True (최우선).
+    - 아이콘이 없을 때만 '생성된 결제 링크가 없습니다' 문구 확인 → False.
+    - React 하이드레이션 중 두 요소가 DOM에 동시 존재할 수 있으므로 카드 확인을 먼저 한다.
     """
     for attempt in range(retries):
         try:
-            # 1) "생성된 결제 링크가 없습니다" 안내 문구가 있으면 링크 없음
-            empty_msgs = driver.find_elements(
-                By.XPATH,
-                "//*[contains(normalize-space(.),'생성된 결제 링크가 없습니다')]",
-            )
-            if empty_msgs:
-                print(f"[EMPTY_CHECK] 결제링크 없음 문구 감지 (attempt={attempt})")
-                return False
-
-            # 2) '거래 내역' 버튼/아이콘이 하나라도 있으면 링크가 있다고 판단
+            # 1) '거래 내역' 버튼/아이콘이 하나라도 있으면 링크가 있다고 판단 (최우선)
+            # React 하이드레이션 중 "없음" 문구와 실제 카드가 DOM에 동시에 존재할 수 있으므로
+            # 실제 카드 존재 여부를 먼저 확인한다.
             icons = driver.find_elements(
                 By.XPATH,
                 "//button[@title='거래 내역']"
@@ -98,7 +91,7 @@ def _has_payment_links_quick(driver: webdriver.Chrome, retries: int = 3, delay: 
                 print(f"[EMPTY_CHECK] 거래 내역 아이콘 감지 → 링크 존재 (attempt={attempt}, count={len(icons)})")
                 return True
 
-            # 3) 거래내역 버튼이 없는 UI에서는 KEY 세션 ID 문자열로 링크 존재를 판단
+            # 2) KEY 세션 ID 문자열로 링크 존재를 판단 (거래내역 버튼 없는 UI 대응)
             key_tokens = driver.find_elements(
                 By.XPATH,
                 "//*[contains(normalize-space(.),'KEY20')]",
@@ -107,7 +100,7 @@ def _has_payment_links_quick(driver: webdriver.Chrome, retries: int = 3, delay: 
                 print(f"[EMPTY_CHECK] KEY 세션ID 감지 → 링크 존재 (attempt={attempt}, count={len(key_tokens)})")
                 return True
 
-            # 4) 카드 컨테이너(rounded+border) 안에 KEY가 있는 경우 (텍스트가 자식 노드에 분리된 경우)
+            # 3) 카드 컨테이너(rounded+border) 안에 KEY가 있는 경우 (텍스트가 자식 노드에 분리된 경우)
             card_containers = driver.find_elements(
                 By.XPATH,
                 "//div[contains(@class,'rounded') and contains(@class,'border')]"
@@ -116,6 +109,19 @@ def _has_payment_links_quick(driver: webdriver.Chrome, retries: int = 3, delay: 
             if card_containers:
                 print(f"[EMPTY_CHECK] 결제링크 카드 컨테이너 감지 → 링크 존재 (attempt={attempt}, count={len(card_containers)})")
                 return True
+
+            # 4) 위 카드/아이콘이 없을 때만 "없음" 문구 확인
+            # (React DOM에 두 요소가 동시에 있을 경우 아이콘이 이미 위에서 처리됨)
+            empty_msgs = driver.find_elements(
+                By.XPATH,
+                "//*[contains(normalize-space(.),'생성된 결제 링크가 없습니다')]",
+            )
+            if empty_msgs:
+                print(f"[EMPTY_CHECK] 결제링크 없음 문구 감지 (attempt={attempt})")
+                if attempt < retries - 1:
+                    time.sleep(delay)
+                    continue
+                return False
         except Exception as e:
             print(f"[EMPTY_CHECK] 링크 존재 여부 확인 중 예외 (attempt={attempt}): {e}")
 
