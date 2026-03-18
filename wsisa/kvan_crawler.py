@@ -297,14 +297,10 @@ def run_crawler_loop(max_cycles: int = 0, max_runtime_sec: int = 0) -> None:
                 _dbg("결제링크 목록 크롤링 시작")
                 _scrape_payment_links_and_store(driver)
                 _dbg(f"결제링크 목록 크롤링 종료 (elapsed={time.time() - t_links:.2f}s, url={driver.current_url})")
-                if not LOCAL_TEST:
-                    try:
-                        mark_expired_sessions_from_kvan_links()
-                    except Exception as _e:
-                        _dbg(f"링크 만료 세션 반영 스킵: {_e}")
-                else:
-                    _dbg(f"LOCAL_TEST=True → mark_expired_sessions_from_kvan_links 호출 여부: False")
-                    print("[crawler] LOCAL_TEST 시 mark_expired_sessions_from_kvan_links 는 호출하지 않아 대기 없이 바로 팝업 스캔으로 진행합니다.")
+                try:
+                    mark_expired_sessions_from_kvan_links()
+                except Exception as _e:
+                    _dbg(f"링크 만료 세션 반영 스킵: {_e}")
                 if _runtime_guard():
                     break
 

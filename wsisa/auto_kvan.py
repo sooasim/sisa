@@ -270,6 +270,53 @@ else:
     LOCAL_TEST = _local_flag.strip().lower() in ("1", "true", "yes", "y")
 
 
+# ── LOCAL_TEST 용 JSON 파일 기반 DB 대체 ──────────────────────────────
+# 로컬 테스트 시 MySQL 대신 JSON 파일을 사용하여 데이터를 저장/조회한다.
+LOCAL_DB_DIR = DATA_DIR / "local_db"
+
+LOCAL_KVAN_LINKS_PATH = LOCAL_DB_DIR / "kvan_links.json"
+LOCAL_KVAN_TRANSACTIONS_PATH = LOCAL_DB_DIR / "kvan_transactions.json"
+LOCAL_TRANSACTIONS_PATH = LOCAL_DB_DIR / "kvan_internal_transactions.json"
+LOCAL_DASHBOARD_PATH = LOCAL_DB_DIR / "kvan_dashboard.json"
+
+
+def _local_db_read(path: Path) -> list[dict]:
+    """LOCAL_TEST 용 JSON 파일에서 레코드 목록을 읽어온다."""
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+    except Exception as e:
+        print(f"[LOCAL_DB] 파일 읽기 실패 ({path.name}): {e}")
+    return []
+
+
+def _local_db_write(path: Path, records: list[dict]) -> None:
+    """LOCAL_TEST 용 JSON 파일에 레코드 목록을 저장한다."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(records, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    except Exception as e:
+        print(f"[LOCAL_DB] 파일 쓰기 실패 ({path.name}): {e}")
+
+
+def _local_db_upsert(path: Path, record: dict, key_field: str) -> None:
+    """키 필드 기준으로 기존 레코드를 업데이트하거나 새로 추가한다."""
+    records = _local_db_read(path)
+    key_val = record.get(key_field, "")
+    found = False
+    if key_val:
+        for i, r in enumerate(records):
+            if str(r.get(key_field, "")) == str(key_val):
+                records[i] = {**r, **record}
+                found = True
+                break
+    if not found:
+        records.append(record)
+    _local_db_write(path, records)
+
+
 def signal_crawler_wakeup() -> None:
     """
     K-VAN 크롤러(kvan_crawler.py)에 "즉시 다시 크롤링해 달라"는 신호를 남긴다.
@@ -1086,8 +1133,8 @@ def _scrape_dashboard_and_store(driver: webdriver.Chrome) -> None:
     로컬 테스트 모드(LOCAL_TEST=True)에서는 DB 에 쓰지 않고 바로 리턴한다.
     """
     if LOCAL_TEST:
-        print("[LOCAL_TEST] 대시보드 크롤링/DB 저장을 건너뜁니다.")
-        return
+        print("[LOCAL_TEST] 대시보드 크롤링 → JSON 저장 모드.")
+        # LOCAL_TEST에서도 대시보드를 크롤링하되, DB 대신 JSON 에 저장
     try:
         # 대시보드가 렌더링될 시간을 아주 짧게만 준다
         time.sleep(0.5)
@@ -1206,48 +1253,72 @@ def _scrape_dashboard_and_store(driver: webdriver.Chrome) -> None:
         except Exception:
             pass
 
-        conn = get_db()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO kvan_dashboard (
-                  captured_at,
-                  monthly_sales_amount,
-                  monthly_approved_count,
-                  monthly_approved_amount,
-                  monthly_canceled_count,
-                  monthly_canceled_amount,
-                  yesterday_sales_amount,
-                  yesterday_approved_count,
-                  yesterday_approved_amount,
-                  yesterday_canceled_count,
-                  yesterday_canceled_amount,
-                  settlement_expected_amount,
-                  today_settlement_expected_amount,
-                  credit_amount,
-                  recent_tx_summary
+        dashboard_record = {
+            "captured_at": datetime.utcnow().isoformat(),
+            "monthly_sales_amount": monthly_sales,
+            "monthly_approved_count": monthly_approved_cnt,
+            "monthly_approved_amount": monthly_approved_amt,
+            "monthly_canceled_count": monthly_canceled_cnt,
+            "monthly_canceled_amount": monthly_canceled_amt,
+            "yesterday_sales_amount": yesterday_sales,
+            "yesterday_approved_count": yesterday_approved_cnt,
+            "yesterday_approved_amount": yesterday_approved_amt,
+            "yesterday_canceled_count": yesterday_canceled_cnt,
+            "yesterday_canceled_amount": yesterday_canceled_amt,
+            "settlement_expected_amount": settlement_expected,
+            "today_settlement_expected_amount": today_settlement_expected,
+            "credit_amount": credit_amount,
+            "recent_tx_summary": recent_summary,
+        }
+
+        if LOCAL_TEST:
+            records = _local_db_read(LOCAL_DASHBOARD_PATH)
+            records.append(dashboard_record)
+            _local_db_write(LOCAL_DASHBOARD_PATH, records)
+            print(f"[LOCAL_TEST] 대시보드 정보 JSON 저장 완료 ({LOCAL_DASHBOARD_PATH.name})")
+        else:
+            conn = get_db()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO kvan_dashboard (
+                      captured_at,
+                      monthly_sales_amount,
+                      monthly_approved_count,
+                      monthly_approved_amount,
+                      monthly_canceled_count,
+                      monthly_canceled_amount,
+                      yesterday_sales_amount,
+                      yesterday_approved_count,
+                      yesterday_approved_amount,
+                      yesterday_canceled_count,
+                      yesterday_canceled_amount,
+                      settlement_expected_amount,
+                      today_settlement_expected_amount,
+                      credit_amount,
+                      recent_tx_summary
+                    )
+                    VALUES (NOW(), %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        monthly_sales,
+                        monthly_approved_cnt,
+                        monthly_approved_amt,
+                        monthly_canceled_cnt,
+                        monthly_canceled_amt,
+                        yesterday_sales,
+                        yesterday_approved_cnt,
+                        yesterday_approved_amt,
+                        yesterday_canceled_cnt,
+                        yesterday_canceled_amt,
+                        settlement_expected,
+                        today_settlement_expected,
+                        credit_amount,
+                        recent_summary,
+                    ),
                 )
-                VALUES (NOW(), %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """,
-                (
-                    monthly_sales,
-                    monthly_approved_cnt,
-                    monthly_approved_amt,
-                    monthly_canceled_cnt,
-                    monthly_canceled_amt,
-                    yesterday_sales,
-                    yesterday_approved_cnt,
-                    yesterday_approved_amt,
-                    yesterday_canceled_cnt,
-                    yesterday_canceled_amt,
-                    settlement_expected,
-                    today_settlement_expected,
-                    credit_amount,
-                    recent_summary,
-                ),
-            )
-        conn.commit()
-        conn.close()
+            conn.commit()
+            conn.close()
     except Exception as e:
         # 대시보드 크롤링 실패는 치명적이지 않으므로 로그만 남기고 계속 진행
         print(f"[WARN] 대시보드 크롤링/DB 저장 실패: {e}")
@@ -1291,17 +1362,9 @@ def _scrape_transactions_and_store(driver: webdriver.Chrome) -> None:
     K-VAN 결제/취소 거래내역 페이지(/transactions)의 테이블을 크롤링하여
     kvan_transactions 테이블에 저장.
     """
-    if LOCAL_TEST:
-        print("[LOCAL_TEST] /transactions 크롤링/DB 저장을 건너뜁니다.")
-        # 페이지 이동과 화면 구조만 빠르게 확인 (항상 실제 새로고침)
-        if "transactions" in driver.current_url:
-            driver.refresh()
-        else:
-            driver.get("https://store.k-van.app/transactions")
-        return
-
     try:
-        _ensure_kvan_transactions_table()
+        if not LOCAL_TEST:
+            _ensure_kvan_transactions_table()
         # 첫 방문 또는 재방문 시 항상 최신 데이터를 보도록 새로고침/이동
         if "transactions" in driver.current_url:
             driver.refresh()
@@ -1345,34 +1408,53 @@ def _scrape_transactions_and_store(driver: webdriver.Chrome) -> None:
             print("[INFO] /transactions 테이블에 표시된 거래 내역이 없습니다.")
             return
 
-        conn = get_db()
-        inserted = 0
-        with conn.cursor() as cur:
-            for tr in rows:
-                try:
-                    cells = tr.find_elements(By.XPATH, ".//td")
-                    texts = [c.text.strip() for c in cells]
-                    if not any(texts):
-                        continue
+        # 행 데이터를 먼저 수집
+        parsed_rows: list[dict] = []
+        for tr in rows:
+            try:
+                cells = tr.find_elements(By.XPATH, ".//td")
+                texts = [c.text.strip() for c in cells]
+                if not any(texts):
+                    continue
 
-                    def get(i: int) -> str:
-                        return texts[i] if 0 <= i < len(texts) else ""
+                def get(i: int) -> str:
+                    return texts[i] if 0 <= i < len(texts) else ""
 
-                    merchant = get(idx_merchant)
-                    pg_name = get(idx_pg)
-                    mid = get(idx_mid)
-                    fee_rate = get(idx_fee)
-                    tx_type = get(idx_type)
-                    amount = _parse_amount(get(idx_amt))
-                    cancel_amount = _parse_amount(get(idx_cancel))
-                    payable_amount = _parse_amount(get(idx_payable))
-                    card_company = get(idx_cardco)
-                    card_number = get(idx_cardno)
-                    installment = get(idx_inst)
-                    approval_no = get(idx_approval)
-                    registered_at = get(idx_reg)
-                    raw_text = " | ".join(texts)
+                parsed_rows.append({
+                    "captured_at": datetime.utcnow().isoformat(),
+                    "merchant_name": get(idx_merchant),
+                    "pg_name": get(idx_pg),
+                    "mid": get(idx_mid),
+                    "fee_rate": get(idx_fee),
+                    "tx_type": get(idx_type),
+                    "amount": _parse_amount(get(idx_amt)),
+                    "cancel_amount": _parse_amount(get(idx_cancel)),
+                    "payable_amount": _parse_amount(get(idx_payable)),
+                    "card_company": get(idx_cardco),
+                    "card_number": get(idx_cardno),
+                    "installment": get(idx_inst),
+                    "approval_no": get(idx_approval),
+                    "registered_at": get(idx_reg),
+                    "raw_text": " | ".join(texts),
+                })
+            except Exception as e_row:
+                print(f"[WARN] 거래내역 한 행 파싱 중 오류: {e_row}")
+                continue
 
+        if not parsed_rows:
+            return
+
+        if LOCAL_TEST:
+            # JSON 파일에 저장
+            existing = _local_db_read(LOCAL_KVAN_TRANSACTIONS_PATH)
+            existing.extend(parsed_rows)
+            _local_db_write(LOCAL_KVAN_TRANSACTIONS_PATH, existing)
+            print(f"[LOCAL_TEST] /transactions 에서 {len(parsed_rows)}건의 거래내역을 JSON 저장 ({LOCAL_KVAN_TRANSACTIONS_PATH.name})")
+        else:
+            conn = get_db()
+            inserted = 0
+            with conn.cursor() as cur:
+                for rec in parsed_rows:
                     cur.execute(
                         """
                         INSERT INTO kvan_transactions (
@@ -1395,32 +1477,28 @@ def _scrape_transactions_and_store(driver: webdriver.Chrome) -> None:
                         VALUES (NOW(), %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                         """,
                         (
-                            merchant,
-                            pg_name,
-                            mid,
-                            fee_rate,
-                            tx_type,
-                            amount,
-                            cancel_amount,
-                            payable_amount,
-                            card_company,
-                            card_number,
-                            installment,
-                            approval_no,
-                            registered_at,
-                            raw_text,
+                            rec["merchant_name"],
+                            rec["pg_name"],
+                            rec["mid"],
+                            rec["fee_rate"],
+                            rec["tx_type"],
+                            rec["amount"],
+                            rec["cancel_amount"],
+                            rec["payable_amount"],
+                            rec["card_company"],
+                            rec["card_number"],
+                            rec["installment"],
+                            rec["approval_no"],
+                            rec["registered_at"],
+                            rec["raw_text"],
                         ),
                     )
                     inserted += 1
-                except Exception as e_row:
-                    print(f"[WARN] 거래내역 한 행 파싱/저장 중 오류: {e_row}")
-                    continue
-
-        conn.commit()
-        conn.close()
-        print(f"[INFO] /transactions 에서 {inserted}건의 거래내역을 kvan_transactions 에 저장했습니다.")
+            conn.commit()
+            conn.close()
+            print(f"[INFO] /transactions 에서 {inserted}건의 거래내역을 kvan_transactions 에 저장했습니다.")
     except Exception as e:
-        print(f"[WARN] 거래내역(/transactions) 크롤링/DB 저장 실패: {e}")
+        print(f"[WARN] 거래내역(/transactions) 크롤링/저장 실패: {e}")
 
 
 def _sync_kvan_to_transactions() -> bool:
@@ -1437,37 +1515,15 @@ def _sync_kvan_to_transactions() -> bool:
     agency_id 매핑:
     - agencies.kvan_mid 와 kvan_transactions.mid 를 비교해 일치하는 대행사를 찾는다.
     """
-    if LOCAL_TEST:
-        print("[LOCAL_TEST] kvan_transactions → transactions 매핑/생성을 건너뜁니다.")
-        return False
-
     updated = 0
     inserted = 0
     try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            # 0) MID -> agency_id 매핑 테이블 생성
-            agency_mid_map: dict[str, str] = {}
-            try:
-                cur.execute("SELECT id, kvan_mid FROM agencies")
-                for ag in cur.fetchall():
-                    m = (ag.get("kvan_mid") or "").strip()
-                    if m:
-                        agency_mid_map[m] = ag["id"]
-            except Exception as e_ag:
-                print(f"[WARN] agencies.kvan_mid 조회 중 오류(계속 진행): {e_ag}")
-
-            # 1) 최근 K-VAN 거래 200건만 사용 (raw_text로 세션 KEY 추출 → 대행사 구분)
-            cur.execute(
-                """
-                SELECT id, captured_at, merchant_name, mid, tx_type,
-                       amount, approval_no, registered_at, raw_text
-                FROM kvan_transactions
-                ORDER BY captured_at DESC
-                LIMIT 200
-                """
-            )
-            krows = cur.fetchall()
+        if LOCAL_TEST:
+            # JSON 파일 기반 매핑
+            krows = _local_db_read(LOCAL_KVAN_TRANSACTIONS_PATH)
+            # 최근 200건만 사용 (captured_at 역순)
+            krows = sorted(krows, key=lambda r: r.get("captured_at", ""), reverse=True)[:200]
+            local_txs = _local_db_read(LOCAL_TRANSACTIONS_PATH)
 
             for kr in krows:
                 amt = kr.get("amount") or 0
@@ -1477,21 +1533,13 @@ def _sync_kvan_to_transactions() -> bool:
                 reg = (kr.get("registered_at") or "").strip()
                 raw_text = (kr.get("raw_text") or "").strip()
                 if not amt or not approval:
-                    # 금액/승인번호가 없으면 내부 거래와 매핑하기 어려우므로 건너뜀
                     continue
 
-                # 등록일에서 날짜 부분만 추출 (예: '2026-03-12 10:20:30' -> '2026-03-12')
-                reg_date = reg.split(" ")[0] if reg else ""
-
-                # 대행사/본사 구분: KEY로 시작하는 세션ID 추출 → admin_state에서 agency_id 조회, 없으면 MID 폴백
                 agency_id: str | None = None
                 session_match = re.search(r"KEY[0-9A-Za-z]+", raw_text) if raw_text else None
                 if session_match:
                     agency_id = _get_agency_id_for_session(session_match.group(0))
-                if not agency_id and mid and mid in agency_mid_map:
-                    agency_id = agency_mid_map[mid]
 
-                # K-VAN 결제유형 기준으로 내부 status 유추
                 tx_status = "other"
                 tx_type_text = tx_type or ""
                 if "승인" in tx_type_text:
@@ -1499,123 +1547,235 @@ def _sync_kvan_to_transactions() -> bool:
                 elif "취소" in tx_type_text or "실패" in tx_type_text or "오류" in tx_type_text:
                     tx_status = "fail"
 
-                # 1단계: 승인번호로 기존 거래 찾기
-                cur.execute(
-                    """
-                    SELECT id, agency_id
-                    FROM transactions
-                    WHERE kvan_approval_no = %s
-                    LIMIT 1
-                    """,
-                    (approval,),
-                )
-                tx = cur.fetchone()
-                if tx:
-                    tx_id = tx["id"]
-                    # agency_id 가 비어 있고, 이번 K-VAN 에서 대행사를 알 수 있다면 채워 넣는다.
-                    cur.execute(
-                        """
-                        UPDATE transactions
-                        SET amount = COALESCE(amount, %s),
-                            status = %s,
-                            kvan_mid = %s,
-                            kvan_approval_no = %s,
-                            kvan_tx_type = %s,
-                            kvan_registered_at = %s,
-                            agency_id = COALESCE(agency_id, %s)
-                        WHERE id = %s
-                        """,
-                        (amt, tx_status, mid, approval, tx_type, reg, agency_id, tx_id),
-                    )
+                # 승인번호로 기존 거래 찾기
+                found_idx = None
+                for i, t in enumerate(local_txs):
+                    if (t.get("kvan_approval_no") or "").strip() == approval:
+                        found_idx = i
+                        break
+
+                if found_idx is not None:
+                    local_txs[found_idx]["amount"] = local_txs[found_idx].get("amount") or amt
+                    local_txs[found_idx]["status"] = tx_status
+                    local_txs[found_idx]["kvan_mid"] = mid
+                    local_txs[found_idx]["kvan_approval_no"] = approval
+                    local_txs[found_idx]["kvan_tx_type"] = tx_type
+                    local_txs[found_idx]["kvan_registered_at"] = reg
+                    if not local_txs[found_idx].get("agency_id"):
+                        local_txs[found_idx]["agency_id"] = agency_id
                     updated += 1
                     continue
 
-                # 2단계: 금액 + 날짜(+ agency_id) 기준으로 기존 거래 찾기
-                params: list = [amt, reg_date, reg_date]
-                sql = """
-                    SELECT id, agency_id
-                    FROM transactions
-                    WHERE amount = %s
-                      AND (%s = '' OR DATE(created_at) = %s)
-                """
-                if agency_id:
-                    sql += " AND agency_id = %s"
-                    params.append(agency_id)
-                sql += """
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                """
-                cur.execute(sql, tuple(params))
-                tx = cur.fetchone()
-                if tx:
-                    tx_id = tx["id"]
-                    cur.execute(
-                        """
-                        UPDATE transactions
-                        SET status = %s,
-                            kvan_mid = %s,
-                            kvan_approval_no = %s,
-                            kvan_tx_type = %s,
-                            kvan_registered_at = %s
-                        WHERE id = %s
-                        """,
-                        (tx_status, mid, approval, tx_type, reg, tx_id),
-                    )
+                # 금액 기준 매핑
+                reg_date = reg.split(" ")[0] if reg else ""
+                found_idx = None
+                for i, t in enumerate(local_txs):
+                    if t.get("amount") == amt:
+                        t_date = (t.get("created_at") or "").split("T")[0]
+                        if not reg_date or t_date == reg_date:
+                            if not agency_id or t.get("agency_id") == agency_id:
+                                found_idx = i
+                                break
+
+                if found_idx is not None:
+                    local_txs[found_idx]["status"] = tx_status
+                    local_txs[found_idx]["kvan_mid"] = mid
+                    local_txs[found_idx]["kvan_approval_no"] = approval
+                    local_txs[found_idx]["kvan_tx_type"] = tx_type
+                    local_txs[found_idx]["kvan_registered_at"] = reg
                     updated += 1
                     continue
 
-                # 3단계: 매칭되는 기존 거래가 없으면 새 transactions 레코드 생성
+                # 새 레코드 생성
                 new_tx_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")[-18:]
                 message = f"K-VAN {tx_type or '거래'} 자동 연동 (MID={mid}, 승인번호={approval})"
-                cur.execute(
-                    """
-                    INSERT INTO transactions (
-                      id,
-                      created_at,
-                      agency_id,
-                      amount,
-                      customer_name,
-                      phone_number,
-                      card_type,
-                      resident_front,
-                      status,
-                      message,
-                      settlement_status,
-                      settled_at,
-                      kvan_mid,
-                      kvan_approval_no,
-                      kvan_tx_type,
-                      kvan_registered_at
-                    )
-                    VALUES (
-                      %s, NOW(), %s, %s,
-                      '', '', '', '',
-                      %s, %s,
-                      '미정산', NULL,
-                      %s, %s, %s, %s
-                    )
-                    """,
-                    (
-                        new_tx_id,
-                        agency_id,
-                        amt,
-                        tx_status,
-                        message,
-                        mid,
-                        approval,
-                        tx_type,
-                        reg,
-                    ),
-                )
+                local_txs.append({
+                    "id": new_tx_id,
+                    "created_at": datetime.utcnow().isoformat(),
+                    "agency_id": agency_id,
+                    "amount": amt,
+                    "customer_name": "",
+                    "status": tx_status,
+                    "message": message,
+                    "settlement_status": "미정산",
+                    "kvan_mid": mid,
+                    "kvan_approval_no": approval,
+                    "kvan_tx_type": tx_type,
+                    "kvan_registered_at": reg,
+                })
                 inserted += 1
 
-        conn.commit()
-        conn.close()
-        if updated or inserted:
-            print(
-                f"[INFO] kvan_transactions 기반으로 내부 거래 매핑/생성 완료 "
-                f"(updated={updated}, inserted={inserted})"
-            )
+            _local_db_write(LOCAL_TRANSACTIONS_PATH, local_txs)
+            if updated or inserted:
+                print(
+                    f"[LOCAL_TEST] kvan_transactions 기반 내부 거래 매핑/생성 완료 "
+                    f"(updated={updated}, inserted={inserted}, file={LOCAL_TRANSACTIONS_PATH.name})"
+                )
+        else:
+            conn = get_db()
+            with conn.cursor() as cur:
+                # 0) MID -> agency_id 매핑 테이블 생성
+                agency_mid_map: dict[str, str] = {}
+                try:
+                    cur.execute("SELECT id, kvan_mid FROM agencies")
+                    for ag in cur.fetchall():
+                        m = (ag.get("kvan_mid") or "").strip()
+                        if m:
+                            agency_mid_map[m] = ag["id"]
+                except Exception as e_ag:
+                    print(f"[WARN] agencies.kvan_mid 조회 중 오류(계속 진행): {e_ag}")
+
+                # 1) 최근 K-VAN 거래 200건만 사용 (raw_text로 세션 KEY 추출 → 대행사 구분)
+                cur.execute(
+                    """
+                    SELECT id, captured_at, merchant_name, mid, tx_type,
+                           amount, approval_no, registered_at, raw_text
+                    FROM kvan_transactions
+                    ORDER BY captured_at DESC
+                    LIMIT 200
+                    """
+                )
+                krows = cur.fetchall()
+
+                for kr in krows:
+                    amt = kr.get("amount") or 0
+                    approval = (kr.get("approval_no") or "").strip()
+                    mid = (kr.get("mid") or "").strip()
+                    tx_type = (kr.get("tx_type") or "").strip()
+                    reg = (kr.get("registered_at") or "").strip()
+                    raw_text = (kr.get("raw_text") or "").strip()
+                    if not amt or not approval:
+                        continue
+
+                    reg_date = reg.split(" ")[0] if reg else ""
+
+                    agency_id: str | None = None
+                    session_match = re.search(r"KEY[0-9A-Za-z]+", raw_text) if raw_text else None
+                    if session_match:
+                        agency_id = _get_agency_id_for_session(session_match.group(0))
+                    if not agency_id and mid and mid in agency_mid_map:
+                        agency_id = agency_mid_map[mid]
+
+                    tx_status = "other"
+                    tx_type_text = tx_type or ""
+                    if "승인" in tx_type_text:
+                        tx_status = "success"
+                    elif "취소" in tx_type_text or "실패" in tx_type_text or "오류" in tx_type_text:
+                        tx_status = "fail"
+
+                    cur.execute(
+                        """
+                        SELECT id, agency_id
+                        FROM transactions
+                        WHERE kvan_approval_no = %s
+                        LIMIT 1
+                        """,
+                        (approval,),
+                    )
+                    tx = cur.fetchone()
+                    if tx:
+                        tx_id = tx["id"]
+                        cur.execute(
+                            """
+                            UPDATE transactions
+                            SET amount = COALESCE(amount, %s),
+                                status = %s,
+                                kvan_mid = %s,
+                                kvan_approval_no = %s,
+                                kvan_tx_type = %s,
+                                kvan_registered_at = %s,
+                                agency_id = COALESCE(agency_id, %s)
+                            WHERE id = %s
+                            """,
+                            (amt, tx_status, mid, approval, tx_type, reg, agency_id, tx_id),
+                        )
+                        updated += 1
+                        continue
+
+                    params: list = [amt, reg_date, reg_date]
+                    sql = """
+                        SELECT id, agency_id
+                        FROM transactions
+                        WHERE amount = %s
+                          AND (%s = '' OR DATE(created_at) = %s)
+                    """
+                    if agency_id:
+                        sql += " AND agency_id = %s"
+                        params.append(agency_id)
+                    sql += """
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    """
+                    cur.execute(sql, tuple(params))
+                    tx = cur.fetchone()
+                    if tx:
+                        tx_id = tx["id"]
+                        cur.execute(
+                            """
+                            UPDATE transactions
+                            SET status = %s,
+                                kvan_mid = %s,
+                                kvan_approval_no = %s,
+                                kvan_tx_type = %s,
+                                kvan_registered_at = %s
+                            WHERE id = %s
+                            """,
+                            (tx_status, mid, approval, tx_type, reg, tx_id),
+                        )
+                        updated += 1
+                        continue
+
+                    new_tx_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")[-18:]
+                    message = f"K-VAN {tx_type or '거래'} 자동 연동 (MID={mid}, 승인번호={approval})"
+                    cur.execute(
+                        """
+                        INSERT INTO transactions (
+                          id,
+                          created_at,
+                          agency_id,
+                          amount,
+                          customer_name,
+                          phone_number,
+                          card_type,
+                          resident_front,
+                          status,
+                          message,
+                          settlement_status,
+                          settled_at,
+                          kvan_mid,
+                          kvan_approval_no,
+                          kvan_tx_type,
+                          kvan_registered_at
+                        )
+                        VALUES (
+                          %s, NOW(), %s, %s,
+                          '', '', '', '',
+                          %s, %s,
+                          '미정산', NULL,
+                          %s, %s, %s, %s
+                        )
+                        """,
+                        (
+                            new_tx_id,
+                            agency_id,
+                            amt,
+                            tx_status,
+                            message,
+                            mid,
+                            approval,
+                            tx_type,
+                            reg,
+                        ),
+                    )
+                    inserted += 1
+
+            conn.commit()
+            conn.close()
+            if updated or inserted:
+                print(
+                    f"[INFO] kvan_transactions 기반으로 내부 거래 매핑/생성 완료 "
+                    f"(updated={updated}, inserted={inserted})"
+                )
     except Exception as e:
         print(f"[WARN] K-VAN ↔ 내부 transactions 매핑/생성 중 오류: {e}")
     return bool(updated or inserted)
@@ -1658,17 +1818,9 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
     - 인근 텍스트(상품명, 금액, 유효시간, 상태, MID, 세션ID 등)를 모두 raw_text 로 저장하고
     - 자주 쓰는 필드(제목/금액/유효시간/status/MID/세션ID)는 휴리스틱하게 추출한다.
     """
-    if LOCAL_TEST:
-        print("[LOCAL_TEST] /payment-link 크롤링/DB 저장을 건너뜁니다.")
-        # 항상 실제 새로고침 또는 첫 진입 (진입 실패 시에도 DB 작업은 건너뛰고 종료)
-        if not _go_to_payment_link(driver):
-            raise RuntimeError("[NAV] LOCAL_TEST 모드에서 /payment-link 로 진입하지 못했습니다.")
-        driver.refresh()
-        _wait_payment_link_page_ready(driver)
-        return
-
     try:
-        _ensure_kvan_links_table()
+        if not LOCAL_TEST:
+            _ensure_kvan_links_table()
         # /payment-link 로 안정적으로 진입 후, 항상 새로고침
         if not _go_to_payment_link(driver):
             raise RuntimeError("[NAV] /payment-link 로 진입하지 못해 링크 리스트 크롤링을 중단합니다.")
@@ -1712,203 +1864,215 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
                 print("[INFO] /payment-link 에 표시된 결제링크가 없습니다.")
                 return
 
-        conn = get_db()
-        inserted = 0
-        with conn.cursor() as cur:
-            # 기본 모드: 링크 URL 텍스트 기반 수집
-            for el in link_elements:
+        # 파싱된 링크 레코드를 수집
+        parsed_links: list[dict] = []
+
+        # 기본 모드: 링크 URL 텍스트 기반 수집
+        for el in link_elements:
+            try:
+                # 링크 문자열 추출
+                link_text = (el.text or "").strip()
+                if not link_text:
+                    link_text = (el.get_attribute("value") or "").strip()
+                if not link_text:
+                    link_text = (el.get_attribute("href") or "").strip()
+                if not link_text:
+                    continue
+
+                # 링크 URL의 querystring에서 sessionId를 우선 추출해 매핑 정확도를 높인다.
+                parsed_session_id = ""
                 try:
-                    # 링크 문자열 추출
-                    link_text = (el.text or "").strip()
-                    if not link_text:
-                        link_text = (el.get_attribute("value") or "").strip()
-                    if not link_text:
-                        link_text = (el.get_attribute("href") or "").strip()
-                    if not link_text:
-                        continue
-
-                    # 링크 URL의 querystring에서 sessionId를 우선 추출해 매핑 정확도를 높인다.
+                    q = parse_qs(urlparse(link_text).query)
+                    parsed_session_id = str((q.get("sessionId") or [""])[0] or "").strip()
+                except Exception:
                     parsed_session_id = ""
-                    try:
-                        q = parse_qs(urlparse(link_text).query)
-                        parsed_session_id = str((q.get("sessionId") or [""])[0] or "").strip()
-                    except Exception:
-                        parsed_session_id = ""
 
-                    # 카드/행 컨테이너: 가장 가까운 div[role='row'] 또는 카드형 div
-                    container = el
-                    for _ in range(5):
-                        container = container.find_element(By.XPATH, "./parent::*")
-                        cls = container.get_attribute("class") or ""
-                        if "border" in cls or "rounded" in cls or "shadow" in cls or "row" in cls:
+                # 카드/행 컨테이너: 가장 가까운 div[role='row'] 또는 카드형 div
+                container = el
+                for _ in range(5):
+                    container = container.find_element(By.XPATH, "./parent::*")
+                    cls = container.get_attribute("class") or ""
+                    if "border" in cls or "rounded" in cls or "shadow" in cls or "row" in cls:
+                        break
+
+                card_text = container.text.strip()
+
+                # 제목/상품명: 첫 줄 또는 '상품명' 이라는 단어가 포함된 줄
+                lines = [ln.strip() for ln in card_text.splitlines() if ln.strip()]
+                title = lines[0] if lines else ""
+                for ln in lines:
+                    if "상품명" in ln:
+                        title = ln
+                        break
+
+                # 금액: '원' 이 포함된 숫자
+                amount = 0
+                for ln in lines:
+                    if "원" in ln:
+                        amt = _parse_amount(ln)
+                        if amt:
+                            amount = amt
                             break
 
-                    card_text = container.text.strip()
+                # 유효시간/TTL: '분' 텍스트가 있는 줄 추출 (예: '60분 (긴 결제 플로우)')
+                ttl_label = ""
+                for ln in lines:
+                    if ("분" in ln and "유효" in ln) or ("세션" in ln):
+                        ttl_label = ln
+                        break
 
-                    # 제목/상품명: 첫 줄 또는 '상품명' 이라는 단어가 포함된 줄
-                    lines = [ln.strip() for ln in card_text.splitlines() if ln.strip()]
-                    title = lines[0] if lines else ""
+                # 상태: '사용중', '만료', '취소' 등 단어가 포함된 줄 추출
+                status = _extract_status_from_link_lines(lines)
+
+                # MID / 세션ID: 'MID' 또는 '세션' 텍스트 기반
+                mid = ""
+                kvan_session_id = ""
+                for ln in lines:
+                    if "MID" in ln.upper():
+                        mid = ln
+                    if "세션" in ln or "Session" in ln:
+                        kvan_session_id = ln
+                resolved_session_id = parsed_session_id
+                if not resolved_session_id and kvan_session_id:
+                    m = re.search(r"(KEY[0-9A-Za-z]+)", kvan_session_id)
+                    if m:
+                        resolved_session_id = m.group(1)
+                if not resolved_session_id:
                     for ln in lines:
-                        if "상품명" in ln:
-                            title = ln
-                            break
-
-                    # 금액: '원' 이 포함된 숫자
-                    amount = 0
-                    for ln in lines:
-                        if "원" in ln:
-                            amt = _parse_amount(ln)
-                            if amt:
-                                amount = amt
-                                break
-
-                    # 유효시간/TTL: '분' 텍스트가 있는 줄 추출 (예: '60분 (긴 결제 플로우)')
-                    ttl_label = ""
-                    for ln in lines:
-                        if ("분" in ln and "유효" in ln) or ("세션" in ln):
-                            ttl_label = ln
-                            break
-
-                    # 상태: '사용중', '만료', '취소' 등 단어가 포함된 줄 추출
-                    status = _extract_status_from_link_lines(lines)
-
-                    # MID / 세션ID: 'MID' 또는 '세션' 텍스트 기반
-                    mid = ""
-                    kvan_session_id = ""
-                    for ln in lines:
-                        if "MID" in ln.upper():
-                            mid = ln
-                        if "세션" in ln or "Session" in ln:
-                            kvan_session_id = ln
-                    resolved_session_id = parsed_session_id
-                    if not resolved_session_id and kvan_session_id:
-                        m = re.search(r"(KEY[0-9A-Za-z]+)", kvan_session_id)
+                        m = re.search(r"(KEY[0-9A-Za-z]+)", ln)
                         if m:
                             resolved_session_id = m.group(1)
-                    if not resolved_session_id:
-                        for ln in lines:
-                            m = re.search(r"(KEY[0-9A-Za-z]+)", ln)
-                            if m:
-                                resolved_session_id = m.group(1)
-                                break
+                            break
 
-                    # 동일 링크가 매 사이클 누적 저장되지 않도록 기존 행을 제거 후 최신 스냅샷 저장
-                    cur.execute("DELETE FROM kvan_links WHERE kvan_link = %s", (link_text,))
+                parsed_links.append({
+                    "captured_at": datetime.utcnow().isoformat(),
+                    "title": title,
+                    "amount": amount,
+                    "ttl_label": ttl_label,
+                    "status": status,
+                    "kvan_link": link_text,
+                    "mid": mid,
+                    "kvan_session_id": resolved_session_id or kvan_session_id,
+                    "raw_text": card_text,
+                })
 
+                # 크롤링으로 새로 얻은 링크를 admin_state.json 에도 즉시 반영
+                if link_text:
+                    try:
+                        st_data = _load_admin_state()
+                        matched = False
+                        for s in st_data.get("sessions") or []:
+                            sid = str(s.get("id") or "")
+                            if (resolved_session_id and sid and sid == resolved_session_id) or \
+                               (sid and title and sid in title):
+                                if s.get("kvan_link") != link_text:
+                                    s["kvan_link"] = link_text
+                                    matched = True
+                        if matched:
+                            _save_admin_state(st_data)
+                    except Exception:
+                        pass
+            except Exception as e_row:
+                print(f"[WARN] 결제링크 카드 파싱/저장 중 오류: {e_row}")
+                continue
+
+        # 폴백 모드: KEY 세션ID 기반 수집
+        if not link_elements and fallback_rows:
+            for row in fallback_rows:
+                try:
+                    row_text = (row.text or "").strip()
+                    if not row_text:
+                        continue
+                    lines = [ln.strip() for ln in row_text.splitlines() if ln.strip()]
+                    sid = ""
+                    for ln in lines:
+                        m = re.search(r"(KEY[0-9A-Za-z]+)", ln)
+                        if m:
+                            sid = m.group(1)
+                            break
+                    if not sid:
+                        continue
+                    link_text = f"https://store.k-van.app/p/{sid}?sessionId={sid}&type=KEYED"
+                    title = ""
+                    amount = 0
+                    status = ""
+                    ttl_label = ""
+                    mid = ""
+                    for ln in lines:
+                        if not title and "원" in ln:
+                            title = ln
+                        if not amount and "원" in ln:
+                            amount = _parse_amount(ln) or 0
+                        if not ttl_label and ("분" in ln):
+                            ttl_label = ln
+                        if not status:
+                            status = _extract_status_from_link_lines([ln])
+                        if not mid and "MID" in ln.upper():
+                            mid = ln
+                    parsed_links.append({
+                        "captured_at": datetime.utcnow().isoformat(),
+                        "title": title,
+                        "amount": amount,
+                        "ttl_label": ttl_label,
+                        "status": status,
+                        "kvan_link": link_text,
+                        "mid": mid,
+                        "kvan_session_id": sid,
+                        "raw_text": row_text,
+                    })
+                    try:
+                        st_data = _load_admin_state()
+                        matched = False
+                        for s in st_data.get("sessions") or []:
+                            if str(s.get("id") or "") == sid:
+                                if s.get("kvan_link") != link_text:
+                                    s["kvan_link"] = link_text
+                                    matched = True
+                        if matched:
+                            _save_admin_state(st_data)
+                    except Exception:
+                        pass
+                except Exception as e_row2:
+                    print(f"[WARN] 결제링크 폴백 파싱/저장 중 오류: {e_row2}")
+                    continue
+
+        if not parsed_links:
+            return
+
+        # 저장: LOCAL_TEST → JSON, 서버 → DB
+        if LOCAL_TEST:
+            # 기존 레코드에서 동일 kvan_link 제거 후 최신 스냅샷 저장
+            existing = _local_db_read(LOCAL_KVAN_LINKS_PATH)
+            new_links_set = {r["kvan_link"] for r in parsed_links}
+            existing = [r for r in existing if r.get("kvan_link") not in new_links_set]
+            existing.extend(parsed_links)
+            _local_db_write(LOCAL_KVAN_LINKS_PATH, existing)
+            print(f"[LOCAL_TEST] /payment-link 에서 {len(parsed_links)}건의 결제링크 정보를 JSON 저장 ({LOCAL_KVAN_LINKS_PATH.name})")
+        else:
+            conn = get_db()
+            inserted = 0
+            with conn.cursor() as cur:
+                for rec in parsed_links:
+                    cur.execute("DELETE FROM kvan_links WHERE kvan_link = %s", (rec["kvan_link"],))
                     cur.execute(
                         """
                         INSERT INTO kvan_links (
-                          captured_at,
-                          title,
-                          amount,
-                          ttl_label,
-                          status,
-                          kvan_link,
-                          mid,
-                          kvan_session_id,
-                          raw_text
+                          captured_at, title, amount, ttl_label, status,
+                          kvan_link, mid, kvan_session_id, raw_text
                         )
                         VALUES (NOW(), %s,%s,%s,%s,%s,%s,%s,%s)
                         """,
                         (
-                            title,
-                            amount,
-                            ttl_label,
-                            status,
-                            link_text,
-                            mid,
-                            resolved_session_id or kvan_session_id,
-                            card_text,
+                            rec["title"], rec["amount"], rec["ttl_label"], rec["status"],
+                            rec["kvan_link"], rec["mid"], rec["kvan_session_id"], rec["raw_text"],
                         ),
                     )
                     inserted += 1
-
-                    # 크롤링으로 새로 얻은 링크를 admin_state.json 에도 즉시 반영
-                    # (sessionId 가 있으면 세션 ID 기준으로 우선 매칭)
-                    if link_text:
-                        try:
-                            st_data = _load_admin_state()
-                            matched = False
-                            for s in st_data.get("sessions") or []:
-                                sid = str(s.get("id") or "")
-                                if (resolved_session_id and sid and sid == resolved_session_id) or \
-                                   (sid and title and sid in title):
-                                    if s.get("kvan_link") != link_text:
-                                        s["kvan_link"] = link_text
-                                        matched = True
-                            if matched:
-                                _save_admin_state(st_data)
-                        except Exception:
-                            pass
-                except Exception as e_row:
-                    print(f"[WARN] 결제링크 카드 파싱/저장 중 오류: {e_row}")
-                    continue
-
-            # 폴백 모드: KEY 세션ID 기반 수집
-            if not link_elements and fallback_rows:
-                for row in fallback_rows:
-                    try:
-                        row_text = (row.text or "").strip()
-                        if not row_text:
-                            continue
-                        lines = [ln.strip() for ln in row_text.splitlines() if ln.strip()]
-                        sid = ""
-                        for ln in lines:
-                            m = re.search(r"(KEY[0-9A-Za-z]+)", ln)
-                            if m:
-                                sid = m.group(1)
-                                break
-                        if not sid:
-                            continue
-                        link_text = f"https://store.k-van.app/p/{sid}?sessionId={sid}&type=KEYED"
-                        title = ""
-                        amount = 0
-                        status = ""
-                        ttl_label = ""
-                        mid = ""
-                        for ln in lines:
-                            if not title and "원" in ln:
-                                title = ln
-                            if not amount and "원" in ln:
-                                amount = _parse_amount(ln) or 0
-                            if not ttl_label and ("분" in ln):
-                                ttl_label = ln
-                            if not status:
-                                status = _extract_status_from_link_lines([ln])
-                            if not mid and "MID" in ln.upper():
-                                mid = ln
-                        cur.execute("DELETE FROM kvan_links WHERE kvan_link = %s", (link_text,))
-                        cur.execute(
-                            """
-                            INSERT INTO kvan_links (
-                              captured_at, title, amount, ttl_label, status, kvan_link, mid, kvan_session_id, raw_text
-                            )
-                            VALUES (NOW(), %s,%s,%s,%s,%s,%s,%s,%s)
-                            """,
-                            (title, amount, ttl_label, status, link_text, mid, sid, row_text),
-                        )
-                        inserted += 1
-                        try:
-                            st_data = _load_admin_state()
-                            matched = False
-                            for s in st_data.get("sessions") or []:
-                                if str(s.get("id") or "") == sid:
-                                    if s.get("kvan_link") != link_text:
-                                        s["kvan_link"] = link_text
-                                        matched = True
-                            if matched:
-                                _save_admin_state(st_data)
-                        except Exception:
-                            pass
-                    except Exception as e_row2:
-                        print(f"[WARN] 결제링크 폴백 파싱/저장 중 오류: {e_row2}")
-                        continue
-
-        conn.commit()
-        conn.close()
-        print(f"[INFO] /payment-link 에서 {inserted}건의 결제링크 정보를 kvan_links 에 저장했습니다.")
+            conn.commit()
+            conn.close()
+            print(f"[INFO] /payment-link 에서 {inserted}건의 결제링크 정보를 kvan_links 에 저장했습니다.")
     except Exception as e:
-        print(f"[WARN] 결제링크 관리(/payment-link) 크롤링/DB 저장 실패: {e}")
+        print(f"[WARN] 결제링크 관리(/payment-link) 크롤링/저장 실패: {e}")
 
 
 def _is_expired_link_status(status_text: str) -> bool:
@@ -1998,15 +2162,87 @@ def _kvan_now() -> datetime:
 
 def mark_expired_sessions_from_kvan_links() -> None:
     """
-    kvan_links 테이블에서 상태가 '만료'인 링크 URL 목록을 조회한 뒤,
+    kvan_links 데이터(DB 또는 로컬 JSON)에서 상태가 '만료'인 링크 URL 목록을 조회한 뒤,
     admin_state.json 의 진행 중 세션 중 해당 링크를 가진 세션을 종료 처리한다.
 
     정책:
-    - 만료/취소 링크 데이터(kvan_links)는 DB에서 자동 삭제한다.
+    - 만료/취소 링크 데이터(kvan_links)는 DB/JSON에서 자동 삭제한다.
     - 거래내역(transactions)은 자동 삭제하지 않는다.
     - admin_state 의 진행중 세션은 즉시 제거하고, history에
       status='만료', deleted_in_kvan=True 로 남긴다.
     """
+    if LOCAL_TEST:
+        # JSON 파일 기반으로 만료 세션 반영
+        try:
+            kvan_links = _local_db_read(LOCAL_KVAN_LINKS_PATH)
+            expired_urls: set[str] = set()
+            excluded_sids: set[str] = set()
+            if EXPIRED_WITH_TRANSACTIONS_PATH.exists():
+                try:
+                    data = json.loads(EXPIRED_WITH_TRANSACTIONS_PATH.read_text(encoding="utf-8"))
+                    for item in (data if isinstance(data, list) else []):
+                        sid = (item.get("session_id") or "").strip()
+                        if sid:
+                            excluded_sids.add(sid)
+                except Exception:
+                    pass
+
+            for row in kvan_links:
+                url = (row.get("kvan_link") or "").strip()
+                status_text = str(row.get("status") or "").strip()
+                sid = (row.get("kvan_session_id") or "").strip()
+                if url and _is_expired_link_status(status_text) and sid not in excluded_sids:
+                    expired_urls.add(url)
+
+            if not expired_urls:
+                return
+
+            st = _load_admin_state()
+            sessions = list(st.get("sessions") or [])
+            history = list(st.get("history") or [])
+            remaining_sessions: list[dict] = []
+            removed_count = 0
+            now_iso = datetime.utcnow().isoformat()
+
+            for s in sessions:
+                link = (s.get("kvan_link") or "").strip()
+                if link and link in expired_urls:
+                    removed_count += 1
+                    sid = str(s.get("id") or "")
+                    s["status"] = "만료"
+                    s["deleted"] = True
+                    s["deleted_in_kvan"] = True
+                    s["deleted_at"] = now_iso
+                    s["finished_at"] = s.get("finished_at") or now_iso
+                    old_msg = str(s.get("result_message") or "").strip()
+                    mark_msg = "만료 감지로 K-VAN 링크가 삭제되었습니다."
+                    s["result_message"] = f"{old_msg}\n{mark_msg}".strip() if old_msg else mark_msg
+                    history = _upsert_history_by_session_id(history, dict(s))
+                    _append_admin_log(
+                        "AUTO",
+                        f"만료 링크 세션 정리 session_id={sid}, link={link[:50]}...",
+                    )
+                else:
+                    remaining_sessions.append(s)
+
+            st["sessions"] = remaining_sessions
+            st["history"] = history
+            _save_admin_state(st)
+
+            # JSON에서 만료 링크 삭제
+            remaining_links = [r for r in kvan_links if (r.get("kvan_link") or "").strip() not in expired_urls]
+            _local_db_write(LOCAL_KVAN_LINKS_PATH, remaining_links)
+
+            if removed_count:
+                _append_admin_log(
+                    "AUTO",
+                    f"[LOCAL_TEST] 만료/취소 링크 JSON 정리 완료 (세션 {removed_count}건, 링크 {len(expired_urls)}건)",
+                )
+                print(f"[LOCAL_TEST] 만료 링크 세션 반영 완료 (세션 {removed_count}건, 링크 {len(expired_urls)}건)")
+        except Exception as e:
+            print(f"[WARN] [LOCAL_TEST] 링크 만료 세션 반영 실패: {e}")
+        return
+
     for attempt in range(1, 4):
         conn = None
         try:
@@ -2120,10 +2356,6 @@ def _sync_popup_transaction_to_internal(
     - kvan_approval_no 가 같은 transactions 가 있으면 업데이트,
       없으면 새 레코드를 INSERT 한다.
     """
-    if LOCAL_TEST:
-        print("[LOCAL_TEST] 팝업 기반 transactions 동기화를 건너뜁니다.")
-        return
-
     approval_no = (approval_no or "").strip()
     if not approval_no or not amount:
         return
@@ -2142,85 +2374,127 @@ def _sync_popup_transaction_to_internal(
         print(f"[WARN] popup 기반 agency_id 조회 실패: {e}")
 
     try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            # 1) 승인번호로 기존 거래 찾기
-            cur.execute(
-                """
-                SELECT id FROM transactions
-                WHERE kvan_approval_no = %s
-                LIMIT 1
-                """,
-                (approval_no,),
-            )
-            row = cur.fetchone()
-            if row:
-                tx_id = row["id"]
-                cur.execute(
-                    """
-                    UPDATE transactions
-                    SET amount = COALESCE(amount, %s),
-                        customer_name = COALESCE(customer_name, %s),
-                        status = 'success',
-                        kvan_registered_at = %s,
-                        agency_id = COALESCE(agency_id, %s)
-                    WHERE id = %s
-                    """,
-                    (amount, customer_name or "", registered_at, agency_id, tx_id),
-                )
+        if LOCAL_TEST:
+            # JSON 파일 기반 동기화
+            local_txs = _local_db_read(LOCAL_TRANSACTIONS_PATH)
+            found_idx = None
+            for i, t in enumerate(local_txs):
+                if (t.get("kvan_approval_no") or "").strip() == approval_no:
+                    found_idx = i
+                    break
+
+            if found_idx is not None:
+                local_txs[found_idx]["amount"] = local_txs[found_idx].get("amount") or amount
+                local_txs[found_idx]["customer_name"] = local_txs[found_idx].get("customer_name") or (customer_name or "")
+                local_txs[found_idx]["status"] = "success"
+                local_txs[found_idx]["kvan_registered_at"] = registered_at
+                if not local_txs[found_idx].get("agency_id"):
+                    local_txs[found_idx]["agency_id"] = agency_id
             else:
-                # 2) 새 레코드 생성
                 new_tx_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")[-18:]
                 message = (
                     f"K-VAN 결제 승인 (세션ID={session_id}, 승인번호={approval_no}, 카드={card_number})"
                 )
-                cur.execute(
-                    """
-                    INSERT INTO transactions (
-                      id,
-                      created_at,
-                      agency_id,
-                      amount,
-                      customer_name,
-                      phone_number,
-                      card_type,
-                      resident_front,
-                      status,
-                      message,
-                      settlement_status,
-                      settled_at,
-                      kvan_mid,
-                      kvan_approval_no,
-                      kvan_tx_type,
-                      kvan_registered_at
-                    )
-                    VALUES (
-                      %s, NOW(), %s, %s,
-                      %s, '', '', '',
-                      'success', %s,
-                      '미정산', NULL,
-                      '', %s, '결제 승인', %s
-                    )
-                    """,
-                    (
-                        new_tx_id,
-                        agency_id,
-                        amount,
-                        customer_name or "",
-                        message,
-                        approval_no,
-                        registered_at,
-                    ),
-                )
-                # 결제 완료 알림 큐에 추가 (본사/대행사 어드민에서 미확인 알림 표시용)
+                local_txs.append({
+                    "id": new_tx_id,
+                    "created_at": datetime.utcnow().isoformat(),
+                    "agency_id": agency_id,
+                    "amount": amount,
+                    "customer_name": customer_name or "",
+                    "status": "success",
+                    "message": message,
+                    "settlement_status": "미정산",
+                    "kvan_approval_no": approval_no,
+                    "kvan_tx_type": "결제 승인",
+                    "kvan_registered_at": registered_at,
+                })
                 _append_payment_notification(
                     agency_id=agency_id or "",
                     amount=amount,
                     tx_id=new_tx_id,
                     customer_name=customer_name or "",
                 )
-        conn.commit()
-        conn.close()
+            _local_db_write(LOCAL_TRANSACTIONS_PATH, local_txs)
+            print(f"[LOCAL_TEST] 팝업 기반 transactions JSON 동기화 완료 (approval_no={approval_no})")
+        else:
+            conn = get_db()
+            with conn.cursor() as cur:
+                # 1) 승인번호로 기존 거래 찾기
+                cur.execute(
+                    """
+                    SELECT id FROM transactions
+                    WHERE kvan_approval_no = %s
+                    LIMIT 1
+                    """,
+                    (approval_no,),
+                )
+                row = cur.fetchone()
+                if row:
+                    tx_id = row["id"]
+                    cur.execute(
+                        """
+                        UPDATE transactions
+                        SET amount = COALESCE(amount, %s),
+                            customer_name = COALESCE(customer_name, %s),
+                            status = 'success',
+                            kvan_registered_at = %s,
+                            agency_id = COALESCE(agency_id, %s)
+                        WHERE id = %s
+                        """,
+                        (amount, customer_name or "", registered_at, agency_id, tx_id),
+                    )
+                else:
+                    # 2) 새 레코드 생성
+                    new_tx_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")[-18:]
+                    message = (
+                        f"K-VAN 결제 승인 (세션ID={session_id}, 승인번호={approval_no}, 카드={card_number})"
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO transactions (
+                          id,
+                          created_at,
+                          agency_id,
+                          amount,
+                          customer_name,
+                          phone_number,
+                          card_type,
+                          resident_front,
+                          status,
+                          message,
+                          settlement_status,
+                          settled_at,
+                          kvan_mid,
+                          kvan_approval_no,
+                          kvan_tx_type,
+                          kvan_registered_at
+                        )
+                        VALUES (
+                          %s, NOW(), %s, %s,
+                          %s, '', '', '',
+                          'success', %s,
+                          '미정산', NULL,
+                          '', %s, '결제 승인', %s
+                        )
+                        """,
+                        (
+                            new_tx_id,
+                            agency_id,
+                            amount,
+                            customer_name or "",
+                            message,
+                            approval_no,
+                            registered_at,
+                        ),
+                    )
+                    _append_payment_notification(
+                        agency_id=agency_id or "",
+                        amount=amount,
+                        tx_id=new_tx_id,
+                        customer_name=customer_name or "",
+                    )
+            conn.commit()
+            conn.close()
     except Exception as e:
         print(f"[WARN] popup 기반 transactions 동기화 실패: {e}")
 
@@ -2708,24 +2982,40 @@ def _mark_session_deleted(session_id: str, title: str, kvan_deleted: bool = Fals
         print(f"[EXPIRED_DEBUG] _mark_session_deleted 완료: history에 deleted=True 보존 session_id={session_id}")
 
         # 만료+거래없음 → kvan_links에서 해당 행 삭제 대상으로 표시 (status='만료' 반영 후 mark_expired_sessions_from_kvan_links가 DELETE)
-        if not LOCAL_TEST and session_id:
-            try:
-                conn = _get_db_with_retry()
+        if session_id:
+            if LOCAL_TEST:
                 try:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            UPDATE kvan_links
-                            SET status = '만료'
-                            WHERE (kvan_session_id = %s OR kvan_link LIKE %s)
-                            """,
-                            (session_id, f"%{session_id}%"),
-                        )
-                    conn.commit()
-                finally:
-                    conn.close()
-            except Exception as e_db:
-                print(f"[WARN] _mark_session_deleted kvan_links 반영 실패: {e_db}")
+                    links = _local_db_read(LOCAL_KVAN_LINKS_PATH)
+                    changed = False
+                    for lnk in links:
+                        sid = (lnk.get("kvan_session_id") or "").strip()
+                        url = (lnk.get("kvan_link") or "").strip()
+                        if sid == session_id or (session_id and session_id in url):
+                            lnk["status"] = "만료"
+                            changed = True
+                    if changed:
+                        _local_db_write(LOCAL_KVAN_LINKS_PATH, links)
+                        print(f"[LOCAL_TEST] kvan_links JSON에서 session_id={session_id[:30]}... 상태 '만료'로 반영")
+                except Exception as e_json:
+                    print(f"[WARN] [LOCAL_TEST] _mark_session_deleted kvan_links JSON 반영 실패: {e_json}")
+            else:
+                try:
+                    conn = _get_db_with_retry()
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                UPDATE kvan_links
+                                SET status = '만료'
+                                WHERE (kvan_session_id = %s OR kvan_link LIKE %s)
+                                """,
+                                (session_id, f"%{session_id}%"),
+                            )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                except Exception as e_db:
+                    print(f"[WARN] _mark_session_deleted kvan_links 반영 실패: {e_db}")
     except Exception as e:
         print(f"[WARN] _mark_session_deleted 실패: {e}")
 
