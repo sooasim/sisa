@@ -219,12 +219,19 @@ def _wait_with_wakeup(total_delay: int) -> None:
 
 def run_crawler_loop(max_cycles: int = 0, max_runtime_sec: int = 0) -> None:
     """
-    링크/거래/대시보드 상태 추적용 크롤러 메인 루프.
-    - 링크 생성/결제는 auto_kvan.py 가 담당
-    - 이 크롤러는 3~5초 주기로 /dashboard, /transactions, /payment-link 를 순회하며
-      DB(kvan_dashboard, kvan_transactions, kvan_links)를 갱신
-    - 추가로, 환경 변수 K_VAN_CRAWL_INTERVAL 이 600 이상으로 지정되어 있으면
-      그 주기를 "백업용 최소 간격" 으로 사용 (3~5초 추적은 그대로 유지)
+    링크/거래 상태 추적용 크롤러 메인 루프.
+
+    1사이클 흐름:
+    ─ [결제링크 있음]
+        결제링크 관리 크롤링 → 만료 처리 → 팝업 스캔
+        → 결제 및 취소내역 크롤링 → 내부 DB 동기화
+        → 변화 있으면 4~7초 / 없으면 10분 대기
+    ─ [결제링크 없음]
+        결제 및 취소내역 페이지로 이동 → 새로고침 → 크롤링 → 동기화
+        → 결제링크 관리로 복귀 → 새로고침 → 링크 재확인
+            ├ 링크 있으면 → 팝업 스캔 → 4~7초 대기
+            └ 링크 없으면 → 10분 대기
+    ─ 대기 중 어드민/대행사 페이지에서 wakeup 요청 시 즉시 재개
     """
     import random
 
@@ -239,25 +246,21 @@ def run_crawler_loop(max_cycles: int = 0, max_runtime_sec: int = 0) -> None:
         if LOCAL_TEST:
             print("[crawler] LOCAL_TEST 모드: DB 관련 쓰기는 auto_kvan 에서 모두 건너뜁니다.")
             print("[crawler] 참고: DB 저장/동기화까지 검증하려면 SISA_LOCAL_TEST=0 으로 실행하세요.")
-            print("[crawler] LOCAL_TEST 시 mark_expired_sessions_from_kvan_links 는 호출하지 않아 대기 없이 바로 팝업 스캔으로 진행합니다.")
         _dbg(f"로그인 직후 current_url={driver.current_url}")
 
-        # 로그인 직후에는 대시보드 크롤링을 하지 말고,
-        # 바로 결제링크 관리 화면으로 한 번 이동해서 권한/세션을 확정시킨다.
+        # 로그인 직후 결제링크 관리 화면으로 이동해 권한/세션을 확정시킨다.
         try:
-            _dbg("로그인 직후 결제링크 관리 페이지로 직접 이동 시도 (/payment-link, 다중 재시도 포함)")
+            _dbg("로그인 직후 결제링크 관리 페이지로 직접 이동 시도")
             if not _go_to_payment_link(driver):
-                _dbg("로그인 직후 /payment-link 진입 실패 (다음 루프에서 다시 시도 예정)")
+                _dbg("로그인 직후 /payment-link 진입 실패 (다음 루프에서 재시도)")
             else:
                 _dbg(f"결제링크 관리 첫 진입 성공, URL={driver.current_url}")
         except Exception as e:
-            _dbg(f"결제링크 관리 첫 진입 중 예외 발생: {e!r} (다음 루프에서 재시도)")
+            _dbg(f"결제링크 관리 첫 진입 중 예외 발생: {e!r}")
 
-        # 빠른 추적(4~7초) + 선택적 백업 간격
         backup_interval = int(os.environ.get("K_VAN_CRAWL_INTERVAL", "600"))
         last_backup_ts = 0.0
         cycle = 0
-        empty_cycles = 0  # 연속으로 "링크 없음"으로 판정된 사이클 수
 
         started_ts = time.time()
         while True:
@@ -273,6 +276,7 @@ def run_crawler_loop(max_cycles: int = 0, max_runtime_sec: int = 0) -> None:
             _dbg(f"사이클 {cycle} 시작, 현재 URL={driver.current_url}")
 
             had_new = False
+            has_links = False
             stop_by_runtime = False
 
             def _runtime_guard() -> bool:
@@ -286,17 +290,13 @@ def run_crawler_loop(max_cycles: int = 0, max_runtime_sec: int = 0) -> None:
                 return False
 
             try:
-                # 2026-03: 대시보드 화면이 '권한 확인 중...' 스피너와 리다이렉트 구조로 바뀌어
-                # 자주 멈추는 문제가 있어, 크롤러에서는 대시보드 크롤링을 건너뛰고
-                # 결제링크 관리 → 거래내역 순으로만 처리한다 (로컬 테스트 우선).
                 _dbg("대시보드 크롤링은 건너뜀 (결제링크 관리 → 거래내역 순으로 처리)")
 
-                # 1) 결제링크 관리 리스트 크롤링 (항상 새로고침/이동)
+                # ── 1) 결제링크 관리 크롤링 (이동/새로고침 포함) ──────────────
                 t_links = time.time()
-                _dbg("결제링크 목록 크롤링 시작 (_scrape_payment_links_and_store)")
+                _dbg("결제링크 목록 크롤링 시작")
                 _scrape_payment_links_and_store(driver)
-                _dbg(f"결제링크 목록 크롤링 종료 (elapsed={time.time() - t_links:.2f}s, url={driver.current_url})")
-                # LOCAL_TEST 시 DB 미연결로 타임아웃 대기 방지 → mark_expired 생략 후 바로 다음 단계(팝업 스캔 등) 진행
+                _dbg(f"결제링크 목록 크롤링 종료 (elapsed={time.time() - t_links:.2f}s)")
                 if not LOCAL_TEST:
                     try:
                         mark_expired_sessions_from_kvan_links()
@@ -305,65 +305,87 @@ def run_crawler_loop(max_cycles: int = 0, max_runtime_sec: int = 0) -> None:
                 if _runtime_guard():
                     break
 
-                # 1-1) 현재 결제링크가 화면에 남아 있는지 간단히 확인
-                # (팝업 스캔 여부를 결정하는 용도, empty_cycles 업데이트는 루프 끝에서 수행)
                 has_links = _has_payment_links_quick(driver)
-
-                # 2) 결제링크 관리 화면 동기화
-                #    - 리스트는 항상 순회해 만료를 즉시 처리
-                #    - 활성 세션이 없으면 비만료 건의 팝업 파싱은 생략해 사이클을 단축
                 active_for_popup = _has_active_sessions(window_minutes=30)
+
                 if has_links:
+                    # ── [링크 있음] 팝업 스캔 → 거래내역 → 동기화 ────────────
                     t_popup = time.time()
-                    _dbg("결제링크 팝업 스캔 시작 (_scan_payment_link_popups_and_sync)")
+                    _dbg("결제링크 팝업 스캔 시작")
                     if _scan_payment_link_popups_and_sync(
                         driver,
                         allow_popup_for_non_expired=active_for_popup,
                     ):
                         had_new = True
                         _dbg("결제링크 팝업 스캔에서 신규 변화 감지 (had_new=True)")
-                    _dbg(f"결제링크 팝업 스캔 종료 (elapsed={time.time() - t_popup:.2f}s, url={driver.current_url})")
-                if _runtime_guard():
-                    break
+                    _dbg(f"결제링크 팝업 스캔 종료 (elapsed={time.time() - t_popup:.2f}s)")
+                    if _runtime_guard():
+                        break
 
-                # 3) 결제 및 취소 내역(/transactions)으로 이동해서 새로고침 후
-                #    추가 승인/취소 내역을 DB(kvan_transactions)에 반영
-                t_tx = time.time()
-                _dbg("거래내역 크롤링 시작 (_scrape_transactions_and_store)")
-                _scrape_transactions_and_store(driver)
-                _dbg(f"거래내역 크롤링 종료 (elapsed={time.time() - t_tx:.2f}s, url={driver.current_url})")
-                if _runtime_guard():
-                    break
+                    t_tx = time.time()
+                    _dbg("거래내역 크롤링 시작")
+                    _scrape_transactions_and_store(driver)
+                    _dbg(f"거래내역 크롤링 종료 (elapsed={time.time() - t_tx:.2f}s)")
+                    if _runtime_guard():
+                        break
 
-                # 4) K-VAN 테이블(kvan_transactions, kvan_links) → 내부 transactions 매핑/갱신
-                t_sync = time.time()
-                _dbg("K-VAN → 내부 transactions 동기화 시작 (_sync_kvan_to_transactions)")
-                if _sync_kvan_to_transactions():
-                    had_new = True
-                    _dbg("K-VAN → transactions 동기화에서 신규/갱신 발생 (had_new=True)")
-                _dbg(f"K-VAN → transactions 동기화 종료 (elapsed={time.time() - t_sync:.2f}s)")
-                if _runtime_guard():
-                    break
+                    t_sync = time.time()
+                    _dbg("K-VAN → 내부 transactions 동기화 시작")
+                    if _sync_kvan_to_transactions():
+                        had_new = True
+                        _dbg("K-VAN → transactions 동기화에서 신규/갱신 발생 (had_new=True)")
+                    _dbg(f"K-VAN → transactions 동기화 종료 (elapsed={time.time() - t_sync:.2f}s)")
+                    if _runtime_guard():
+                        break
 
-                # 5) 한 사이클을 마무리하기 전에 다시 결제링크 관리 화면으로 돌아와
-                #    새로고침 후 "링크 존재 여부"를 최종적으로 한 번 더 확인한다.
-                try:
-                    if _go_to_payment_link(driver):
-                        driver.refresh()
-                        _wait_payment_link_page_ready(driver)
-                        has_links_end = _has_payment_links_quick(driver)
-                        if has_links_end:
-                            empty_cycles = 0
-                            _dbg("사이클 종료 시점: 결제링크가 하나 이상 존재 → empty_cycles=0 으로 리셋")
+                else:
+                    # ── [링크 없음] 거래내역 확인 → 결제링크 관리 복귀 ─────────
+                    _alog("결제링크 없음 → 결제 및 취소내역 페이지로 이동해 신규 거래 확인")
+                    _dbg("결제링크 없음 → /transactions 로 이동")
+
+                    t_tx = time.time()
+                    _scrape_transactions_and_store(driver)
+                    _dbg(f"거래내역 크롤링 종료 (elapsed={time.time() - t_tx:.2f}s)")
+                    if _runtime_guard():
+                        break
+
+                    t_sync = time.time()
+                    _dbg("K-VAN → 내부 transactions 동기화 시작")
+                    if _sync_kvan_to_transactions():
+                        had_new = True
+                        _dbg("거래내역에서 신규 데이터 발견 (had_new=True)")
+                    _dbg(f"K-VAN → transactions 동기화 종료 (elapsed={time.time() - t_sync:.2f}s)")
+                    if _runtime_guard():
+                        break
+
+                    # 결제링크 관리로 복귀 → 새로고침 → 링크 재확인
+                    _alog("결제링크 관리 페이지로 복귀 → 새로고침 후 링크 재확인")
+                    _dbg("결제링크 없음 사이클: /payment-link 로 복귀 후 새로고침")
+                    try:
+                        if _go_to_payment_link(driver):
+                            driver.refresh()
+                            _wait_payment_link_page_ready(driver)
+                            has_links_retry = _has_payment_links_quick(driver)
+                            if has_links_retry:
+                                has_links = True
+                                _alog("복귀 후 결제링크 발견 → 팝업 스캔 진행")
+                                _dbg("복귀 후 결제링크 발견 → 팝업 스캔 진행")
+                                if _scan_payment_link_popups_and_sync(
+                                    driver,
+                                    allow_popup_for_non_expired=active_for_popup,
+                                ):
+                                    had_new = True
+                            else:
+                                _alog("복귀 후에도 결제링크 없음 → 10분 대기 예정")
+                                _dbg("복귀 후에도 결제링크 없음 → 10분 대기로 전환")
                         else:
-                            empty_cycles += 1
-                            _dbg(f"사이클 종료 시점: 결제링크 없음으로 판정 → empty_cycles={empty_cycles}")
-                    else:
-                        _dbg("사이클 종료 시점: /payment-link 로 돌아오지 못함(다음 루프에서 재시도)")
-                except Exception as e_nav_end:
-                    _dbg(f"사이클 종료 시점 결제링크 재확인 중 예외: {e_nav_end!r}")
+                            _dbg("/payment-link 복귀 실패 (다음 루프에서 재시도)")
+                    except Exception as e_retry:
+                        _dbg(f"결제링크 복귀 재확인 중 예외: {e_retry!r}")
+                    if _runtime_guard():
+                        break
+
             except Exception as e:
-                # 내비게이션 관련 치명적 오류(RuntimeError)는 "여기서 멈추고" 디버그를 남긴 뒤 루프를 종료한다.
                 try:
                     cur_url = driver.current_url
                 except Exception:
@@ -378,7 +400,6 @@ def run_crawler_loop(max_cycles: int = 0, max_runtime_sec: int = 0) -> None:
                 print(f"[crawler][WARN] 크롤링 중 오류: {e}")
                 _alog(f"[WARN] 크롤링 중 오류: {e}")
                 _dbg(f"크롤링 중 예외 발생: {e!r}, 현재 URL={cur_url}, 재로그인 시도")
-                # 에러 발생 시 재로그인 시도 후 다음 루프에서 재시도
                 try:
                     _simple_sign_in(driver)
                 except Exception as e2:
@@ -397,28 +418,24 @@ def run_crawler_loop(max_cycles: int = 0, max_runtime_sec: int = 0) -> None:
                 _alog(msg)
                 break
 
-            # 활성 세션/신규 변화/링크 존재 여부에 따라 대기 시간 결정
-            # - 링크가 없고(empty_cycles>=3) 최근 3사이클 연속으로 비어 있으면: 10분에 한 번만 체크
-            # - 그 외에는 기존 로직과 동일하게 4~7초 주기 유지
+            # 대기 시간 결정:
+            # - 결제링크가 있거나, 신규 거래 발생, 활성 세션이 있으면: 4~7초 짧은 주기
+            # - 결제링크도 없고 신규 거래도 없으면: 10분 대기 (wakeup 요청 시 즉시 재개)
             active = _has_active_sessions(window_minutes=10)
-            if empty_cycles >= 3:
-                delay = 600
-            elif active or had_new:
+            if had_new or has_links or active:
                 delay = random.randint(4, 7)
             else:
                 delay = 600
             print(
                 f"[crawler] 다음 크롤링까지 {delay}초 대기 "
-                f"(active_sessions={active}, had_new={had_new}, empty_cycles={empty_cycles})"
+                f"(has_links={has_links}, had_new={had_new}, active_sessions={active})"
             )
             _alog(
                 f"다음 크롤링까지 {delay}초 대기 "
-                f"(active_sessions={active}, had_new={had_new}, empty_cycles={empty_cycles})"
+                f"(has_links={has_links}, had_new={had_new}, active_sessions={active})"
             )
             _wait_with_wakeup(delay)
 
-            # backup_interval 이상 지나면, 타임스탬프만 갱신
-            # (지금은 동일한 크롤링을 수행하므로 별도의 추가 작업은 필요 없음)
             now_ts = time.time()
             if backup_interval > 0 and now_ts - last_backup_ts >= backup_interval:
                 print(f"[crawler] 백업 주기({backup_interval}s) 도달 - 크롤링 주기 정상 동작 확인.")
