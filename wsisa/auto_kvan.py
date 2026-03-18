@@ -2045,13 +2045,9 @@ def mark_expired_sessions_from_kvan_links() -> None:
                 else:
                     remaining_sessions.append(s)
 
-            # 히스토리 정리: K-VAN 에서 삭제되었고 거래 내역도 없는 항목은
-            # 어드민/대행사 페이지에 표시할 필요가 없으므로 제거한다.
-            # 거래 내역이 있는 만료 세션(has_transaction=True)은 정산 확인용으로 유지.
-            history = [
-                h for h in history
-                if not (bool(h.get("deleted_in_kvan")) and not bool(h.get("has_transaction")))
-            ]
+            # 히스토리에 deleted_in_kvan=True 항목을 유지해야
+            # _is_session_already_processed()가 다음 사이클에서 재처리를 방지할 수 있다.
+            # 어드민/대행사 페이지 표시 필터링은 web_form.py 의 _is_visible 에서 처리.
             st["sessions"] = remaining_sessions
             st["history"] = history
             _save_admin_state(st)
@@ -3106,6 +3102,11 @@ return out;
                             f"만료+팝업없음 세션 삭제 session_id={session_id} (kvan_deleted={deleted_ok})",
                         )
                         changed = True
+                        if deleted_ok:
+                            # K-VAN에서 카드가 삭제되면 DOM이 재렌더되어 나머지 btn들이 stale해진다.
+                            # 다음 사이클에서 나머지 카드를 처리하도록 루프를 종료한다.
+                            print("[EXPIRED_DEBUG] K-VAN 삭제 성공 → DOM 재렌더로 카드 루프 종료 (다음 사이클에서 계속)")
+                            break
                         continue
                     # 팝업 내용이 로드될 때까지 짧게 대기
                     time.sleep(0.5)
@@ -3118,6 +3119,10 @@ return out;
                         or "거래 내역 없음" in popup_text
                         or "내역이 없습니다" in popup_text
                         or "내역이 없" in popup_text
+                    )
+                    print(
+                        f"[EXPIRED_DEBUG] 만료 카드 팝업: tbody tr {len(tx_rows)}개, "
+                        f"has_no_history={has_no_history} session_id={session_id[:30]}..."
                     )
                     if has_no_history:
                         # 팝업 닫기 → K-VAN에서 실제 링크 삭제 → 내부 상태 업데이트
@@ -3134,6 +3139,10 @@ return out;
                             f"만료+거래없음 세션 삭제 session_id={session_id} (kvan_deleted={deleted_ok})",
                         )
                         changed = True
+                        if deleted_ok:
+                            # K-VAN에서 카드가 삭제되면 DOM이 재렌더되어 나머지 btn들이 stale해진다.
+                            print("[EXPIRED_DEBUG] K-VAN 삭제 성공 → DOM 재렌더로 카드 루프 종료 (다음 사이클에서 계속)")
+                            break
                         continue
                     # 만료 but 거래 내역 있음 → DB 저장 후 어드민 알림 목록에 추가
                     agency_id = _get_agency_id_for_session(session_id)
