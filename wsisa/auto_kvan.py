@@ -2045,6 +2045,13 @@ def mark_expired_sessions_from_kvan_links() -> None:
                 else:
                     remaining_sessions.append(s)
 
+            # 히스토리 정리: K-VAN 에서 삭제되었고 거래 내역도 없는 항목은
+            # 어드민/대행사 페이지에 표시할 필요가 없으므로 제거한다.
+            # 거래 내역이 있는 만료 세션(has_transaction=True)은 정산 확인용으로 유지.
+            history = [
+                h for h in history
+                if not (bool(h.get("deleted_in_kvan")) and not bool(h.get("has_transaction")))
+            ]
             st["sessions"] = remaining_sessions
             st["history"] = history
             _save_admin_state(st)
@@ -2546,6 +2553,11 @@ def _mark_session_deleted(session_id: str, title: str) -> None:
         removed_session["result_message"] = f"{old_msg}\n{mark_msg}".strip() if old_msg else mark_msg
 
         history = _upsert_history_by_session_id(history, removed_session)
+        # 거래 내역 없는 만료 세션은 히스토리에 남길 필요가 없으므로 즉시 제거
+        history = [
+            h for h in history
+            if not (bool(h.get("deleted_in_kvan")) and not bool(h.get("has_transaction")))
+        ]
         st["sessions"] = remaining_sessions
         st["history"] = history
         _save_admin_state(st)

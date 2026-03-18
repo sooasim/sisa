@@ -2592,8 +2592,11 @@ def admin():
 
     # 진행 중(결제중만) vs 완료/종료(history + 세션 중 만료·결제완료·실패 등) 구분 표시
     _status = lambda s: (str(s.get("status") or "결제중").strip())
-    active_sessions = [s for s in sessions if _status(s) == "결제중"]
-    completed_sessions = list(history) + [s for s in sessions if _status(s) != "결제중"]
+    # K-VAN에서 삭제(deleted_in_kvan=True)되고 거래 내역도 없는 세션은 목록에서 숨긴다.
+    # 거래 내역이 있는 만료 세션(has_transaction=True)은 정산 확인을 위해 계속 표시.
+    _is_visible = lambda s: not (bool(s.get("deleted_in_kvan")) and not bool(s.get("has_transaction")))
+    active_sessions = [s for s in sessions if _status(s) == "결제중" and _is_visible(s)]
+    completed_sessions = [h for h in history if _is_visible(h)] + [s for s in sessions if _status(s) != "결제중" and _is_visible(s)]
 
     # 결제중인데 아직 K-VAN 링크가 없는 세션이 있는지 여부 (자동 새로고침/팝업 트리거 용)
     has_pending_link = any(
@@ -4835,8 +4838,10 @@ def agency_admin():
 
     # 진행 중(결제중만) vs 완료/종료 구분
     _st = lambda s: (str(s.get("status") or "결제중").strip())
-    agency_active_sessions = [s for s in sessions if _st(s) == "결제중"]
-    agency_completed_sessions = list(history) + [s for s in sessions if _st(s) != "결제중"]
+    # K-VAN에서 삭제(deleted_in_kvan=True)되고 거래 내역도 없는 세션은 목록에서 숨긴다.
+    _is_visible_ag = lambda s: not (bool(s.get("deleted_in_kvan")) and not bool(s.get("has_transaction")))
+    agency_active_sessions = [s for s in sessions if _st(s) == "결제중" and _is_visible_ag(s)]
+    agency_completed_sessions = [h for h in history if _is_visible_ag(h)] + [s for s in sessions if _st(s) != "결제중" and _is_visible_ag(s)]
 
     # DB 기반 거래 내역 (transactions 테이블에서 이 대행사 건만)
     agency_transactions: list[dict] = []
