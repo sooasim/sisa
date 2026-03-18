@@ -40,7 +40,14 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, InvalidSessionIdException
+from selenium.webdriver.common.keys import Keys
+from selenium.common.exceptions import (
+    TimeoutException,
+    InvalidSessionIdException,
+    StaleElementReferenceException,
+    NoSuchElementException,
+    ElementClickInterceptedException,
+)
 
 from auto_kvan import (
     _append_admin_log,
@@ -115,6 +122,372 @@ def _wait_with_wakeup(seconds: int) -> None:
                 return
         except Exception:
             pass
+
+
+# =========================
+# 빠른 삭제 자동화 설정
+# =========================
+
+NO_TX_TEXTS = (
+    "거래내역이 없습니다",
+    "거래 내역이 없습니다",
+    "조회된 거래내역이 없습니다",
+)
+
+EXPIRED_TARGET_XPATHS = [
+    "//*[normalize-space(text())='만료']",
+    "//*[contains(@title,'만료')]",
+    "//*[contains(@aria-label,'만료')]",
+    "//*[contains(@class,'expired')]",
+]
+
+TX_TARGET_XPATHS = [
+    ".//*[contains(normalize-space(.), '거래내역')]",
+    ".//*[contains(normalize-space(.), '거래 내역')]",
+    ".//*[contains(normalize-space(.), '내역')]",
+    ".//*[contains(@title, '거래내역')]",
+    ".//*[contains(@title, '거래 내역')]",
+    ".//*[contains(@title, '내역')]",
+    ".//*[contains(@aria-label, '거래내역')]",
+    ".//*[contains(@aria-label, '거래 내역')]",
+    ".//*[contains(@aria-label, '내역')]",
+    ".//*[contains(@class, 'history')]",
+    ".//*[contains(@class, 'transaction')]",
+    ".//*[contains(@class, 'receipt')]",
+    ".//*[contains(@data-testid, 'history')]",
+    ".//*[contains(@data-testid, 'transaction')]",
+    ".//*[contains(@data-icon, 'history')]",
+    ".//*[contains(@data-icon, 'receipt')]",
+]
+
+TRASH_TARGET_XPATHS = [
+    ".//*[contains(normalize-space(.), '삭제')]",
+    ".//*[contains(@title, '삭제')]",
+    ".//*[contains(@title, '휴지통')]",
+    ".//*[contains(@aria-label, '삭제')]",
+    ".//*[contains(@aria-label, '휴지통')]",
+    ".//*[contains(@class, 'trash')]",
+    ".//*[contains(@class, 'delete')]",
+    ".//*[contains(@data-testid, 'delete')]",
+    ".//*[contains(@data-icon, 'trash')]",
+]
+
+DIALOG_XPATHS = [
+    "//div[@role='dialog']",
+    "//div[contains(@class,'modal')]",
+    "//div[contains(@class,'dialog')]",
+    "//div[contains(@class,'popup')]",
+]
+
+CLOSE_TARGET_XPATHS = [
+    ".//*[contains(normalize-space(.), '닫기')]",
+    ".//*[contains(@title, '닫기')]",
+    ".//*[contains(@aria-label, '닫기')]",
+    ".//*[contains(@class, 'close')]",
+]
+
+CONFIRM_DELETE_XPATHS = [
+    ".//*[self::button or self::a][contains(normalize-space(.), '삭제')]",
+    ".//*[self::button or self::a][contains(normalize-space(.), '확인')]",
+    ".//*[self::button or self::a][normalize-space(.)='예']",
+    ".//*[@role='button'][contains(normalize-space(.), '삭제')]",
+    ".//*[@role='button'][contains(normalize-space(.), '확인')]",
+    ".//*[@role='button'][normalize-space(.)='예']",
+]
+
+
+def _safe_text(el) -> str:
+    try:
+        return " ".join((el.text or "").split())
+    except Exception:
+        return ""
+
+
+def _find_visible_elements(root, xpaths: list):
+    found = []
+    for xp in xpaths:
+        try:
+            els = root.find_elements(By.XPATH, xp)
+        except Exception:
+            continue
+        for el in els:
+            try:
+                if el.is_displayed():
+                    found.append(el)
+            except Exception:
+                continue
+    return found
+
+
+def _nearest_clickable(el):
+    try:
+        return el.find_element(
+            By.XPATH,
+            "ancestor-or-self::*[self::button or self::a or @role='button' or @onclick or contains(@class,'btn') or contains(@class,'icon')][1]",
+        )
+    except Exception:
+        return None
+
+
+def _row_container_from(el):
+    row_xpaths = [
+        "ancestor-or-self::tr[1]",
+        "ancestor-or-self::li[1]",
+        "ancestor-or-self::div[contains(@class,'row')][1]",
+        "ancestor-or-self::div[contains(@class,'item')][1]",
+        "ancestor-or-self::div[contains(@class,'card')][1]",
+        "ancestor-or-self::div[contains(@class,'list')][1]",
+    ]
+    for xp in row_xpaths:
+        try:
+            row = el.find_element(By.XPATH, xp)
+            if row.is_displayed():
+                return row
+        except Exception:
+            continue
+    return None
+
+
+def _find_action_in_row(row, target_xpaths: list):
+    targets = _find_visible_elements(row, target_xpaths)
+    for t in targets:
+        try:
+            clickable = _nearest_clickable(t) or t
+            if clickable and clickable.is_displayed():
+                return clickable
+        except Exception:
+            continue
+    return None
+
+
+def _click_fast(driver, el) -> bool:
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center', inline:'center'});", el
+        )
+    except Exception:
+        pass
+
+    try:
+        el.click()
+        return True
+    except (ElementClickInterceptedException, StaleElementReferenceException, Exception):
+        try:
+            driver.execute_script("arguments[0].click();", el)
+            return True
+        except Exception:
+            return False
+
+
+def _has_visible_text(driver, texts) -> bool:
+    for txt in texts:
+        xp = f'//*[contains(normalize-space(.), "{txt}")]'
+        try:
+            els = driver.find_elements(By.XPATH, xp)
+        except Exception:
+            continue
+        for el in els:
+            try:
+                if el.is_displayed():
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _wait_visible_text(driver, texts, timeout: float = 1.8) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        if _has_visible_text(driver, texts):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _find_visible_dialog_root(driver):
+    for xp in DIALOG_XPATHS:
+        try:
+            dialogs = driver.find_elements(By.XPATH, xp)
+        except Exception:
+            continue
+        for dlg in dialogs:
+            try:
+                if dlg.is_displayed():
+                    return dlg
+            except Exception:
+                continue
+    return None
+
+
+def _close_history_popup_fast(driver) -> None:
+    dlg = _find_visible_dialog_root(driver)
+    root = dlg or driver
+
+    close_btn = _find_action_in_row(root, CLOSE_TARGET_XPATHS)
+    if close_btn:
+        _click_fast(driver, close_btn)
+        time.sleep(0.05)
+        return
+
+    # 닫기 버튼이 없으면 ESC
+    try:
+        body = driver.find_element(By.TAG_NAME, "body")
+        body.send_keys(Keys.ESCAPE)
+        time.sleep(0.05)
+    except Exception:
+        pass
+
+
+def _confirm_delete_fast(driver) -> bool:
+    dlg = _find_visible_dialog_root(driver)
+    root = dlg or driver
+
+    btn = _find_action_in_row(root, CONFIRM_DELETE_XPATHS)
+    if not btn:
+        return False
+
+    if not _click_fast(driver, btn):
+        return False
+
+    time.sleep(0.05)
+    return True
+
+
+def _candidate_expired_rows(driver):
+    rows = []
+    seen = set()
+
+    for xp in EXPIRED_TARGET_XPATHS:
+        try:
+            expired_marks = driver.find_elements(By.XPATH, xp)
+        except Exception:
+            continue
+
+        for mark in expired_marks:
+            try:
+                if not mark.is_displayed():
+                    continue
+            except Exception:
+                continue
+
+            row = _row_container_from(mark)
+            if not row:
+                continue
+
+            # 삭제/거래내역 액션이 있는 행만 후보로 채택
+            tx_btn = _find_action_in_row(row, TX_TARGET_XPATHS)
+            trash_btn = _find_action_in_row(row, TRASH_TARGET_XPATHS)
+            if not tx_btn or not trash_btn:
+                continue
+
+            try:
+                key = (int(row.rect.get("y", 0)), _safe_text(row)[:120])
+            except Exception:
+                key = (_safe_text(row)[:120],)
+
+            if key not in seen:
+                seen.add(key)
+                rows.append(row)
+
+    return rows
+
+
+def _delete_one_expired_no_tx_row(driver) -> bool:
+    rows = _candidate_expired_rows(driver)
+    if not rows:
+        _dbg("삭제 후보 행 없음 (만료 + 액션버튼)")
+        return False
+
+    for row in rows:
+        row_desc = _safe_text(row)[:100]
+        _dbg(f"삭제 후보 검사 시작: {row_desc}")
+
+        tx_btn = _find_action_in_row(row, TX_TARGET_XPATHS)
+        trash_btn = _find_action_in_row(row, TRASH_TARGET_XPATHS)
+        if not tx_btn or not trash_btn:
+            _dbg("거래내역 버튼 또는 삭제 버튼을 찾지 못해 스킵")
+            continue
+
+        # 거래내역 열기
+        if not _click_fast(driver, tx_btn):
+            _dbg("거래내역 버튼 클릭 실패")
+            continue
+
+        no_tx = _wait_visible_text(driver, NO_TX_TEXTS, timeout=1.8)
+        _dbg(f"거래내역 없음 판정={no_tx}")
+
+        # 거래내역 팝업 닫기
+        _close_history_popup_fast(driver)
+
+        if not no_tx:
+            _dbg("거래내역 존재 → 삭제 안 함")
+            continue
+
+        # 팝업 닫은 뒤 다시 삭제 버튼 확보
+        try:
+            trash_btn = _find_action_in_row(row, TRASH_TARGET_XPATHS)
+        except Exception:
+            trash_btn = None
+
+        if not trash_btn:
+            _dbg("팝업 닫은 뒤 삭제 버튼 재탐색 실패")
+            continue
+
+        if not _click_fast(driver, trash_btn):
+            _dbg("휴지통 버튼 클릭 실패")
+            continue
+
+        if not _confirm_delete_fast(driver):
+            _dbg("삭제 확인 버튼 클릭 실패")
+            continue
+
+        try:
+            WebDriverWait(driver, 2, poll_frequency=0.05).until(EC.staleness_of(row))
+        except TimeoutException:
+            pass
+
+        _alog(f"만료 + 거래내역 없음 링크 삭제 완료: {row_desc}")
+        _dbg(f"만료 + 거래내역 없음 링크 삭제 완료: {row_desc}")
+        return True
+
+    return False
+
+
+def _delete_expired_links_with_no_transactions(
+    driver,
+    max_delete_per_cycle: int = 20,
+) -> int:
+    """
+    결제링크 관리 화면에서
+    - '만료' 표시가 있고
+    - 거래내역 아이콘을 눌렀을 때 '거래내역이 없습니다'가 보이는 행만
+    즉시 휴지통 삭제한다.
+    """
+    if not _go_to_payment_link(driver):
+        _dbg("삭제 루틴: /payment-link 진입 실패")
+        return 0
+
+    try:
+        _wait_payment_link_page_ready(driver)
+    except Exception:
+        pass
+
+    deleted = 0
+
+    # 한 번 삭제하면 DOM 이 바뀌므로 매번 후보를 새로 찾는다.
+    while deleted < max_delete_per_cycle:
+        ok = _delete_one_expired_no_tx_row(driver)
+        if not ok:
+            break
+        deleted += 1
+        time.sleep(0.1)
+
+    if deleted:
+        _dbg(f"삭제 루틴 종료: 총 {deleted}건 삭제")
+    else:
+        _dbg("삭제 루틴 종료: 삭제 건수 0")
+
+    return deleted
 
 
 def _find_element(driver: webdriver.Chrome, locators: list, timeout: float = 0.8):
