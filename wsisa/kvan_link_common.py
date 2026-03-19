@@ -209,6 +209,55 @@ def _norm_kvan_header(h: str) -> str:
     return re.sub(r"\s+", " ", (h or "").replace("\n", " ").strip())
 
 
+def infer_kvan_transaction_header_cell_label(inner_html: str) -> str:
+    """
+    K-VAN 결제/취소 내역 thead: 라벨이 <span>이 아니라 input placeholder / select 첫 옵션에만 있는 경우가 많음.
+    Selenium .text 는 이런 셀에서 빈 문자열이 되어 열 개수가 tbody 와 맞지 않는 원인이 된다.
+    """
+    raw = inner_html or ""
+
+    def _from_placeholder(html: str) -> str:
+        for m in re.finditer(r'placeholder\s*=\s*"([^"]+)"', html, re.I):
+            lab = (m.group(1) or "").strip()
+            if lab and lab != "~":
+                return lab
+        for m in re.finditer(r"placeholder\s*=\s*'([^']+)'", html, re.I):
+            lab = (m.group(1) or "").strip()
+            if lab and lab != "~":
+                return lab
+        return ""
+
+    lab = _from_placeholder(raw)
+    if lab:
+        return _norm_kvan_header(lab)
+
+    m = re.search(
+        r"<option[^>]*\svalue\s*=\s*(?:\"\"|'')[^>]*>([^<]*)</option>",
+        raw,
+        re.I,
+    )
+    if not m:
+        m = re.search(
+            r"<option[^>]*value\s*=\s*(?:\"\"|'')\s*>([^<]*)</option>",
+            raw,
+            re.I,
+        )
+    if m:
+        lab = (m.group(1) or "").strip()
+        if lab:
+            return _norm_kvan_header(lab)
+
+    for sp in re.findall(r"<span[^>]*>([^<]*)</span>", raw, re.I):
+        lab = re.sub(r"\s+", " ", sp).strip()
+        if lab and lab != "~":
+            return _norm_kvan_header(lab)
+
+    text = re.sub(r"<[^>]+>", " ", raw)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^~\s*", "", text).strip()
+    return _norm_kvan_header(text)
+
+
 def kvan_transactions_header_indices(headers: list[str]) -> dict[str, int]:
     """
     K-VAN '결제 및 취소내역' 테이블 헤더 → 컬럼 인덱스.

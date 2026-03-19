@@ -41,6 +41,7 @@ from kvan_link_common import (
     build_kvan_transactions_snapshots,
     ensure_kvan_links_internal_session_column,
     ensure_kvan_links_link_created_at,
+    infer_kvan_transaction_header_cell_label,
     load_kvan_link_preserved_by_url,
     parse_amount_won,
     parse_kvan_link_ui_created_at,
@@ -2640,8 +2641,18 @@ def _scrape_transactions_and_store(driver: webdriver.Chrome, store: KVStore) -> 
     for hr in header_rows:
         try:
             cells = hr.find_elements(By.XPATH, ".//th|.//td")
-            txts = [_cell_txt(c.text) for c in cells if (c.text or "").strip()]
-            if txts:
+            # thead 셀은 placeholder/select 옵션만 라벨인 경우 .text 가 비어 열이 밀림 → tbody 와 열 불일치
+            txts: list[str] = []
+            for c in cells:
+                try:
+                    html = c.get_attribute("innerHTML") or ""
+                    lab = infer_kvan_transaction_header_cell_label(html)
+                    if not (lab or "").strip():
+                        lab = _cell_txt(c.text)
+                    txts.append(lab if (lab or "").strip() else "")
+                except Exception:
+                    txts.append("")
+            if any((x or "").strip() for x in txts):
                 header_candidates.append(txts)
         except Exception:
             continue

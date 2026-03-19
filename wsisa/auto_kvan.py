@@ -24,6 +24,7 @@ import pymysql
 from kvan_link_common import (
     build_kvan_transactions_snapshots,
     extract_kvan_session_key_from_url,
+    infer_kvan_transaction_header_cell_label,
     parse_amount_won,
     parse_kvan_link_ui_created_at,
     upsert_kvan_link_creation_seed,
@@ -1399,8 +1400,17 @@ def _scrape_transactions_and_store(driver: webdriver.Chrome) -> None:
         for hr in header_rows:
             try:
                 cells = hr.find_elements(By.XPATH, ".//th|.//td")
-                txts = [_cell_txt(c.text) for c in cells if (c.text or "").strip()]
-                if txts:
+                txts: list[str] = []
+                for c in cells:
+                    try:
+                        html = c.get_attribute("innerHTML") or ""
+                        lab = infer_kvan_transaction_header_cell_label(html)
+                        if not (lab or "").strip():
+                            lab = _cell_txt(c.text)
+                        txts.append(lab if (lab or "").strip() else "")
+                    except Exception:
+                        txts.append("")
+                if any((x or "").strip() for x in txts):
                     header_candidates.append(txts)
             except Exception:
                 continue
