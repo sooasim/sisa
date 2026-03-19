@@ -2297,5 +2297,3 @@ if __name__ == "__main__":
     if args.mode == "create":
         raise SystemExit(run_create(session_id=args.session_id.strip()))
     raise SystemExit(run_crawler_loop(max_cycles=max(0, args.max_cycles), max_runtime_sec=max(0, args.max_seconds)))
-
-
