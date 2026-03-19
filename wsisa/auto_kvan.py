@@ -23,13 +23,12 @@ import pymysql
 
 from kvan_link_common import (
     append_payment_notification,
-    build_kvan_transactions_snapshots,
     extract_kvan_session_key_from_url,
-    infer_kvan_transaction_header_cell_label,
     parse_amount_won,
     parse_kvan_link_ui_created_at,
     upsert_kvan_link_creation_seed,
 )
+from kvan_tx_table_scrape import extract_kvan_transactions_from_page
 
 # 링크 생성 속도 배율은 아래 _is_server_env() 정의 이후 LINK_CREATION_WAIT_FACTOR 로 설정한다.
 
@@ -1369,97 +1368,21 @@ def _scrape_transactions_and_store(driver: webdriver.Chrome) -> None:
             driver.get("https://store.k-van.app/transactions")
         return
 
-    def _cell_txt(s: str) -> str:
-        return re.sub(r"\s+", " ", (s or "").replace("\n", " ").strip())
-
     try:
         _ensure_kvan_transactions_table()
-        if "transactions" in driver.current_url:
-            driver.refresh()
-        else:
-            driver.get("https://store.k-van.app/transactions")
-        time.sleep(0.25)
-        try:
-            WebDriverWait(driver, 16).until(
-                EC.presence_of_element_located((By.XPATH, "//table//thead//th"))
-            )
-            try:
-                driver.execute_script(
-                    "window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));"
-                )
-                time.sleep(0.35)
-            except Exception:
-                pass
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.XPATH, "//table//tbody//tr"))
-            )
-        except TimeoutException:
+        snapshot_rows, body_rows, used_label, attempts, h_tr1 = (
+            extract_kvan_transactions_from_page(driver, navigate=True)
+        )
+        if used_label == "timeout":
             print(
                 "[WARN] /transactions 테이블 로딩 타임아웃 — kvan_transactions 는 비우지 않고 유지합니다."
             )
             return
 
-        header_rows = driver.find_elements(By.XPATH, "//table//thead//tr")
-        header_candidates: list[list[str]] = []
-        for hr in header_rows:
-            try:
-                cells = hr.find_elements(By.XPATH, ".//th|.//td")
-                txts: list[str] = []
-                for c in cells:
-                    try:
-                        html = c.get_attribute("innerHTML") or ""
-                        lab = infer_kvan_transaction_header_cell_label(html)
-                        if not (lab or "").strip():
-                            lab = _cell_txt(c.text)
-                        txts.append(lab if (lab or "").strip() else "")
-                    except Exception:
-                        txts.append("")
-                if any((x or "").strip() for x in txts):
-                    header_candidates.append(txts)
-            except Exception:
-                continue
-
-        def _score_header_labels(txts: list[str]) -> int:
-            joined = " ".join(txts)
-            score = len(txts)
-            if "승인번호" in joined:
-                score += 80
-            if "결제 금액" in joined or "결제금액" in joined:
-                score += 40
-            if "거래일시" in joined or "등록일" in joined:
-                score += 35
-            if "거래 유형" in joined or "거래유형" in joined:
-                score += 25
-            if "MID" in joined:
-                score += 10
-            return score
-
-        best_headers: list[str] = []
-        if header_candidates:
-            best_headers = max(header_candidates, key=_score_header_labels)
-        if not best_headers:
-            print("[WARN] /transactions 헤더 없음 — 저장 생략")
-            return
-
-        body_rows: list[list[str]] = []
-        for tr in driver.find_elements(By.XPATH, "//table//tbody//tr"):
-            try:
-                cells = tr.find_elements(By.XPATH, ".//td")
-                texts = [_cell_txt(c.text) for c in cells]
-                if not any(texts):
-                    continue
-                body_rows.append(texts)
-            except Exception:
-                continue
-
-        captured_iso = datetime.utcnow().isoformat()
-        snapshot_rows = build_kvan_transactions_snapshots(
-            best_headers, body_rows, captured_iso=captured_iso
-        )
         if not snapshot_rows and body_rows:
             print(
                 f"[WARN] /transactions {len(body_rows)}행 파싱 0건 — 열 매핑 확인 필요. "
-                f"헤더={best_headers[:10]} — kvan_transactions DB 유지"
+                f"헤더시도={used_label or '(모두실패)'} tr1={h_tr1[:8]!s} — kvan_transactions DB 유지"
             )
             try:
                 print(f"[DEBUG] 첫 행 셀 {len(body_rows[0])}개: {body_rows[0][:12]}")
@@ -1521,7 +1444,9 @@ def _scrape_transactions_and_store(driver: webdriver.Chrome) -> None:
                 inserted += 1
         conn.commit()
         conn.close()
-        print(f"[INFO] /transactions 에서 {inserted}건의 거래내역을 kvan_transactions 에 저장했습니다.")
+        print(
+            f"[INFO] /transactions 에서 {inserted}건 저장 (header={used_label}) kvan_transactions"
+        )
     except Exception as e:
         print(f"[WARN] 거래내역(/transactions) 크롤링/DB 저장 실패: {e}")
 

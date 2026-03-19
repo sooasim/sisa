@@ -35,7 +35,7 @@
 | 2 | `/payment-link` 스크랩 | MySQL `kvan_links` |
 | 2b | 만료 링크 정리 | `mark_expired_sessions_from_kvan_links` |
 | 3 | 결제링크 카드 **거래내역 팝업** | `upsert_popup_transaction` → `transactions` + **알림 JSON** |
-| 4 | `/transactions` 테이블 스크랩 | `kvan_transactions` |
+| 4 | `/transactions` 테이블 스크랩 | `kvan_transactions` (`kvan_tx_table_scrape.py`: tbody 우선 대기 → 구버전 thead `.text` → infer 폴백) |
 | 5 | `sync_kvan_to_transactions` | `transactions` 매핑/INSERT, **신규 승인 건 알림 JSON** |
 
 ## 4) 본사 `/hq-admin`
