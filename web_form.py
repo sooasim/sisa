@@ -34,10 +34,122 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("SISA_DATA_DIR") or (BASE_DIR / "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+_wsisa = BASE_DIR / "wsisa"
+if str(_wsisa) not in sys.path:
+    sys.path.insert(0, str(_wsisa))
+try:
+    from kvan_link_common import (
+        extract_kvan_session_key_from_url,
+        parse_kvan_link_ui_created_at,
+    )
+except ImportError:
+    def extract_kvan_session_key_from_url(link: str) -> str:  # type: ignore[misc]
+        return ""
+
+    def parse_kvan_link_ui_created_at(text: str):  # type: ignore[misc]
+        return None
+
 ORDER_JSON_PATH = str(DATA_DIR / "current_order.json")
 RESULT_JSON_PATH = str(DATA_DIR / "last_result.json")
 ADMIN_STATE_PATH = str(DATA_DIR / "admin_state.json")
 HQ_STATE_PATH = str(DATA_DIR / "hq_state.json")
+
+
+def _data_dir_candidates_for_admin_state() -> list[Path]:
+    """auto_kvan / kvan_crawler 와 동일한 데이터 디렉터리 후보(admin_state.json 공유)."""
+    candidates = [
+        Path(DATA_DIR),
+        BASE_DIR / "data",
+        BASE_DIR.parent / "data",
+        BASE_DIR / "wsisa" / "data",
+        Path("/app/data"),
+    ]
+    uniq: list[Path] = []
+    seen: set[str] = set()
+    for p in candidates:
+        k = str(p)
+        if k not in seen:
+            uniq.append(p)
+            seen.add(k)
+    return uniq
+
+
+def _admin_state_json_candidate_paths() -> list[Path]:
+    return [d / "admin_state.json" for d in _data_dir_candidates_for_admin_state()]
+
+
+def resolved_admin_state_json_path() -> Path:
+    """기존 파일이 있는 후보를 우선, 없으면 DATA_DIR 기본 경로."""
+    for p in _admin_state_json_candidate_paths():
+        if p.exists():
+            return p
+    return Path(DATA_DIR) / "admin_state.json"
+
+
+def load_admin_state_json_for_web() -> dict:
+    for p in _admin_state_json_candidate_paths():
+        if not p.exists():
+            continue
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                base = {
+                    "sessions": list(data.get("sessions") or []),
+                    "history": list(data.get("history") or []),
+                }
+                for k, v in data.items():
+                    if k not in ("sessions", "history"):
+                        base[k] = v
+                return base
+        except Exception:
+            continue
+    return {"sessions": [], "history": []}
+
+
+def save_admin_state_json_for_web(state: dict) -> None:
+    path = resolved_admin_state_json_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out: dict = {
+        "sessions": state.get("sessions") or [],
+        "history": state.get("history") or [],
+    }
+    for k, v in state.items():
+        if k not in ("sessions", "history"):
+            out[k] = v
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+
+
+def _split_admin_sessions_by_agency_flag(
+    rows: list,
+) -> tuple[list[dict], list[dict]]:
+    """agency_id 가 비어 있으면 HQ(본사), 아니면 대행사."""
+    agency: list[dict] = []
+    hq: list[dict] = []
+    for s in rows:
+        if not isinstance(s, dict):
+            continue
+        if str(s.get("agency_id") or "").strip():
+            agency.append(s)
+        else:
+            hq.append(s)
+    return agency, hq
+
+
+def _hq_persist_sessions_and_history(hq_sessions: list, hq_history: list) -> None:
+    """본사(/admin) 세션·히스토리만 바꾸고 대행사 항목은 그대로 둔다."""
+    full = load_admin_state_json_for_web()
+    ag_s, _ = _split_admin_sessions_by_agency_flag(full.get("sessions") or [])
+    ag_h, _ = _split_admin_sessions_by_agency_flag(full.get("history") or [])
+    extra = {k: v for k, v in full.items() if k not in ("sessions", "history")}
+    save_admin_state_json_for_web(
+        {
+            **extra,
+            "sessions": ag_s + list(hq_sessions),
+            "history": ag_h + list(hq_history),
+        }
+    )
 ADMIN_LOG_PATH = DATA_DIR / "hq_logs.log"
 SESSION_ORDER_DIR = DATA_DIR / "sessions" / "orders"
 SESSION_RESULT_DIR = DATA_DIR / "sessions" / "results"
@@ -340,8 +452,9 @@ def ensure_runtime_files() -> None:
         SESSION_ORDER_DIR.mkdir(parents=True, exist_ok=True)
         SESSION_RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
-        state_path = Path(ADMIN_STATE_PATH)
-        if not state_path.exists():
+        if not any(p.exists() for p in _admin_state_json_candidate_paths()):
+            state_path = resolved_admin_state_json_path()
+            state_path.parent.mkdir(parents=True, exist_ok=True)
             with open(state_path, "w", encoding="utf-8") as f:
                 json.dump({"sessions": [], "history": []}, f, ensure_ascii=False, indent=2)
 
@@ -391,17 +504,8 @@ KVAN_CRAWLER_HEARTBEAT_PATH = DATA_DIR / "kvan_crawler.heartbeat"
 
 
 def _hq_load_admin_state_json() -> dict:
-    """HQ 화면에서 K-VAN 링크 ↔ 대행사 표시용 admin_state.json."""
-    try:
-        p = Path(ADMIN_STATE_PATH)
-        if p.exists():
-            with open(p, encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return data
-    except Exception:
-        pass
-    return {"sessions": [], "history": []}
+    """HQ 화면에서 K-VAN 링크 ↔ 대행사 표시용 admin_state.json (워커와 동일 경로 후보)."""
+    return load_admin_state_json_for_web()
 
 
 def _hq_link_matches_kvan_session_id(link: str, session_id: str) -> bool:
@@ -464,10 +568,13 @@ def _hq_link_matches_kvan_session_id(link: str, session_id: str) -> bool:
 def _hq_collect_session_keys_from_row(row: dict) -> list[str]:
     """kvan_links 한 행에서 admin_state 와 대조할 세션 키 후보 (중복 제거)."""
     out: list[str] = []
+    link = (row.get("kvan_link") or "").strip()
+    url_key = extract_kvan_session_key_from_url(link)
+    if url_key:
+        out.append(url_key)
     internal = (row.get("internal_session_id") or "").strip()
     if internal:
         out.append(internal)
-    link = (row.get("kvan_link") or "").strip()
     ks = (row.get("kvan_session_id") or "").strip()
     if ks:
         out.append(ks)
@@ -507,19 +614,56 @@ def _hq_agency_label_from_row_db(row: dict, agency_by_id: dict) -> str | None:
     return aid
 
 
+def _hq_admin_session_match_score(row: dict, s: dict) -> int:
+    """
+    admin_state 한 세션과 kvan_links 한 행의 일치 강도.
+    내부 세션 id 일치 > KEY 일치 > kvan_link 상호 매칭 순으로 가산.
+    """
+    internal = (row.get("internal_session_id") or "").strip()
+    link = (row.get("kvan_link") or "").strip()
+    keys = _hq_collect_session_keys_from_row(row)
+    sid = str(s.get("id") or "").strip()
+    s_link = (s.get("kvan_link") or "").strip()
+    best = 0
+    if internal and sid and internal == sid:
+        best = max(best, 100)
+    for key in keys:
+        if key and sid and key == sid:
+            best = max(best, 95)
+    for key in keys:
+        if key and s_link and _hq_link_matches_kvan_session_id(s_link, key):
+            best = max(best, 90)
+    if sid and link and _hq_link_matches_kvan_session_id(link, sid):
+        best = max(best, 88)
+    for key in keys:
+        if key and link and s_link and _hq_link_matches_kvan_session_id(link, key):
+            best = max(best, 85)
+    return best
+
+
+def _hq_best_admin_session_for_kvan_row(row: dict, admin_st: dict) -> dict | None:
+    """진행 세션을 히스토리보다 우선(페널티). 임계값 미만이면 미매칭으로 본다."""
+    best_s: dict | None = None
+    best_sc = 0
+    for penalty, bucket in (
+        (0, admin_st.get("sessions") or []),
+        (10, admin_st.get("history") or []),
+    ):
+        for s in bucket:
+            if not isinstance(s, dict):
+                continue
+            sc = _hq_admin_session_match_score(row, s) - penalty
+            if sc > best_sc:
+                best_sc, best_s = sc, s
+    return best_s if best_sc >= 65 else None
+
+
 def _hq_kvan_link_owner_display(
     row: dict,
     admin_st: dict,
     agency_by_id: dict,
 ) -> str:
-    """결제링크 행의 소유 표시: DB agency_id → admin_state 세션·내부 id·링크 대조 (MID 미사용: 동일 MID 다계정 구분 불가)."""
-    db_label = _hq_agency_label_from_row_db(row, agency_by_id)
-    if db_label:
-        return db_label
-
-    link = (row.get("kvan_link") or "").strip()
-    keys = _hq_collect_session_keys_from_row(row)
-    combined = (admin_st.get("sessions") or []) + (admin_st.get("history") or [])
+    """소유 표시: admin_state 세션·세션ID·kvan_link 대조를 최우선, 그다음 DB agency_id (크롤러 병합값은 틀릴 수 있음)."""
 
     def _fmt_session(s: dict) -> str:
         aid = str(s.get("agency_id") or "").strip()
@@ -529,17 +673,17 @@ def _hq_kvan_link_owner_display(
             return "본사"
         return aid
 
-    for s in combined:
-        sid = str(s.get("id") or "").strip()
-        for key in keys:
-            if sid and key and sid == key:
-                return _fmt_session(s)
-        s_link = (s.get("kvan_link") or "").strip()
-        for key in keys:
-            if s_link and key and _hq_link_matches_kvan_session_id(s_link, key):
-                return _fmt_session(s)
-        if link and sid and _hq_link_matches_kvan_session_id(link, sid):
-            return _fmt_session(s)
+    matched = _hq_best_admin_session_for_kvan_row(row, admin_st)
+    if matched is not None:
+        return _fmt_session(matched)
+
+    db_label = _hq_agency_label_from_row_db(row, agency_by_id)
+    if db_label:
+        return db_label
+
+    aid = str(row.get("agency_id") or "").strip()
+    if aid:
+        return aid
 
     return "미매칭"
 
@@ -570,9 +714,20 @@ def _hq_enrich_kvan_links_for_admin(kvan_links: list, agencies: list) -> list[di
         r["_title_short"] = (r.get("title") or r.get("product_name") or "-") or "-"
         kl = (r.get("kvan_link") or "") or ""
         r["_link_preview"] = (kl[:72] + "…") if len(kl) > 72 else kl
+        try:
+            ui_dt = parse_kvan_link_ui_created_at(str(r.get("raw_text") or ""))
+        except Exception:
+            ui_dt = None
         lc = r.get("link_created_at")
         ca = r.get("captured_at")
-        r["_created_display"] = lc or ca or "-"
+        if ui_dt is not None:
+            r["_created_display"] = ui_dt.strftime("%Y-%m-%d %H:%M:%S")
+        elif lc:
+            r["_created_display"] = str(lc)
+        elif ca:
+            r["_created_display"] = str(ca)
+        else:
+            r["_created_display"] = "-"
         out.append(r)
     return out
 
@@ -1982,23 +2137,21 @@ def pay(session_id: str):
 
     # 관리자 상태에서 현재 세션 정보 읽기 (금액/할부 고정용)
     fixed_amount = False
-    if Path(ADMIN_STATE_PATH).exists():
-        try:
-            with open(ADMIN_STATE_PATH, "r", encoding="utf-8") as f:
-                admin_state = json.load(f)
-            sessions = admin_state.get("sessions") or []
-            for s in sessions:
-                if str(s.get("id")) == str(session_id):
-                    amount_str = str(s.get("amount", "") or "")
-                    if amount_str:
-                        defaults["amount"] = amount_str
-                        fixed_amount = True
-                    installment = str(s.get("installment", "") or "")
-                    if installment:
-                        defaults["installment_months"] = installment
-                    break
-        except Exception:
-            pass
+    try:
+        admin_state = load_admin_state_json_for_web()
+        sessions = admin_state.get("sessions") or []
+        for s in sessions:
+            if str(s.get("id")) == str(session_id):
+                amount_str = str(s.get("amount", "") or "")
+                if amount_str:
+                    defaults["amount"] = amount_str
+                    fixed_amount = True
+                installment = str(s.get("installment", "") or "")
+                if installment:
+                    defaults["installment_months"] = installment
+                break
+    except Exception:
+        pass
 
     # 세션별 마지막 결과 읽기
     last_result: dict | None = None
@@ -2181,10 +2334,12 @@ def _run_path_self_heal(auto_env_data_dir: Path) -> list[str]:
             report.append(f"[ERR] dir create failed: {d} ({e})")
 
     # 필수 파일이 없으면 기본 구조로 생성
-    admin_state_candidates = [
-        Path(ADMIN_STATE_PATH),
-        auto_env_data_dir / "admin_state.json",
-    ]
+    admin_state_candidates = list(
+        dict.fromkeys(
+            [Path(ADMIN_STATE_PATH), auto_env_data_dir / "admin_state.json"]
+            + _admin_state_json_candidate_paths()
+        )
+    )
     for st_path in admin_state_candidates:
         try:
             if not st_path.exists():
@@ -2277,6 +2432,7 @@ def debug_paths():
         Path(ORDER_JSON_PATH),
         Path(RESULT_JSON_PATH),
         Path(ADMIN_STATE_PATH),
+        resolved_admin_state_json_path(),
         ADMIN_LOG_PATH,
         SESSION_ORDER_DIR,
         SESSION_RESULT_DIR,
@@ -2288,11 +2444,9 @@ def debug_paths():
     # 최근 세션 기준으로 주문 JSON 존재 여부를 즉시 확인
     recent_sessions: list[dict] = []
     try:
-        state_path = Path(ADMIN_STATE_PATH)
-        if state_path.exists():
-            with open(state_path, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            sessions_all = saved.get("sessions") or []
+        saved = load_admin_state_json_for_web()
+        sessions_all = saved.get("sessions") or []
+        if sessions_all:
             for s in list(reversed(sessions_all))[:10]:
                 sid = str(s.get("id") or "").strip()
                 if not sid:
@@ -2580,14 +2734,12 @@ def _is_recent_duplicate_amount(amount_str: str, window_minutes: int = 5) -> boo
 
     try:
         cutoff = datetime.utcnow() - timedelta(minutes=window_minutes)
-        state_path = Path(ADMIN_STATE_PATH)
-        if not state_path.exists():
-            return False
-        with open(state_path, "r", encoding="utf-8") as f:
-            saved = json.load(f)
+        saved = load_admin_state_json_for_web()
         sessions = saved.get("sessions") or []
         history = saved.get("history") or []
         candidates = list(sessions) + list(history)
+        if not candidates:
+            return False
 
         for s in candidates:
             s_amount = str(s.get("amount") or "").replace(",", "").strip()
@@ -2858,34 +3010,35 @@ def admin():
     history: list[dict] = []
     message = ""
     crawler_refresh_since = ""
-    if Path(ADMIN_STATE_PATH).exists():
-        try:
-            with open(ADMIN_STATE_PATH, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            if isinstance(saved, dict):
-                raw_sessions = saved.get("sessions") or []
-                raw_history = saved.get("history") or []
-                # /admin 페이지에서는 HQ(agency_id 가 비어 있는) 세션/히스토리만 본다.
-                sessions = [
-                    s for s in raw_sessions if not str(s.get("agency_id") or "").strip()
-                ]
-                history = [
-                    h for h in raw_history if not str(h.get("agency_id") or "").strip()
-                ]
-                # 이전 단일 세션 포맷에서 마이그레이션
-                if saved.get("current_session_id") and not sessions:
-                    sessions = [
-                        {
-                            "id": str(saved.get("current_session_id")),
-                            "amount": str(saved.get("amount", "") or ""),
-                            "installment": str(saved.get("installment", "") or "일시불"),
-                            "status": "결제중",
-                            "created_at": saved.get("created_at")
-                            or datetime.utcnow().isoformat(),
-                        }
-                    ]
-        except Exception:
-            sessions = []
+    try:
+        saved = load_admin_state_json_for_web()
+        raw_sessions = saved.get("sessions") or []
+        raw_history = saved.get("history") or []
+        _, sessions = _split_admin_sessions_by_agency_flag(raw_sessions)
+        _, history = _split_admin_sessions_by_agency_flag(raw_history)
+        # 이전 단일 세션 포맷에서 마이그레이션 (파일에도 반영해 워커와 공유)
+        if saved.get("current_session_id") and not sessions:
+            sessions = [
+                {
+                    "id": str(saved.get("current_session_id")),
+                    "amount": str(saved.get("amount", "") or ""),
+                    "installment": str(saved.get("installment", "") or "일시불"),
+                    "status": "결제중",
+                    "created_at": saved.get("created_at")
+                    or datetime.utcnow().isoformat(),
+                    "agency_id": "",
+                }
+            ]
+            ag_s, _ = _split_admin_sessions_by_agency_flag(raw_sessions)
+            ag_h, hq_h = _split_admin_sessions_by_agency_flag(raw_history)
+            new_full = dict(saved)
+            new_full["sessions"] = ag_s + sessions
+            new_full["history"] = ag_h + hq_h
+            new_full.pop("current_session_id", None)
+            save_admin_state_json_for_web(new_full)
+    except Exception:
+        sessions = []
+        history = []
 
     # 진행 중(결제중만) vs 완료/종료(history + 세션 중 만료·결제완료·실패 등) 구분 표시
     _status = lambda s: (str(s.get("status") or "결제중").strip())
@@ -2978,7 +3131,16 @@ def admin():
                     r.get("title"), r.get("amount")
                 )
                 r["status_display"] = _admin_kvan_status_display(r)
-                r["_created_display"] = r.get("link_created_at") or r.get("captured_at") or "-"
+                try:
+                    ui_dt = parse_kvan_link_ui_created_at(str(r.get("raw_text") or ""))
+                except Exception:
+                    ui_dt = None
+                if ui_dt is not None:
+                    r["_created_display"] = ui_dt.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    r["_created_display"] = (
+                        str(r.get("link_created_at") or r.get("captured_at") or "-")
+                    )
                 recent_links.append(r)
             try:
                 cur.execute(
@@ -3047,10 +3209,8 @@ def admin():
                         "agency_id": "",  # HQ에서 생성한 세션은 특정 대행사에 속하지 않음
                     }
                     sessions.append(session)
-                    admin_state = {"sessions": sessions, "history": history}
                     try:
-                        with open(ADMIN_STATE_PATH, "w", encoding="utf-8") as f:
-                            json.dump(admin_state, f, ensure_ascii=False, indent=2)
+                        _hq_persist_sessions_and_history(sessions, history)
                     except Exception as e:  # noqa: BLE001
                         message = f"상태 저장 중 오류가 발생했습니다: {e}"
                     else:
@@ -3075,23 +3235,21 @@ def admin():
         elif action == "retry_kvan":
             sid = request.form.get("session_id", "").strip()
             if sid:
-                # 실패 상태 → 결제중으로 초기화 후 재시도
-                state_path = Path(ADMIN_STATE_PATH)
-                if state_path.exists():
-                    try:
-                        with open(state_path, "r", encoding="utf-8") as f:
-                            saved = json.load(f)
-                        for s in saved.get("sessions") or []:
-                            if str(s.get("id")) == sid:
-                                s["status"] = "결제중"
-                                s.pop("error_reason", None)
-                                s.pop("failed_at", None)
-                                s.pop("kvan_link", None)
-                                break
-                        with open(state_path, "w", encoding="utf-8") as f:
-                            json.dump(saved, f, ensure_ascii=False, indent=2)
-                    except Exception as e:  # noqa: BLE001
-                        _append_hq_log("WEB", f"[WARN] retry 상태 초기화 실패: {e}")
+                # 실패 상태 → 결제중으로 초기화 후 재시도 (본사 세션만)
+                try:
+                    full = load_admin_state_json_for_web()
+                    for s in full.get("sessions") or []:
+                        if str(s.get("id")) == sid and not str(
+                            s.get("agency_id") or ""
+                        ).strip():
+                            s["status"] = "결제중"
+                            s.pop("error_reason", None)
+                            s.pop("failed_at", None)
+                            s.pop("kvan_link", None)
+                            break
+                    save_admin_state_json_for_web(full)
+                except Exception as e:  # noqa: BLE001
+                    _append_hq_log("WEB", f"[WARN] retry 상태 초기화 실패: {e}")
                 # 주문 JSON 재생성 + 큐에 재등록
                 try:
                     for s in sessions:
@@ -3136,10 +3294,8 @@ def admin():
                 else:
                     new_sessions.append(s)
             sessions = new_sessions
-            admin_state = {"sessions": sessions, "history": history}
             try:
-                with open(ADMIN_STATE_PATH, "w", encoding="utf-8") as f:
-                    json.dump(admin_state, f, ensure_ascii=False, indent=2)
+                _hq_persist_sessions_and_history(sessions, history)
             except Exception as e:  # noqa: BLE001
                 message = f"세션 종료 중 오류가 발생했습니다: {e}"
 
@@ -3149,20 +3305,16 @@ def admin():
                 if str(h.get("id")) == sid:
                     h["settled"] = "정산완료" if h.get("settled") != "정산완료" else "정산전"
                     break
-            admin_state = {"sessions": sessions, "history": history}
             try:
-                with open(ADMIN_STATE_PATH, "w", encoding="utf-8") as f:
-                    json.dump(admin_state, f, ensure_ascii=False, indent=2)
+                _hq_persist_sessions_and_history(sessions, history)
             except Exception as e:  # noqa: BLE001
                 message = f"정산 상태 변경 중 오류가 발생했습니다: {e}"
 
         elif action == "delete_history":
             sid = request.form.get("session_id", "").strip()
             history = [h for h in history if str(h.get("id")) != sid]
-            admin_state = {"sessions": sessions, "history": history}
             try:
-                with open(ADMIN_STATE_PATH, "w", encoding="utf-8") as f:
-                    json.dump(admin_state, f, ensure_ascii=False, indent=2)
+                _hq_persist_sessions_and_history(sessions, history)
             except Exception as e:  # noqa: BLE001
                 message = f"기록 삭제 중 오류가 발생했습니다: {e}"
 
@@ -3588,7 +3740,7 @@ def admin():
                   <i class="fa-solid fa-database text-sky-300 text-xs"></i>
                   K-VAN 링크 DB 요약 (최근 10건)
                 </div>
-                <div class="box-schema">본사(<code>agency_id</code> 없음) <code>kvan_links</code> 최근 10건 — 표시 시각은 <code>link_created_at</code> 우선(없으면 <code>captured_at</code>).</div>
+                <div class="box-schema">본사(<code>agency_id</code> 없음) <code>kvan_links</code> 최근 10건 — 생성시간은 카드 <code>raw_text</code>에서 파싱한 K-VAN 표시 시각 우선, 없으면 <code>link_created_at</code>·<code>captured_at</code>.</div>
                 {% if recent_links %}
                   <div style="max-height:min(50vh,420px); overflow-y:auto; font-size:11px; margin-top:4px;">
                     <table class="table-sticky" style="width:100%; border-collapse:collapse;">
@@ -5119,7 +5271,7 @@ def hq_admin():
                 <a href="{{ url_for('hq_export_excel', scope='kvan_links') }}" class="px-3 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25">엑셀</a>
               </div>
             </div>
-                <div class="box-schema"><code>kvan_links</code>: <code>link_created_at</code>은 링크가 DB에 처음 들어온 시각(재크롤 시 유지), <code>captured_at</code>은 마지막 스냅샷 갱신 시각입니다. 소유(본사/대행사)는 DB <code>agency_id</code> 및 <code>admin_state</code> 대조(MID 미사용). 크롤러는 <code>TRUNCATE</code> 없이 병합 갱신합니다.</div>
+                <div class="box-schema"><code>kvan_links</code>: 생성시간 컬럼은 K-VAN 카드 텍스트에서 추출 가능하면 그 일시를 저장하고, 아니면 DB 최초 반영 시각입니다. 화면 표시는 <code>raw_text</code> 파싱값을 최우선합니다. <code>captured_at</code>은 마지막 크롤 스냅샷 시각. 본사/대행사·업체명은 <code>admin_state</code> 세션 ID·<code>kvan_link</code> 대조를 먼저 적용하고, 매칭 실패 시에만 DB <code>agency_id</code>를 씁니다(MID 미사용).</div>
             {% if kvan_links_display %}
             <div class="overflow-x-auto max-h-[min(85vh,720px)] overflow-y-auto border border-white/20 rounded-xl">
               <table class="min-w-full text-[11px] border-collapse">
@@ -5410,17 +5562,23 @@ def agency_admin():
     # 세션/히스토리는 admin_state.json 에서 agency_id 기준으로만 필터 (비어있으면 표시 안 함)
     sessions: list[dict] = []
     history: list[dict] = []
-    if Path(ADMIN_STATE_PATH).exists():
-        try:
-            with open(ADMIN_STATE_PATH, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            all_sessions = saved.get("sessions") or []
-            all_history = saved.get("history") or []
-            aid = (agency_id or "").strip()
-            sessions = [s for s in all_sessions if aid and str(s.get("agency_id") or "").strip() == aid]
-            history = [h for h in all_history if aid and str(h.get("agency_id") or "").strip() == aid]
-        except Exception:
-            sessions, history = [], []
+    try:
+        saved = load_admin_state_json_for_web()
+        all_sessions = saved.get("sessions") or []
+        all_history = saved.get("history") or []
+        aid = (agency_id or "").strip()
+        sessions = [
+            s
+            for s in all_sessions
+            if aid and str(s.get("agency_id") or "").strip() == aid
+        ]
+        history = [
+            h
+            for h in all_history
+            if aid and str(h.get("agency_id") or "").strip() == aid
+        ]
+    except Exception:
+        sessions, history = [], []
 
     # 진행 중(결제중만) vs 완료/종료 구분
     _st = lambda s: (str(s.get("status") or "결제중").strip())
@@ -5498,22 +5656,24 @@ def agency_admin():
                         "created_at": datetime.utcnow().isoformat(),
                         "agency_id": agency_id,
                     }
-                    # 전체 admin_state 에 병합 저장
-                    all_sessions = sessions
-                    all_history = history
-                    if Path(ADMIN_STATE_PATH).exists():
-                        try:
-                            with open(ADMIN_STATE_PATH, "r", encoding="utf-8") as f:
-                                saved = json.load(f)
-                            all_sessions = saved.get("sessions") or []
-                            all_history = saved.get("history") or []
-                        except Exception:
-                            all_sessions, all_history = [], []
+                    # 전체 admin_state 에 병합 저장 (워커·본사 /admin 과 동일 파일)
+                    full = load_admin_state_json_for_web()
+                    all_sessions = list(full.get("sessions") or [])
+                    all_history = list(full.get("history") or [])
+                    extra = {
+                        k: v
+                        for k, v in full.items()
+                        if k not in ("sessions", "history")
+                    }
                     all_sessions.append(new_session)
-                    admin_state = {"sessions": all_sessions, "history": all_history}
                     try:
-                        with open(ADMIN_STATE_PATH, "w", encoding="utf-8") as f:
-                            json.dump(admin_state, f, ensure_ascii=False, indent=2)
+                        save_admin_state_json_for_web(
+                            {
+                                **extra,
+                                "sessions": all_sessions,
+                                "history": all_history,
+                            }
+                        )
                     except Exception as e:  # noqa: BLE001
                         message = f"세션 생성 중 오류가 발생했습니다: {e}"
                     else:
@@ -5542,22 +5702,21 @@ def agency_admin():
         elif action == "retry_kvan":
             sid = (request.form.get("session_id") or "").strip()
             if sid:
-                state_path = Path(ADMIN_STATE_PATH)
-                if state_path.exists():
-                    try:
-                        with open(state_path, "r", encoding="utf-8") as f:
-                            saved = json.load(f)
-                        for s in saved.get("sessions") or []:
-                            if str(s.get("id")) == sid:
-                                s["status"] = "결제중"
-                                s.pop("error_reason", None)
-                                s.pop("failed_at", None)
-                                s.pop("kvan_link", None)
-                                break
-                        with open(state_path, "w", encoding="utf-8") as f:
-                            json.dump(saved, f, ensure_ascii=False, indent=2)
-                    except Exception as e:  # noqa: BLE001
-                        _append_hq_log("WEB", f"[WARN] agency retry 상태 초기화 실패: {e}")
+                try:
+                    full = load_admin_state_json_for_web()
+                    aid_s = str(agency_id or "").strip()
+                    for s in full.get("sessions") or []:
+                        if str(s.get("id")) == sid and str(
+                            s.get("agency_id") or ""
+                        ).strip() == aid_s:
+                            s["status"] = "결제중"
+                            s.pop("error_reason", None)
+                            s.pop("failed_at", None)
+                            s.pop("kvan_link", None)
+                            break
+                    save_admin_state_json_for_web(full)
+                except Exception as e:  # noqa: BLE001
+                    _append_hq_log("WEB", f"[WARN] agency retry 상태 초기화 실패: {e}")
                 try:
                     for s in sessions:
                         if str(s.get("id")) == sid:
@@ -5581,18 +5740,17 @@ def agency_admin():
         elif action == "delete_session":
             sid = (request.form.get("session_id") or "").strip()
             if sid:
-                # admin_state.json 전체에서 해당 세션 제거
-                if Path(ADMIN_STATE_PATH).exists():
-                    try:
-                        with open(ADMIN_STATE_PATH, "r", encoding="utf-8") as f:
-                            saved = json.load(f)
-                        all_sessions = saved.get("sessions") or []
-                        all_history = saved.get("history") or []
-                        all_sessions = [s for s in all_sessions if str(s.get("id")) != sid]
-                        with open(ADMIN_STATE_PATH, "w", encoding="utf-8") as f:
-                            json.dump({"sessions": all_sessions, "history": all_history}, f, ensure_ascii=False, indent=2)
-                    except Exception:
-                        pass
+                try:
+                    full = load_admin_state_json_for_web()
+                    all_sessions = [
+                        s
+                        for s in (full.get("sessions") or [])
+                        if str(s.get("id")) != sid
+                    ]
+                    full["sessions"] = all_sessions
+                    save_admin_state_json_for_web(full)
+                except Exception:
+                    pass
                 sessions = [s for s in sessions if str(s.get("id")) != sid]
             return redirect(url_for("agency_admin"))
         elif action == "bulk_delete_agency_tx":

@@ -24,6 +24,7 @@ import pymysql
 from kvan_link_common import (
     extract_kvan_session_key_from_url,
     parse_amount_won,
+    parse_kvan_link_ui_created_at,
     upsert_kvan_link_creation_seed,
 )
 
@@ -1486,6 +1487,70 @@ def _scrape_transactions_and_store(driver: webdriver.Chrome) -> None:
         print(f"[WARN] 거래내역(/transactions) 크롤링/DB 저장 실패: {e}")
 
 
+def _extract_primary_kvan_key_from_tx_raw(raw_text: str) -> str | None:
+    """
+    kvan_transactions.raw_text 에서 본 거래에 해당하는 KEY… 세션 토큰 1개를 고른다.
+    (첫 KEY 정규식 매칭은 UI에 여러 KEY가 있을 때 오탐이 나기 쉬움)
+    """
+    rt = (raw_text or "").strip()
+    if not rt:
+        return None
+    for pat in (
+        r"sessionId[=:]\s*(KEY[0-9A-Za-z]+)",
+        r"sessionid[=:]\s*(KEY[0-9A-Za-z]+)",
+    ):
+        m = re.search(pat, rt, re.I)
+        if m:
+            return m.group(1)
+    m = re.search(r"/p/(KEY[0-9A-Za-z]+)", rt, re.I)
+    if m:
+        return m.group(1)
+    keys = re.findall(r"(KEY[0-9A-Za-z]+)", rt, re.I)
+    if not keys:
+        return None
+    uniq: list[str] = []
+    for k in keys:
+        if k not in uniq:
+            uniq.append(k)
+    return max(uniq, key=len)
+
+
+def _resolve_agency_id_for_kvan_tx_row(raw_text: str, cur) -> tuple[str | None, str]:
+    """
+    admin_state 우선, 단일 kvan_links 행이면 DB agency_id 보조.
+    반환: (agency_id None/빈=본사, 선택된 KEY 또는 '')
+    """
+    key = _extract_primary_kvan_key_from_tx_raw(raw_text)
+    if not key:
+        return None, ""
+    aid = _get_agency_id_for_session(key)
+    if aid:
+        return aid, key
+    try:
+        cur.execute(
+            """
+            SELECT agency_id FROM kvan_links
+            WHERE kvan_link LIKE %s OR kvan_session_id LIKE %s
+               OR internal_session_id = %s
+            """,
+            (f"%{key}%", f"%{key}%", key),
+        )
+        rows = cur.fetchall() or []
+        if len(rows) == 1:
+            db_ag = str(rows[0].get("agency_id") or "").strip()
+            return (db_ag if db_ag else None), key
+        ags = [
+            str(r.get("agency_id") or "").strip()
+            for r in rows
+            if str(r.get("agency_id") or "").strip()
+        ]
+        if ags and len(set(ags)) == 1:
+            return ags[0], key
+    except Exception:
+        pass
+    return (aid or None), key
+
+
 def _sync_kvan_to_transactions() -> bool:
     """
     kvan_transactions 에 쌓인 K-VAN 거래내역을
@@ -1536,11 +1601,13 @@ def _sync_kvan_to_transactions() -> bool:
                 # 등록일에서 날짜 부분만 추출 (예: '2026-03-12 10:20:30' -> '2026-03-12')
                 reg_date = reg.split(" ")[0] if reg else ""
 
-                # 대행사/본사 구분: KEY로 시작하는 세션ID 추출 → admin_state에서 agency_id 조회만 (MID 미사용)
-                agency_id: str | None = None
-                session_match = re.search(r"KEY[0-9A-Za-z]+", raw_text) if raw_text else None
-                if session_match:
-                    agency_id = _get_agency_id_for_session(session_match.group(0))
+                # 대행사/본사 구분: raw_text 에서 주 세션 KEY 추정 → admin_state → 필요 시 kvan_links 단일 행
+                agency_id, chosen_key = _resolve_agency_id_for_kvan_tx_row(raw_text, cur)
+                if chosen_key:
+                    print(
+                        f"[KVAN-TX-SYNC] approval={approval} key={chosen_key} "
+                        f"agency_id={(agency_id or '')!r}"
+                    )
 
                 # K-VAN 결제유형 기준으로 내부 status 유추
                 tx_status = "other"
@@ -1564,6 +1631,7 @@ def _sync_kvan_to_transactions() -> bool:
                 if tx:
                     tx_id = tx["id"]
                     # agency_id 가 비어 있고, 이번 K-VAN 에서 대행사를 알 수 있다면 채워 넣는다.
+                    fill_agency = (agency_id or "").strip()
                     cur.execute(
                         """
                         UPDATE transactions
@@ -1573,10 +1641,10 @@ def _sync_kvan_to_transactions() -> bool:
                             kvan_approval_no = %s,
                             kvan_tx_type = %s,
                             kvan_registered_at = %s,
-                            agency_id = COALESCE(agency_id, %s)
+                            agency_id = COALESCE(NULLIF(TRIM(agency_id), ''), %s)
                         WHERE id = %s
                         """,
-                        (amt, tx_status, mid, approval, tx_type, reg, agency_id, tx_id),
+                        (amt, tx_status, mid, approval, tx_type, reg, fill_agency, tx_id),
                     )
                     updated += 1
                     continue
@@ -1648,7 +1716,7 @@ def _sync_kvan_to_transactions() -> bool:
                     """,
                     (
                         new_tx_id,
-                        agency_id,
+                        (agency_id or "").strip(),
                         amt,
                         tx_status,
                         message,
@@ -1913,6 +1981,11 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
                     pres_ag = (prev_kl.get("agency_id") or "").strip()
                     pres_int = (prev_kl.get("internal_session_id") or "").strip()
                     pres_lc = prev_kl.get("link_created_at")
+                    try:
+                        parsed_ui_created = parse_kvan_link_ui_created_at(card_text)
+                    except Exception:
+                        parsed_ui_created = None
+                    link_created_val = pres_lc or parsed_ui_created
                     if not row_agency_id and pres_ag:
                         row_agency_id = pres_ag
                     internal_sid = pres_int
@@ -1941,7 +2014,7 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
                         VALUES (NOW(), IFNULL(%s, NOW()), %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                         """,
                         (
-                            pres_lc,
+                            link_created_val,
                             title,
                             amount,
                             ttl_label,
@@ -2030,6 +2103,11 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
                             row_agency_fb = (prev_fb.get("agency_id") or "").strip()
                         internal_fb = (prev_fb.get("internal_session_id") or "").strip() or _lookup_internal_session_id_for_kvan_key(sid)
                         pres_lc_fb = prev_fb.get("link_created_at")
+                        try:
+                            parsed_ui_fb = parse_kvan_link_ui_created_at(row_text)
+                        except Exception:
+                            parsed_ui_fb = None
+                        link_created_fb = pres_lc_fb or parsed_ui_fb
                         cur.execute("DELETE FROM kvan_links WHERE kvan_link = %s", (link_text,))
                         cur.execute(
                             """
@@ -2039,7 +2117,7 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
                             VALUES (NOW(), IFNULL(%s, NOW()), %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                             """,
                             (
-                                pres_lc_fb,
+                                link_created_fb,
                                 title,
                                 amount,
                                 ttl_label,
@@ -2836,14 +2914,28 @@ def _get_agency_id_for_session(session_id: str) -> str | None:
         return None
     try:
         st = _load_admin_state()
-        for s in (st.get("sessions") or []) + (st.get("history") or []):
-            if str(s.get("id") or "") == str(session_id):
-                aid = (s.get("agency_id") or "").strip()
-                return aid or None
+        sid = str(session_id).strip()
+        sessions = st.get("sessions") or []
+        history = st.get("history") or []
+
+        def _aid_from(s: dict) -> str | None:
+            a = (s.get("agency_id") or "").strip()
+            return a or None
+
+        # 1) 내부 세션 id 정확 일치 (진행·히스토리 모두, 진행 세션을 먼저)
+        for s in sessions + history:
+            if str(s.get("id") or "").strip() == sid:
+                return _aid_from(s)
+
+        # 2) kvan_link 로만 매칭: 진행 세션 우선 → 히스토리 (오탐 줄임)
+        for s in sessions:
             link = (s.get("kvan_link") or "").strip()
-            if link and _link_matches_kvan_session_id(link, session_id):
-                aid = (s.get("agency_id") or "").strip()
-                return aid or None
+            if link and _link_matches_kvan_session_id(link, sid):
+                return _aid_from(s)
+        for s in history:
+            link = (s.get("kvan_link") or "").strip()
+            if link and _link_matches_kvan_session_id(link, sid):
+                return _aid_from(s)
         return None
     except Exception:
         return None
@@ -2856,10 +2948,11 @@ def _lookup_internal_session_id_for_kvan_key(kvan_key: str) -> str:
         return ""
     try:
         st = _load_admin_state()
-        for s in (st.get("sessions") or []) + (st.get("history") or []):
-            link = (s.get("kvan_link") or "").strip()
-            if link and _link_matches_kvan_session_id(link, kk):
-                return str(s.get("id") or "").strip()
+        for bucket in (st.get("sessions") or [], st.get("history") or []):
+            for s in bucket:
+                link = (s.get("kvan_link") or "").strip()
+                if link and _link_matches_kvan_session_id(link, kk):
+                    return str(s.get("id") or "").strip()
         return ""
     except Exception:
         return ""

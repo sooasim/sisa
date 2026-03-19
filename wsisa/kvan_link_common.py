@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 
 import pymysql
@@ -62,6 +63,106 @@ def extract_kvan_session_key_from_url(link: str) -> str:
         return m.group(1)
     m = re.search(r"(KEY[0-9A-Za-z]+)", u)
     return m.group(1) if m else ""
+
+
+def parse_kvan_link_ui_created_at(text: str) -> datetime | None:
+    """
+    K-VAN 결제링크 카드/목록에 표시되는 '생성·등록' 일시를 raw_text 에서 추출.
+    (DB 최초 INSERT 시각과 다를 수 있어, 화면에 나온 실제 생성 시각 표시용)
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    blob = raw.replace("\r\n", "\n")
+    lines = [ln.strip() for ln in blob.split("\n") if ln.strip()]
+
+    def _build_dt(y: int, mo: int, d: int, h: int, mi: int, se: int) -> datetime | None:
+        try:
+            if not (2000 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31):
+                return None
+            return datetime(y, mo, d, min(h, 23), min(mi, 59), min(se, 59))
+        except (TypeError, ValueError):
+            return None
+
+    def _ampm_adjust(window: str, hour: int) -> int:
+        if "오후" in window and 1 <= hour <= 11:
+            return hour + 12
+        if "오전" in window and hour == 12:
+            return 0
+        return hour
+
+    # 1) '생성/등록' 라벨 근처 윈도에서만 탐색 (만료일시 단독 라벨은 제외)
+    candidates: list[datetime] = []
+    for i, ln in enumerate(lines):
+        if re.search(r"만료일시|만료\s*일", ln) and not re.search(
+            r"생성|등록", ln, re.I
+        ):
+            continue
+        if not re.search(
+            r"(?:링크\s*)?생성|생성(?:일시|시간|일)|등록(?:일시|일|시간)|만들어진\s*시각",
+            ln,
+            re.I,
+        ):
+            continue
+        window = "\n".join(lines[i : min(i + 6, len(lines))])
+        # ISO / 숫자 형
+        for m in re.finditer(
+            r"(\d{4})\s*[-/.년]\s*(\d{1,2})\s*[-/.월]\s*(\d{1,2})(?:일)?"
+            r'(?:\s+|[Tt])\s*(\d{1,2})\s*:\s*(\d{2})(?::\s*(\d{2}))?',
+            window,
+        ):
+            y, mo, d, h, mi, se = (
+                int(m.group(1)),
+                int(m.group(2)),
+                int(m.group(3)),
+                int(m.group(4)),
+                int(m.group(5)),
+                int(m.group(6) or 0),
+            )
+            h = _ampm_adjust(window, h)
+            dt = _build_dt(y, mo, d, h, mi, se)
+            if dt:
+                candidates.append(dt)
+        for m in re.finditer(
+            r"(\d{4})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})\s+"
+            r"(?:오전|오후)?\s*(\d{1,2})\s*:\s*(\d{2})(?::\s*(\d{2}))?",
+            window,
+        ):
+            y, mo, d, h, mi, se = (
+                int(m.group(1)),
+                int(m.group(2)),
+                int(m.group(3)),
+                int(m.group(4)),
+                int(m.group(5)),
+                int(m.group(6) or 0),
+            )
+            h = _ampm_adjust(window, h)
+            dt = _build_dt(y, mo, d, h, mi, se)
+            if dt:
+                candidates.append(dt)
+
+    if candidates:
+        return min(candidates)
+
+    # 2) 라벨 없이 카드 첫머리에 날짜만 있는 경우 (약한 휴리스틱: 첫 번째 유효 패턴만)
+    head = "\n".join(lines[:8])
+    m = re.search(
+        r"(\d{4})\s*[-/.년]\s*(\d{1,2})\s*[-/.월]\s*(\d{1,2})(?:일)?"
+        r"\s+(\d{1,2})\s*:\s*(\d{2})(?::\s*(\d{2}))?",
+        head,
+    )
+    if m:
+        y, mo, d, h, mi, se = (
+            int(m.group(1)),
+            int(m.group(2)),
+            int(m.group(3)),
+            int(m.group(4)),
+            int(m.group(5)),
+            int(m.group(6) or 0),
+        )
+        h = _ampm_adjust(head, h)
+        return _build_dt(y, mo, d, h, mi, se)
+    return None
 
 
 def parse_amount_won(text: str) -> int:

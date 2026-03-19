@@ -42,6 +42,7 @@ from kvan_link_common import (
     ensure_kvan_links_link_created_at,
     load_kvan_link_preserved_by_url,
     parse_amount_won,
+    parse_kvan_link_ui_created_at,
     upsert_kvan_link_creation_seed,
 )
 from selenium import webdriver
@@ -266,23 +267,90 @@ def _link_matches_kvan_session_id(link: str, session_id: str) -> bool:
 def _get_agency_id_for_session(session_id: str) -> Optional[str]:
     """
     admin_state 에서 session_id 에 해당하는 agency_id 반환.
-    kvan_link 와는 _link_matches_kvan_session_id 로 여러 방식 중 하나만 통과하면 일치.
+    내부 id 정확 일치 후, 진행 세션 kvan_link 매칭 → 히스토리 (auto_kvan 과 동일).
     """
     if not session_id:
         return None
     try:
         st = _load_admin_state()
-        for s in (st.get("sessions") or []) + (st.get("history") or []):
-            if str(s.get("id") or "") == str(session_id):
-                aid = (s.get("agency_id") or "").strip()
-                return aid or None
+        sid = str(session_id).strip()
+        sessions = st.get("sessions") or []
+        history = st.get("history") or []
+
+        def _aid_from(s: dict) -> Optional[str]:
+            a = (s.get("agency_id") or "").strip()
+            return a or None
+
+        for s in sessions + history:
+            if str(s.get("id") or "").strip() == sid:
+                return _aid_from(s)
+        for s in sessions:
             link = (s.get("kvan_link") or "").strip()
-            if link and _link_matches_kvan_session_id(link, session_id):
-                aid = (s.get("agency_id") or "").strip()
-                return aid or None
+            if link and _link_matches_kvan_session_id(link, sid):
+                return _aid_from(s)
+        for s in history:
+            link = (s.get("kvan_link") or "").strip()
+            if link and _link_matches_kvan_session_id(link, sid):
+                return _aid_from(s)
         return None
     except Exception:
         return None
+
+
+def _extract_primary_kvan_key_from_tx_raw(raw_text: str) -> Optional[str]:
+    rt = (raw_text or "").strip()
+    if not rt:
+        return None
+    for pat in (
+        r"sessionId[=:]\s*(KEY[0-9A-Za-z]+)",
+        r"sessionid[=:]\s*(KEY[0-9A-Za-z]+)",
+    ):
+        m = re.search(pat, rt, re.I)
+        if m:
+            return m.group(1)
+    m = re.search(r"/p/(KEY[0-9A-Za-z]+)", rt, re.I)
+    if m:
+        return m.group(1)
+    keys = re.findall(r"(KEY[0-9A-Za-z]+)", rt, re.I)
+    if not keys:
+        return None
+    uniq: list[str] = []
+    for k in keys:
+        if k not in uniq:
+            uniq.append(k)
+    return max(uniq, key=len)
+
+
+def _resolve_agency_id_for_kvan_tx_row(raw_text: str, cur) -> tuple[Optional[str], str]:
+    key = _extract_primary_kvan_key_from_tx_raw(raw_text)
+    if not key:
+        return None, ""
+    aid = _get_agency_id_for_session(key)
+    if aid:
+        return aid, key
+    try:
+        cur.execute(
+            """
+            SELECT agency_id FROM kvan_links
+            WHERE kvan_link LIKE %s OR kvan_session_id LIKE %s
+               OR internal_session_id = %s
+            """,
+            (f"%{key}%", f"%{key}%", key),
+        )
+        rows = cur.fetchall() or []
+        if len(rows) == 1:
+            db_ag = str(rows[0].get("agency_id") or "").strip()
+            return (db_ag if db_ag else None), key
+        ags = [
+            str(r.get("agency_id") or "").strip()
+            for r in rows
+            if str(r.get("agency_id") or "").strip()
+        ]
+        if ags and len(set(ags)) == 1:
+            return ags[0], key
+    except Exception:
+        pass
+    return (aid or None), key
 
 
 def _lookup_internal_session_id_for_kvan_key(kvan_key: str) -> str:
@@ -864,7 +932,13 @@ class KVStore:
                     prev.get("internal_session_id") or ""
                 ).strip()
                 title = (row.get("title") or "").strip() or (prev.get("title") or "").strip()
-                link_created_at = prev.get("link_created_at")
+                try:
+                    parsed_ui = parse_kvan_link_ui_created_at(
+                        str(row.get("raw_text") or "")
+                    )
+                except Exception:
+                    parsed_ui = None
+                link_created_at = prev.get("link_created_at") or parsed_ui
                 amount = row.get("amount", 0)
                 try:
                     ai = int(amount)
@@ -984,7 +1058,7 @@ class KVStore:
             cur.execute(
                 """
                 SELECT id, captured_at, merchant_name, mid, tx_type,
-                       amount, approval_no, card_number, registered_at
+                       amount, approval_no, card_number, registered_at, raw_text
                 FROM kvan_transactions
                 ORDER BY captured_at DESC
                 LIMIT %s
@@ -1289,6 +1363,15 @@ class KVStore:
                             prefix4 and prefix_to_agency.get(prefix4)
                         ) or ""
 
+                        raw_tx = (kr.get("raw_text") or "").strip()
+                        key_agency, kkey = _resolve_agency_id_for_kvan_tx_row(raw_tx, cur)
+                        if kkey:
+                            resolved_agency_id = (key_agency or "").strip()
+                            print(
+                                f"[KVAN-TX-SYNC][crawler] approval={approval} key={kkey} "
+                                f"agency_id={(resolved_agency_id or '')!r}"
+                            )
+
                         cur.execute(
                             """
                             SELECT id
@@ -1312,7 +1395,7 @@ class KVStore:
                                     kvan_tx_type = %s,
                                     kvan_registered_at = %s,
                                     card_prefix4 = COALESCE(NULLIF(card_prefix4, ''), %s),
-                                    agency_id = COALESCE(NULLIF(agency_id, ''), %s)
+                                    agency_id = COALESCE(NULLIF(TRIM(agency_id), ''), %s)
                                 WHERE id = %s
                                 """,
                                 (
@@ -1368,7 +1451,7 @@ class KVStore:
                                     kvan_tx_type = %s,
                                     kvan_registered_at = %s,
                                     card_prefix4 = COALESCE(NULLIF(card_prefix4, ''), %s),
-                                    agency_id = COALESCE(NULLIF(agency_id, ''), %s)
+                                    agency_id = COALESCE(NULLIF(TRIM(agency_id), ''), %s)
                                 WHERE id = %s
                                 """,
                                 (
