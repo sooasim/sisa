@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import time
 import json
@@ -7,7 +9,7 @@ from typing import List
 from datetime import datetime, timedelta
 import random
 import re
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 from openpyxl import load_workbook, Workbook
 from selenium import webdriver
@@ -18,6 +20,9 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 import pymysql
+
+# 링크 생성 속도 최적화: 대기 시간 배율 (1.0=기본, 0.5=약 2배 빠름). 에러 시 1.0으로 올려서 사용.
+LINK_CREATION_WAIT_FACTOR = 0.5
 
 # 웹 어드민에서 볼 수 있는 간단한 로그 파일 (HQ 어드민에서 tail 형태로 노출)
 # auto_kvan.py 는 /app/wsisa/ 에 위치하므로 parent.parent = /app
@@ -418,9 +423,8 @@ def _load_auction_items() -> None:
     if AUCTION_LOADED:
         return
     try:
-        # wsisa 폴더 기준 상위 경로에 auction.html 이 있다고 가정
-        root = BASE_DIR.parent
-        auction_path = root / "auction.html"
+        # BASE_DIR = 프로젝트 루트(wsisa 상위), auction.html 은 그 안에 있음
+        auction_path = BASE_DIR / "auction.html"
         if not auction_path.exists():
             AUCTION_LOADED = True
             return
@@ -454,16 +458,24 @@ def _load_auction_items() -> None:
 
 
 def _choose_product_name_for_amount(amount: int) -> str:
-    """amount 와 동일한 금액의 옥션 상품들 중 최대 10개에서 랜덤 1개 선택."""
+    """
+    신청 금액(amount) 이상인 옥션 금액 구간 중 가장 낮은 구간의 상품명을 선택한다.
+    예: 217만원 신청 → 220만원 구간 상품 중 최대 10개에서 랜덤 1개.
+    금액 입력란에는 신청 금액(217만원)이 그대로 들어가고, 상품명만 옥션 구간에 맞춘다.
+    """
     _load_auction_items()
     if not AUCTION_ITEMS:
         return "SISA 글로벌 옥션 상품"
-    candidates = [it for it in AUCTION_ITEMS if it.get("price") == amount]
+    # 신청 금액 이상인 옥션 상품만 (같은 금액이 없으면 그 다음 구간 사용)
+    candidates = [it for it in AUCTION_ITEMS if (it.get("price") or 0) >= amount]
     if not candidates:
         return "SISA 글로벌 옥션 상품"
-    if len(candidates) > 10:
-        candidates = random.sample(candidates, 10)
-    chosen = random.choice(candidates)
+    # 그중 가장 낮은 금액 구간(예: 217만 → 220만원 구간)
+    min_tier = min(it["price"] for it in candidates)
+    tier_items = [it for it in candidates if it["price"] == min_tier]
+    if len(tier_items) > 10:
+        tier_items = random.sample(tier_items, 10)
+    chosen = random.choice(tier_items)
     return chosen.get("name") or "SISA 글로벌 옥션 상품"
 
 # MySQL 환경 변수 (Railway 용) - web_form.py 와 동일하게
@@ -733,6 +745,7 @@ def _find_input_quick(
     여러 CSS 셀렉터 후보를 짧게(0.2초 간격) 반복해서 검사하며,
     화면에 보이는 첫 번째 input 을 찾는다.
     """
+    interval = 0.1 * (2.0 - LINK_CREATION_WAIT_FACTOR)  # 0.05~0.2
     end = time.time() + max_wait
     while time.time() < end:
         for sel in css_list:
@@ -746,7 +759,7 @@ def _find_input_quick(
                         return el
                 except Exception:
                     continue
-        time.sleep(0.2)
+        time.sleep(interval)
     return None
 
 
@@ -1044,7 +1057,7 @@ def create_driver(headless: bool | None = None) -> webdriver.Chrome:
     if driver_path:
         service = Service(executable_path=driver_path)
     driver = webdriver.Chrome(service=service, options=options) if service else webdriver.Chrome(options=options)
-    driver.implicitly_wait(5)
+    driver.implicitly_wait(max(3, int(5 * LINK_CREATION_WAIT_FACTOR)))
     return driver
 
 
@@ -1746,7 +1759,13 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
                             break
 
                     # 상태: '사용중', '만료', '취소' 등 단어가 포함된 줄 추출
+                    # 카드가 이미 만료(만료일 경과 또는 배지 '만료')면 status='만료'로 저장해 다음 사이클에서 mark_expired가 DELETE 대상으로 인식
                     status = _extract_status_from_link_lines(lines)
+                    if "만료" not in (status or ""):
+                        expire_at = _extract_expire_at_from_lines(lines)
+                        if expire_at is not None and expire_at < _kvan_now():
+                            status = "만료"
+                    # resolved_session_id는 아래에서 설정됨
 
                     # MID / 세션ID: 'MID' 또는 '세션' 텍스트 기반
                     mid = ""
@@ -1798,6 +1817,8 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
                         ),
                     )
                     inserted += 1
+                    if (status or "").strip() == "만료":
+                        print(f"[EXPIRED_DEBUG] 스크래핑: kvan_links INSERT status='만료' (kvan_session_id={resolved_session_id or kvan_session_id or ''})")
 
                     # 크롤링으로 새로 얻은 링크를 admin_state.json 에도 즉시 반영
                     # (sessionId 가 있으면 세션 ID 기준으로 우선 매칭)
@@ -1853,6 +1874,10 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome) -> None:
                                 status = _extract_status_from_link_lines([ln])
                             if not mid and "MID" in ln.upper():
                                 mid = ln
+                        if "만료" not in (status or ""):
+                            expire_at = _extract_expire_at_from_lines(lines)
+                            if expire_at is not None and expire_at < _kvan_now():
+                                status = "만료"
                         cur.execute("DELETE FROM kvan_links WHERE kvan_link = %s", (link_text,))
                         cur.execute(
                             """
@@ -1983,10 +2008,12 @@ def mark_expired_sessions_from_kvan_links() -> None:
     - admin_state 의 진행중 세션은 즉시 제거하고, history에
       status='만료', deleted_in_kvan=True 로 남긴다.
     """
+    print("[EXPIRED_DEBUG] mark_expired_sessions_from_kvan_links 진입")
     for attempt in range(1, 4):
         conn = None
         try:
             conn = _get_db_with_retry()
+            print(f"[EXPIRED_DEBUG] DB 연결 성공 (attempt={attempt})")
             expired_urls: set[str] = set()
             # 만료+거래있음 세션은 삭제 제외 (어드민 알림용으로 유지)
             excluded_sids: set[str] = set()
@@ -1999,6 +2026,7 @@ def mark_expired_sessions_from_kvan_links() -> None:
                             excluded_sids.add(sid)
                 except Exception:
                     pass
+            print(f"[EXPIRED_DEBUG] 제외 세션(만료+거래있음) 수: {len(excluded_sids)}, sid_sample={list(excluded_sids)[:3]}")
 
             with conn.cursor() as cur:
                 cur.execute(
@@ -2008,18 +2036,29 @@ def mark_expired_sessions_from_kvan_links() -> None:
                     WHERE kvan_link IS NOT NULL AND kvan_link != ''
                     """,
                 )
-                for row in cur.fetchall() or []:
-                    url = (row.get("kvan_link") or "").strip()
-                    status_text = str(row.get("status") or "").strip()
-                    sid = (row.get("kvan_session_id") or "").strip()
-                    if url and _is_expired_link_status(status_text) and sid not in excluded_sids:
-                        expired_urls.add(url)
+                rows = cur.fetchall() or []
+            print(f"[EXPIRED_DEBUG] kvan_links 전체 행 수: {len(rows)}")
+            for i, row in enumerate(rows):
+                url = (row.get("kvan_link") or "").strip()
+                status_text = str(row.get("status") or "").strip()
+                sid = (row.get("kvan_session_id") or "").strip()
+                is_exp = _is_expired_link_status(status_text)
+                in_excl = sid in excluded_sids
+                if i < 5:
+                    print(f"[EXPIRED_DEBUG]   row[{i}] status={repr(status_text)}, sid={sid[:24] if sid else ''}..., is_expired={is_exp}, excluded={in_excl}")
+                if url and is_exp and not in_excl:
+                    expired_urls.add(url)
+            if len(rows) > 5:
+                print(f"[EXPIRED_DEBUG]   ... 외 {len(rows)-5}건 (동일 조건으로 expired_urls 집합에 반영)")
+            print(f"[EXPIRED_DEBUG] 만료로 판별된 URL 수(expired_urls): {len(expired_urls)}, sample={list(expired_urls)[:2]}")
             if not expired_urls:
+                print("[EXPIRED_DEBUG] expired_urls 비어 있음 → 삭제할 대상 없음, return")
                 conn.close()
                 return
             st = _load_admin_state()
             sessions = list(st.get("sessions") or [])
             history = list(st.get("history") or [])
+            print(f"[EXPIRED_DEBUG] admin_state sessions 수: {len(sessions)}, history 수: {len(history)}")
             remaining_sessions: list[dict] = []
             removed_count = 0
             now_iso = datetime.utcnow().isoformat()
@@ -2028,6 +2067,8 @@ def mark_expired_sessions_from_kvan_links() -> None:
                 link = (s.get("kvan_link") or "").strip()
                 if link and link in expired_urls:
                     removed_count += 1
+                    if removed_count <= 3:
+                        print(f"[EXPIRED_DEBUG]   admin_state 매칭 제거 session_id={s.get('id')}, link_len={len(link)}")
                     sid = str(s.get("id") or "")
                     s["status"] = "만료"
                     s["deleted"] = True
@@ -2055,6 +2096,10 @@ def mark_expired_sessions_from_kvan_links() -> None:
                         f"DELETE FROM kvan_links WHERE kvan_link IN ({placeholders})",
                         tuple(expired_urls),
                     )
+                    deleted_count = cur.rowcount
+                print(f"[EXPIRED_DEBUG] DELETE FROM kvan_links 실행 완료, 삭제된 행 수: {deleted_count}")
+            else:
+                print("[EXPIRED_DEBUG] expired_urls 비어 있어 DELETE 미실행")
             conn.commit()
             conn.close()
             if removed_count:
@@ -2101,18 +2146,8 @@ def _sync_popup_transaction_to_internal(
     if not approval_no or not amount:
         return
 
-    # admin_state.json 에서 agency_id 찾기
-    agency_id: str | None = None
-    try:
-        st = _load_admin_state()
-        sessions = st.get("sessions") or []
-        history = st.get("history") or []
-        for s in list(sessions) + list(history):
-            if str(s.get("id")) == str(session_id):
-                agency_id = (s.get("agency_id") or "").strip() or None
-                break
-    except Exception as e:
-        print(f"[WARN] popup 기반 agency_id 조회 실패: {e}")
+    # session_id(KEY... 또는 우리 세션 id)로 agency_id 찾기. KEY... 는 kvan_link 파싱으로 매칭.
+    agency_id: str | None = _get_agency_id_for_session(session_id)
 
     try:
         conn = get_db()
@@ -2466,6 +2501,7 @@ def _mark_session_deleted(session_id: str, title: str) -> None:
         # 만료+거래없음 → kvan_links에서 해당 행 삭제 대상으로 표시 (status='만료' 반영 후 mark_expired_sessions_from_kvan_links가 DELETE)
         if not LOCAL_TEST and session_id:
             try:
+                print(f"[EXPIRED_DEBUG] _mark_session_deleted: 서버 모드, kvan_links UPDATE 시도 session_id={session_id[:24]}...")
                 conn = _get_db_with_retry()
                 try:
                     with conn.cursor() as cur:
@@ -2477,11 +2513,18 @@ def _mark_session_deleted(session_id: str, title: str) -> None:
                             """,
                             (session_id, f"%{session_id}%"),
                         )
+                        updated = cur.rowcount
                     conn.commit()
+                    print(f"[EXPIRED_DEBUG] _mark_session_deleted: kvan_links UPDATE 완료, 반영 행 수: {updated}")
                 finally:
                     conn.close()
             except Exception as e_db:
                 print(f"[WARN] _mark_session_deleted kvan_links 반영 실패: {e_db}")
+        else:
+            if LOCAL_TEST:
+                print(f"[EXPIRED_DEBUG] _mark_session_deleted: LOCAL_TEST=true → kvan_links UPDATE 스킵 session_id={session_id[:24] if session_id else ''}...")
+            elif not session_id:
+                print("[EXPIRED_DEBUG] _mark_session_deleted: session_id 없음 → kvan_links UPDATE 스킵")
     except Exception as e:
         print(f"[WARN] _mark_session_deleted 실패: {e}")
 
@@ -2553,14 +2596,88 @@ def _mark_session_expired_with_transactions(
         print(f"[WARN] _mark_session_expired_with_transactions 실패: {e}")
 
 
+def _link_matches_kvan_session_id(link: str, session_id: str) -> bool:
+    """
+    kvan_link(전체 URL)와 팝업/크롤러에서 온 session_id(KEY... 또는 변형)가 같은 세션인지 판별.
+    아래 방법 중 하나라도 통과하면 True (오류·인코딩·파싱 차이 보완).
+    """
+    if not link or not session_id:
+        return False
+    sid = str(session_id).strip()
+    link_raw = link.strip()
+    if not sid or not link_raw:
+        return False
+    sid_l = sid.lower()
+    link_l = link_raw.lower()
+
+    def _eq(a: str, b: str) -> bool:
+        aa = unquote(str(a).strip())
+        bb = unquote(str(b).strip())
+        return aa == bb or aa.lower() == bb.lower()
+
+    # 1) 전체 URL 부분 문자열
+    if sid in link_raw or sid_l in link_l:
+        return True
+
+    # 2) parse_qs 의 sessionId
+    try:
+        q = parse_qs(urlparse(link_raw).query)
+        for v in q.get("sessionId") or []:
+            if _eq(v, sid):
+                return True
+    except Exception:
+        pass
+
+    # 3) KEY 직후 ~ &type=KEYED 앞까지 (쿼리에 명시된 형태)
+    for pat in (
+        r"sessionId=(KEY[^&]+?)&type=KEYED",
+        r"sessionid=(KEY[^&]+?)&type=KEYED",
+        r"sessionId=(KEY[^&]+?)(?:&|$)",
+    ):
+        m = re.search(pat, link_raw, re.IGNORECASE)
+        if m and _eq(m.group(1), sid):
+            return True
+
+    # 4) 경로 /p/KEY...
+    m = re.search(r"/p/(KEY[A-Za-z0-9]+)", link_raw, re.IGNORECASE)
+    if m and _eq(m.group(1), sid):
+        return True
+
+    # 5) URL 안의 모든 KEY… 토큰과 비교 (대소문자 무시)
+    for tok in re.findall(r"KEY[A-Za-z0-9]+", link_raw, re.IGNORECASE):
+        if _eq(tok, sid):
+            return True
+
+    # 6) 팝업 쪽이 KEY 접두어 없이 뒷부분만 온 경우 (KEY 이후 문자열만 동일하면 일치)
+    if sid_l.startswith("key") and len(sid_l) > 3:
+        suffix = sid_l[3:]
+        for tok in re.findall(r"KEY([A-Za-z0-9]+)", link_raw, re.IGNORECASE):
+            if tok.lower() == suffix:
+                return True
+    elif not sid_l.startswith("key") and re.match(r"^[A-Za-z0-9]+$", sid):
+        for tok in re.findall(r"KEY([A-Za-z0-9]+)", link_raw, re.IGNORECASE):
+            if tok.lower() == sid_l:
+                return True
+
+    return False
+
+
 def _get_agency_id_for_session(session_id: str) -> str | None:
-    """admin_state.json 에서 session_id(KEY...)에 해당하는 agency_id 반환. 본사/대행사 구분용."""
+    """
+    admin_state.json 에서 session_id에 해당하는 agency_id 반환. 본사/대행사 구분용.
+    session_id 는 (1) 우리 쪽 세션 id 또는 (2) K-VAN 링크의 KEY... (거래 내역 팝업에서 옴) 일 수 있음.
+    kvan_link 와의 대조는 _link_matches_kvan_session_id 로 여러 방식 중 하나만 통과하면 일치.
+    """
     if not session_id:
         return None
     try:
         st = _load_admin_state()
         for s in (st.get("sessions") or []) + (st.get("history") or []):
             if str(s.get("id") or "") == str(session_id):
+                aid = (s.get("agency_id") or "").strip()
+                return aid or None
+            link = (s.get("kvan_link") or "").strip()
+            if link and _link_matches_kvan_session_id(link, session_id):
                 aid = (s.get("agency_id") or "").strip()
                 return aid or None
         return None
@@ -2888,8 +3005,21 @@ return out;
                         "거래 내역이 없습니다" in popup_text
                         or "거래 내역 없음" in popup_text
                     )
+                    # 테이블에 실제 데이터 행이 없거나, 첫 행이 '없습니다' 문구면 거래없음으로 간주 (K-VAN 문구 차이·로딩 지연 대응)
+                    rows = dialog.find_elements(By.XPATH, ".//table//tbody//tr")
+                    if not has_no_history and len(rows) == 0:
+                        has_no_history = True
+                        print(f"[EXPIRED_DEBUG] 만료 카드: tbody tr 0개 → 거래없음으로 간주 session_id={session_id[:24]}...")
+                    elif not has_no_history and rows:
+                        first_row_text = (rows[0].text or "").strip()
+                        if "없습니다" in first_row_text or "없음" in first_row_text:
+                            has_no_history = True
+                            print(f"[EXPIRED_DEBUG] 만료 카드: 첫 행이 '없음' 문구 → 거래없음으로 간주 session_id={session_id[:24]}..., first_row={first_row_text[:60]}")
+                    if not has_no_history:
+                        print(f"[EXPIRED_DEBUG] 만료 카드 팝업: popup_text_len={len(popup_text)}, tbody_rows={len(rows)}, has_no_history=False → 만료+거래있음 처리 session_id={session_id[:24]}...")
                     if has_no_history:
                         _close_dialog(driver, dialog)
+                        print(f"[EXPIRED_DEBUG] 만료+거래없음 → _mark_session_deleted 호출 session_id={session_id}, LOCAL_TEST={LOCAL_TEST}")
                         _mark_session_deleted(session_id, product_title)
                         expired_count += 1
                         _append_admin_log("CRAWLER", f"만료+거래없음 세션 삭제 session_id={session_id}")
@@ -3078,7 +3208,7 @@ def _go_to_payment_link_page(driver: webdriver.Chrome) -> None:
             )
         )
         link_btn.click()
-        time.sleep(0.3)
+        time.sleep(0.15 * (1.0 + LINK_CREATION_WAIT_FACTOR))
         _step_end("결제링크 관리 메뉴 이동", t0)
     except Exception as e:
         print(f"[WARN] 결제링크 관리/생성 페이지 이동 실패: {e}")
@@ -3095,8 +3225,10 @@ def _go_to_create_link_page(driver: webdriver.Chrome) -> bool:
     """
     t0 = _step_start("+ 생성 버튼 클릭 (헤더/위치 기반 탐색)")
     try:
-        # 최대 약 8~10초 동안(12회) 반복해서 버튼을 찾는다.
-        for _ in range(12):
+        # 반복 횟수·간격 최적화: 6회 × 0.35초 ≈ 2.1초 (기존 12×0.7≈8.4초 대비 단축)
+        n_tries = 6
+        retry_sleep = 0.35 * (1.0 + LINK_CREATION_WAIT_FACTOR)
+        for _ in range(n_tries):
             try:
                 clicked = driver.execute_script(
                     """
@@ -3156,14 +3288,12 @@ return clickCreateButton();
 """
                 )
                 if clicked:
-                    time.sleep(0.5)
+                    time.sleep(0.25 * (1.0 + LINK_CREATION_WAIT_FACTOR))
                     _step_end("+ 생성 버튼 클릭 (헤더/위치 기반 탐색)", t0)
                     return True
             except Exception:
-                # DOM 이 아직 완전히 준비되지 않았을 수 있으므로 잠시 후 재시도
                 pass
-
-            time.sleep(0.7)
+            time.sleep(retry_sleep)
 
         print("[WARN] 여러 번 시도했지만 '+ 생성' 버튼을 찾지 못했습니다.")
         _step_end("+ 생성 버튼 클릭 (헤더/위치 기반 탐색)", t0)
@@ -3177,7 +3307,10 @@ return clickCreateButton();
 def _store_kvan_link_for_session(session_id: str, link: str) -> None:
     """admin_state.json 의 해당 세션에 K-VAN 결제 링크를 매핑해서 저장.
 
-    admin_state.json 이 여러 경로 후보 중 어디에 존재하든 찾아서 업데이트한다.
+    링크 형식: https://store.k-van.app/p/KEY...?sessionId=KEY...&type=KEYED
+    KEY 부터 &type=KEYED 앞까지가 K-VAN 세션 ID이며, 크롤러가 /payment-link 를 스크래핑할 때
+    kvan_links.kvan_session_id 로 DB 에 저장한다. 거래 내역 팝업의 session_id(KEY...) 와
+    이 kvan_link 를 기준으로 본사/대행사 매칭이 이뤄진다.
     """
     if not session_id or not link:
         return
@@ -3218,9 +3351,8 @@ def _fill_payment_link_form_and_get_url(
 ) -> str | None:
     """결제링크 생성 페이지에서 폼을 채우고, 생성된 https://store.k-van.app... 링크를 리턴."""
     t0_all = _step_start("결제링크 생성 폼 작성 전체")
-    # 전체 폼에서는 기다리는 시간을 최소화한다.
-    wait = WebDriverWait(driver, 3)
-    time.sleep(0.2)
+    wait = WebDriverWait(driver, max(2, int(3 * LINK_CREATION_WAIT_FACTOR)))
+    time.sleep(0.1 * (1.0 + LINK_CREATION_WAIT_FACTOR))
 
     # 1. 금액 입력
     t0 = _step_start("1. 금액 입력")
@@ -3246,7 +3378,7 @@ def _fill_payment_link_form_and_get_url(
             pass
         amount_input.clear()
         amount_input.send_keys(str(row.amount))
-        time.sleep(0.2)
+        time.sleep(0.1 * (1.0 + LINK_CREATION_WAIT_FACTOR))
     _step_end("1. 금액 입력", t0)
 
     # 2. 상품명: 옥션 리스트에서 amount 에 맞는 상품명 선택
@@ -3260,7 +3392,7 @@ def _fill_payment_link_form_and_get_url(
         )
         name_input.clear()
         name_input.send_keys(product_name)
-        time.sleep(0.2)
+        time.sleep(0.1 * (1.0 + LINK_CREATION_WAIT_FACTOR))
     except TimeoutException:
         pass
     _step_end("2. 상품명 입력", t0)
@@ -3279,9 +3411,8 @@ def _fill_payment_link_form_and_get_url(
         )
         desc_input.clear()
         desc_input.send_keys(desc_text)
-        time.sleep(0.2)
+        time.sleep(0.1 * (1.0 + LINK_CREATION_WAIT_FACTOR))
     except TimeoutException:
-        # textarea 대신 input 일 수도 있으므로 보조 XPATH 시도
         try:
             desc_input = wait.until(
                 EC.visibility_of_element_located(
@@ -3293,16 +3424,15 @@ def _fill_payment_link_form_and_get_url(
             )
             desc_input.clear()
             desc_input.send_keys(desc_text)
-            time.sleep(0.2)
+            time.sleep(0.1 * (1.0 + LINK_CREATION_WAIT_FACTOR))
         except TimeoutException:
             pass
     _step_end("3. 상품설명 입력", t0)
 
     # 폼 아래쪽에 있는 세션유효시간/링크 생성 버튼들이 보이도록 스크롤을 충분히 내린다.
     try:
-        # 기존보다 3배 정도 더 아래로 내려서, 60분 및 '링크 생성하기' 버튼이 모두 보이도록 한다.
         driver.execute_script("window.scrollBy(0, 1800);")
-        time.sleep(0.3)
+        time.sleep(0.15 * (1.0 + LINK_CREATION_WAIT_FACTOR))
     except Exception:
         pass
 
@@ -3333,18 +3463,18 @@ def _fill_payment_link_form_and_get_url(
                     "arguments[0].scrollIntoView({behavior:'instant', block:'center'});",
                     create_btn,
                 )
-                time.sleep(0.05)
+                time.sleep(0.03)
                 driver.execute_script("arguments[0].click();", create_btn)
                 clicked = True
                 break
             except Exception:
-                time.sleep(0.1)
+                time.sleep(0.08)
         if not clicked:
             print("[WARN] '링크 생성하기' 버튼을 2초 내에 찾지 못했습니다.")
             _step_end("5. '링크 생성하기' 버튼 클릭", t0)
             _step_end("결제링크 생성 폼 작성 전체", t0_all)
             return None
-        time.sleep(0.3)
+        time.sleep(0.2 * (1.0 + LINK_CREATION_WAIT_FACTOR))
     except Exception:
         print("[WARN] '링크 생성하기' 버튼 클릭 중 예외가 발생했습니다.")
         _step_end("5. '링크 생성하기' 버튼 클릭", t0)
@@ -3362,12 +3492,11 @@ def _fill_payment_link_form_and_get_url(
             "arguments[0].scrollIntoView({behavior:'instant', block:'center'});",
             copy_btn,
         )
-        time.sleep(0.1)
+        time.sleep(0.05)
         driver.execute_script("arguments[0].click();", copy_btn)
         used_copy_button = True
-        time.sleep(0.4)
+        time.sleep(0.2 * (1.0 + LINK_CREATION_WAIT_FACTOR))
     except TimeoutException:
-        # 링크 복사 버튼이 없는 구조일 수도 있으므로, 이 경우에는 생성 버튼만 누른 상태로 진행한다.
         print("[DEBUG] '링크 복사' 버튼을 찾지 못했습니다. 생성 버튼만 누른 상태로 진행합니다.")
     _step_end("5. '링크 생성하기' 버튼 클릭", t0)
 
@@ -3408,8 +3537,7 @@ def _fill_payment_link_form_and_get_url(
                 "arguments[0].scrollIntoView({behavior:'instant', block:'center'});",
                 confirm_btn,
             )
-            # 너무 길게 기다리지 않고 바로 클릭
-            time.sleep(0.05)
+            time.sleep(0.03)
             driver.execute_script("arguments[0].click();", confirm_btn)
             print("[INFO] '생성하기' 버튼(JS click) 실행.")
         except Exception as e:
@@ -3420,11 +3548,13 @@ def _fill_payment_link_form_and_get_url(
     _step_end("6. 팝업 '생성하기' 버튼 클릭", t0)
 
     # 7. 생성된 링크 추출 + 링크 복사 아이콘 클릭 + 클립보드 복사
+    # 참고: 크롬 왼쪽 상단 '허용' 등 권한 알림은 클릭하지 않아도 됨. 링크는 페이지 input 값에서 읽어 저장하며,
+    # 저장 후 admin_state.json 반영 및 signal_crawler_wakeup()으로 어드민/대행사 페이지에 곧 반영된다.
     t0 = _step_start("7. 생성된 링크 추출")
     link_text = None
     try:
         # readonly input.value 형태의 링크를 우선적으로 찾는다.
-        url_input = WebDriverWait(driver, 3).until(
+        url_input = WebDriverWait(driver, max(2, int(3 * LINK_CREATION_WAIT_FACTOR))).until(
             EC.presence_of_element_located(
                 (
                     By.XPATH,
@@ -3455,14 +3585,13 @@ def _fill_payment_link_form_and_get_url(
                             "arguments[0].scrollIntoView({behavior:'instant', block:'center'});",
                             copy_btn,
                         )
-                        time.sleep(0.05)
+                        time.sleep(0.03)
                         driver.execute_script("arguments[0].click();", copy_btn)
                         clicked_copy = True
                         print("[INFO] K-VAN 화면의 '링크 복사' 아이콘 버튼 클릭.")
                         break
                     except TimeoutException:
-                        # 아직 아이콘이 안 뜬 경우 → 0.2초 정도 기다리고 다시 시도
-                        time.sleep(0.2)
+                        time.sleep(0.12)
 
             except TimeoutException:
                 print("[WARN] '링크 복사' 아이콘 버튼을 찾지 못했습니다. K-VAN 내부 복사는 생략합니다.")
@@ -3600,13 +3729,12 @@ def sign_in(driver: webdriver.Chrome, row: PaymentRow) -> None:
 
     # 2차 인증 PIN 팝업 처리 (있으면 입력, 없으면 통과)
     try:
-        # 로그인 버튼 클릭 후 사람이 화면을 보는 것처럼 약간 대기
-        time.sleep(0.5)
-        pin_wait = WebDriverWait(driver, 3)
+        pin_delay = 0.25 * (1.0 + LINK_CREATION_WAIT_FACTOR)  # 0.25~0.375
+        time.sleep(pin_delay)
+        pin_wait = WebDriverWait(driver, max(2, int(3 * LINK_CREATION_WAIT_FACTOR)))
         pin_input_container = pin_wait.until(
             EC.visibility_of_element_located(PIN_POPUP_SELECTORS["input"])
         )
-        # 위에서 찾은 컨테이너 안의 input 이나 자신이 input 일 수 있음
         if pin_input_container.tag_name.lower() == "input":
             pin_input = pin_input_container
         else:
@@ -3615,16 +3743,13 @@ def sign_in(driver: webdriver.Chrome, row: PaymentRow) -> None:
         t0_pin = _step_start("PIN 입력 및 확인")
         pin_input.clear()
         pin_input.send_keys(row.login_pin)
-        # 사람이 확인 내용을 읽는 것처럼 잠시 대기
-        time.sleep(0.4)
+        time.sleep(0.15 * (1.0 + LINK_CREATION_WAIT_FACTOR))
 
         confirm_btn = driver.find_element(*PIN_POPUP_SELECTORS["confirm"])
         confirm_btn.click()
-        # 서버가 토큰을 발급하고 홈으로 이동할 시간을 충분히 준다
-        time.sleep(1.0)
+        time.sleep(0.5 * (1.0 + LINK_CREATION_WAIT_FACTOR))
         _step_end("PIN 입력 및 확인", t0_pin)
     except TimeoutException:
-        # PIN 팝업이 없는 계정/환경일 수 있으므로 조용히 통과
         pass
 
     # 로그인 완료까지 잠시 대기 (홈 또는 다른 보호된 페이지로 진입)
@@ -4058,9 +4183,12 @@ def append_transaction_to_hq(
 
 def main() -> None:
     """
-    auto_kvan 링크 생성 메인 엔트리.
+    auto_kvan 링크 생성 메인 엔트리 (우선 목적: 결제 링크 생성).
+
     - 세션 ID 또는 기본 JSON 을 읽어 K-VAN 결제 링크를 생성한다.
     - 전체 실행 시간이 30분(1800초)을 넘으면 안전하게 종료한다.
+    - 링크 생성 속도: LINK_CREATION_WAIT_FACTOR(기본 0.5)로 대기 시간을 조절한다.
+      불안정하면 1.0으로 올리면 된다.
     """
     import sys
 
@@ -4172,8 +4300,9 @@ def main() -> None:
 
     _check_timeout("after_load_order")
 
-    driver = create_driver()
+    driver: webdriver.Chrome | None = None
     try:
+        driver = create_driver()
         _check_timeout("before_sign_in")
         _append_admin_log("AUTO", f"K-VAN 로그인 시작 session_id={session_id or '-'}")
         print("K-VAN 가맹점 페이지에 로그인 중...")
@@ -4235,8 +4364,21 @@ def main() -> None:
             input("브라우저를 확인한 뒤, 종료하려면 Enter 키를 누르세요...")
     except TimeoutError as te:
         print(f"[ERROR] {te}")
+        _append_admin_log("AUTO", f"[ERROR] {te}")
+    except Exception as e:
+        print(f"[ERROR] 링크 생성 중 오류: {e}")
+        _append_admin_log("AUTO", f"[ERROR] 링크 생성 중 오류: {e}")
+        if session_id:
+            try:
+                save_result_to_json(str(result_json_path), "error", str(e))
+            except Exception:
+                pass
     finally:
-        driver.quit()
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception as qe:
+                print(f"[WARN] driver.quit() 실패: {qe}")
 
 
 if __name__ == "__main__":

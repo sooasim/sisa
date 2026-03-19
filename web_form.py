@@ -2594,6 +2594,8 @@ def admin():
     _status = lambda s: (str(s.get("status") or "결제중").strip())
     active_sessions = [s for s in sessions if _status(s) == "결제중"]
     completed_sessions = list(history) + [s for s in sessions if _status(s) != "결제중"]
+    # 삭제된(=K-VAN에서 삭제됨) 링크 기록은 완료/종료 목록에서도 숨긴다.
+    completed_sessions = [s for s in completed_sessions if not s.get("deleted_in_kvan")]
 
     # 결제중인데 아직 K-VAN 링크가 없는 세션이 있는지 여부 (자동 새로고침/팝업 트리거 용)
     has_pending_link = any(
@@ -2627,10 +2629,19 @@ def admin():
         conn = get_db()
         with conn.cursor() as cur:
             try:
+                # 삭제/만료/취소 상태는 최근 DB 요약에서 제외(어드민에서 혼동 방지)
                 cur.execute(
                     """
                     SELECT captured_at, title, amount, ttl_label, status, kvan_link
                     FROM kvan_links
+                    WHERE kvan_link IS NOT NULL AND kvan_link != ''
+                      AND NOT (
+                        COALESCE(status, '') LIKE '%만료%'
+                        OR (
+                          COALESCE(status, '') LIKE '%취소%'
+                          AND COALESCE(status, '') NOT LIKE '%취소 가능%'
+                        )
+                      )
                     ORDER BY captured_at DESC
                     LIMIT 10
                     """
@@ -3793,6 +3804,43 @@ def hq_admin():
                 message = "만료+거래있음 목록을 확인 처리했습니다."
             except Exception as e:
                 message = f"확인 처리 중 오류: {e}"
+        elif action == "delete_expired_with_tx":
+            session_id_del = request.form.get("session_id", "").strip()
+            if session_id_del and EXPIRED_WITH_TRANSACTIONS_PATH.exists():
+                try:
+                    items = json.loads(EXPIRED_WITH_TRANSACTIONS_PATH.read_text(encoding="utf-8"))
+                    if isinstance(items, list):
+                        items = [it for it in items if str(it.get("session_id") or "") != session_id_del]
+                        EXPIRED_WITH_TRANSACTIONS_PATH.write_text(
+                            json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8"
+                        )
+                    message = "해당 만료 결제 링크 항목을 삭제했습니다."
+                except Exception as e:
+                    message = f"삭제 처리 중 오류: {e}"
+        elif action == "delete_kvan_link":
+            link_id = request.form.get("link_id", "").strip()
+            if link_id:
+                try:
+                    conn = get_db()
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM kvan_links WHERE id = %s", (link_id,))
+                    conn.commit()
+                    conn.close()
+                    message = "해당 K-VAN 결제 링크를 삭제했습니다."
+                except Exception as e:
+                    message = f"K-VAN 링크 삭제 중 오류: {e}"
+        elif action == "delete_kvan_tx":
+            tx_id = request.form.get("kvan_tx_id", "").strip()
+            if tx_id:
+                try:
+                    conn = get_db()
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM kvan_transactions WHERE id = %s", (tx_id,))
+                    conn.commit()
+                    conn.close()
+                    message = "해당 K-VAN 거래 내역을 삭제했습니다."
+                except Exception as e:
+                    message = f"K-VAN 거래 삭제 중 오류: {e}"
 
     # POST 처리 후 화면은 항상 DB 기준 최신 상태를 다시 로드한다.
     state = _load_hq_state()
@@ -3814,6 +3862,26 @@ def hq_admin():
         expired_with_transactions = []
     expired_with_tx_unseen = sum(1 for x in expired_with_transactions if not x.get("seen"))
     expired_with_transactions_reversed = list(reversed(expired_with_transactions))  # 최신순 표시
+
+    # K-VAN 결제링크/거래내역 DB 전체 로드 (실시간 표시)
+    kvan_links: list = []
+    kvan_transactions: list = []
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM kvan_links ORDER BY captured_at DESC")
+            kvan_links = cur.fetchall()
+            cur.execute("SELECT * FROM kvan_transactions ORDER BY captured_at DESC")
+            kvan_transactions = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        print(f"[WARN] hq_admin kvan_links/kvan_transactions 조회 실패: {e}")
+
+    # 각 테이블 전체 컬럼 목록 (DB 모든 항목 표시용)
+    app_columns = list(applications[0].keys()) if applications else []
+    agency_columns = list(agencies[0].keys()) if agencies else []
+    kvan_links_columns = list(kvan_links[0].keys()) if kvan_links else []
+    kvan_tx_columns = list(kvan_transactions[0].keys()) if kvan_transactions else []
 
     # 대행사 관리 페이징 (20개씩)
     try:
@@ -4021,46 +4089,18 @@ def hq_admin():
           </div>
           {% endif %}
 
-          <!-- 0. K-VAN / 매크로 상태 로그 뷰어 -->
-          <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-4">
-            <div class="flex items-center justify-between mb-2">
-              <h2 class="text-sm font-semibold flex items-center gap-2">
-                <i class="fa-solid fa-terminal text-brand-accent"></i> K-VAN 크롤링 & 자동결제 로그
-              </h2>
-              <div class="flex items-center gap-2 text-[10px]">
-                <span class="text-white/50">최근 {{ admin_logs|length }}줄</span>
-                <form method="post" action="{{ url_for('hq_admin') }}" onsubmit="return confirm('로그 파일을 정말 삭제하시겠습니까?');">
-                  <input type="hidden" name="action" value="clear_logs">
-                  <button type="submit"
-                          class="px-2 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25">
-                    로그 삭제
-                  </button>
-                </form>
-              </div>
-            </div>
-            <p class="text-[10px] text-white/45 mb-2">로그 파일 경로: {{ admin_log_path }}</p>
-            {% if admin_logs %}
-            <div class="bg-black/40 rounded-xl border border-white/10 p-3 max-h-56 overflow-y-auto text-[11px] font-mono text-white/80 whitespace-pre-wrap">
-              {% for line in admin_logs %}
-              <div class="leading-tight">{{ line }}</div>
-              {% endfor %}
-            </div>
-            {% else %}
-            <p class="text-[11px] text-white/60">아직 기록된 K-VAN/매크로 로그가 없습니다.</p>
-            {% endif %}
-          </section>
-
-          <!-- 만료되었으나 거래 내역 있음 (크롤러 저장 → 어드민 알림) -->
+          <!-- 만료된 결제 링크 (거래 내역 있음) - 삭제/엑셀 -->
           <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
             <div class="flex items-center justify-between mb-2">
               <h2 class="text-sm font-semibold flex items-center gap-2">
                 <i class="fa-solid fa-link-slash text-amber-400"></i> 만료된 결제 링크 (거래 내역 있음)
               </h2>
               {% if expired_with_transactions %}
-              <form method="post" action="{{ url_for('hq_admin') }}">
+              <form method="post" action="{{ url_for('hq_admin') }}" class="inline">
                 <input type="hidden" name="action" value="mark_expired_with_transactions_seen" />
                 <button type="submit" class="px-2 py-1 rounded bg-amber-600/80 text-white text-xs hover:bg-amber-600">전체 확인</button>
               </form>
+              <a href="{{ url_for('hq_export_excel', scope='expired_links') }}" class="px-2 py-1 rounded bg-white/10 border border-white/30 text-white text-xs hover:bg-white/25">엑셀</a>
               {% endif %}
             </div>
             <p class="text-[10px] text-white/50 mb-2">만료되었지만 결제가 발생한 링크 목록입니다. DB에 저장되어 있으며 정산 대상에 포함됩니다.</p>
@@ -4074,6 +4114,7 @@ def hq_admin():
                     <th class="px-2 py-1 text-left">대행사 ID</th>
                     <th class="px-2 py-1 text-left">만료 시각</th>
                     <th class="px-2 py-1 text-center">확인</th>
+                    <th class="px-2 py-1 text-center">삭제</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -4084,6 +4125,13 @@ def hq_admin():
                     <td class="px-2 py-1 text-white/80">{{ e.agency_id or '본사' }}</td>
                     <td class="px-2 py-1 text-white/60">{{ e.finished_at or '' }}</td>
                     <td class="px-2 py-1 text-center">{{ '확인함' if e.seen else '미확인' }}</td>
+                    <td class="px-2 py-1 text-center">
+                      <form method="post" action="{{ url_for('hq_admin') }}" class="inline" onsubmit="return confirm('이 만료 링크 항목을 목록에서 삭제하시겠습니까?');">
+                        <input type="hidden" name="action" value="delete_expired_with_tx" />
+                        <input type="hidden" name="session_id" value="{{ e.session_id or '' }}" />
+                        <button type="submit" class="px-2 py-0.5 rounded bg-red-500/40 text-red-100 text-[10px] hover:bg-red-500/60">삭제</button>
+                      </form>
+                    </td>
                   </tr>
                   {% endfor %}
                 </tbody>
@@ -4097,76 +4145,61 @@ def hq_admin():
             {% endif %}
           </section>
 
-          <!-- 1. 대행사 신청 현황 -->
+          <!-- 1. 대행사 신청 현황 (DB applications 전체 컬럼 실시간) -->
           <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
             <div class="flex items-center justify-between mb-3">
               <h2 class="text-lg font-semibold flex items-center gap-2">
                 <i class="fa-solid fa-file-pen text-brand-accent"></i> 대행사 신청 현황
               </h2>
-              <p class="text-[11px] text-white/60">신청서 양식과 동일한 정보가 리스트로 표시됩니다.</p>
+              <div class="flex items-center gap-2">
+                <p class="text-[11px] text-white/60 hidden sm:block">DB applications 테이블 실시간 연동.</p>
+                <a href="{{ url_for('hq_export_excel', scope='applications') }}" class="px-3 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25 text-[11px]">엑셀</a>
+              </div>
             </div>
-            <div class="box-schema"><code>applications</code> 항목: <code>created_at, company_name, domain, phone, bank_name, account_number, email_or_sheet, login_id, login_password, fee_percent</code></div>
+            <div class="box-schema"><code>applications</code> 전체 항목: {% for c in app_columns %}<code>{{ c }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</div>
             {% if applications %}
-            <div class="overflow-x-auto">
-              <table class="min-w-full text-sm border-separate border-spacing-y-2">
-                <thead class="text-xs text-white/70">
+            <div class="overflow-x-auto max-h-[420px] overflow-y-auto border border-white/20 rounded-xl">
+              <table class="min-w-full text-sm border-collapse">
+                <thead class="text-xs text-white/70 bg-black/40 sticky top-0 z-10">
                   <tr>
-                    <th class="px-3 py-1 text-left">신청일</th>
-                    <th class="px-3 py-1 text-left">업체명</th>
-                    <th class="px-3 py-1 text-left">도메인(영문)</th>
-                    <th class="px-3 py-1 text-left">전화번호</th>
-                    <th class="px-3 py-1 text-left">은행/계좌</th>
-                    <th class="px-3 py-1 text-left">이메일/구글시트</th>
-                    <th class="px-3 py-1 text-left">아이디</th>
-                    <th class="px-3 py-1 text-left">비밀번호</th>
-                    <th class="px-3 py-1 text-center">수수료%</th>
-                    <th class="px-3 py-1 text-center">수수료 저장</th>
-                    <th class="px-3 py-1 text-center">승인 및 생성</th>
-                    <th class="px-3 py-1 text-center">삭제</th>
+                    {% for col in app_columns %}
+                    <th class="px-2 py-1.5 text-left whitespace-nowrap border-b border-r border-white/20">{{ col }}</th>
+                    {% endfor %}
+                    <th class="px-2 py-1.5 text-center whitespace-nowrap border-b border-white/20">수수료 저장</th>
+                    <th class="px-2 py-1.5 text-center whitespace-nowrap border-b border-white/20">승인 및 생성</th>
+                    <th class="px-2 py-1.5 text-center whitespace-nowrap border-b border-white/20">삭제</th>
                   </tr>
                 </thead>
                 <tbody>
                   {% for a in applications %}
-                  <tr class="bg-black/20 hover:bg-black/30 transition">
-                    <td class="px-3 py-2 text-[11px] text-white/70">{{ a.created_at or '' }}</td>
-                    <td class="px-3 py-2 font-semibold">{{ a.company_name }}</td>
-                    <td class="px-3 py-2 text-[11px] text-white/80">{{ a.domain }}</td>
-                    <td class="px-3 py-2 text-[11px] text-white/80">{{ a.phone }}</td>
-                    <td class="px-3 py-2 text-[11px] text-white/80">{{ a.bank_name }} / {{ a.account_number }}</td>
-                    <td class="px-3 py-2 text-[11px] text-white/70 max-w-[160px] truncate">{{ a.email_or_sheet }}</td>
-                    <td class="px-3 py-2 text-[11px] font-mono text-blue-200">{{ a.login_id }}</td>
-                    <td class="px-3 py-2 text-[11px] text-white/60">••••••</td>
-                    <td class="px-3 py-2 text-center text-[11px]">
-                      {{ a.fee_percent or 10 }}%
+                  <tr class="bg-black/20 hover:bg-black/30">
+                    {% for col in app_columns %}
+                    <td class="px-2 py-1.5 text-[11px] whitespace-nowrap border-r border-white/10">
+                      {% set val = a.get(col) %}
+                      {% if col == 'login_password' and val %}••••••{% elif val is not none and val != '' %}{{ val }}{% else %}-{% endif %}
                     </td>
-                    <td class="px-3 py-2 text-center text-[11px]">
+                    {% endfor %}
+                    <td class="px-2 py-1.5 text-center border-r border-white/10">
                       <form method="post" action="{{ url_for('hq_admin') }}" class="inline-flex items-center gap-1">
                         <input type="hidden" name="action" value="update_application_fee" />
                         <input type="hidden" name="application_id" value="{{ a.id }}" />
-                        <input type="number" name="fee_percent" value="{{ a.fee_percent or 10 }}" min="0" max="100"
-                               class="w-12 bg-black/40 border border-white/20 rounded px-1 py-0.5 text-[11px] text-center">
+                        <input type="number" name="fee_percent" value="{{ a.fee_percent or 10 }}" min="0" max="100" class="w-12 bg-black/40 border border-white/20 rounded px-1 py-0.5 text-[11px] text-center">
                         <span>%</span>
-                        <button type="submit" class="text-[10px] px-2 py-0.5 rounded-full bg-white/10 hover:bg-white/20">
-                          저장
-                        </button>
+                        <button type="submit" class="text-[10px] px-2 py-0.5 rounded-full bg-white/10 hover:bg-white/20">저장</button>
                       </form>
                     </td>
-                    <td class="px-3 py-2 text-center">
-                      <form method="post" action="{{ url_for('hq_admin') }}">
+                    <td class="px-2 py-1.5 text-center border-r border-white/10">
+                      <form method="post" action="{{ url_for('hq_admin') }}" class="inline">
                         <input type="hidden" name="action" value="approve_application" />
                         <input type="hidden" name="application_id" value="{{ a.id }}" />
-                        <button type="submit" class="px-3 py-1 rounded-full bg-brand-accent text-brand-blue text-[11px] font-semibold hover:bg-white transition">
-                          승인 및 생성
-                        </button>
+                        <button type="submit" class="px-3 py-1 rounded-full bg-brand-accent text-brand-blue text-[11px] font-semibold hover:bg-white transition">승인 및 생성</button>
                       </form>
                     </td>
-                    <td class="px-3 py-2 text-center">
-                      <form method="post" action="{{ url_for('hq_admin') }}" onsubmit="return confirm('해당 대행사 신청을 삭제하시겠습니까?');">
+                    <td class="px-2 py-1.5 text-center">
+                      <form method="post" action="{{ url_for('hq_admin') }}" class="inline" onsubmit="return confirm('해당 대행사 신청을 삭제하시겠습니까?');">
                         <input type="hidden" name="action" value="delete_application" />
                         <input type="hidden" name="application_id" value="{{ a.id }}" />
-                        <button type="submit" class="px-3 py-1 rounded-full bg-red-500/30 text-red-100 text-[11px] hover:bg-red-500/50">
-                          삭제
-                        </button>
+                        <button type="submit" class="px-3 py-1 rounded-full bg-red-500/30 text-red-100 text-[11px] hover:bg-red-500/50">삭제</button>
                       </form>
                     </td>
                   </tr>
@@ -4598,7 +4631,93 @@ def hq_admin():
             {% endif %}
           </section>
 
-          <!-- 5. K-VAN 대시보드 요약 (공유용) -->
+          <!-- 5. K-VAN 결제링크 (DB kvan_links 전체 컬럼 실시간) -->
+          <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
+            <div class="flex items-center justify-between mb-3">
+              <h2 class="text-lg font-semibold flex items-center gap-2">
+                <i class="fa-solid fa-link text-brand-accent"></i> K-VAN 결제링크
+              </h2>
+              <a href="{{ url_for('hq_export_excel', scope='kvan_links') }}" class="px-3 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25 text-[11px]">엑셀</a>
+            </div>
+            <div class="box-schema"><code>kvan_links</code> 전체 항목: {% for c in kvan_links_columns %}<code>{{ c }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</div>
+            {% if kvan_links %}
+            <div class="overflow-x-auto max-h-[360px] overflow-y-auto border border-white/20 rounded-xl">
+              <table class="min-w-full text-sm border-collapse">
+                <thead class="text-xs text-white/70 bg-black/40 sticky top-0 z-10">
+                  <tr>
+                    {% for col in kvan_links_columns %}
+                    <th class="px-2 py-1.5 text-left whitespace-nowrap border-b border-r border-white/20">{{ col }}</th>
+                    {% endfor %}
+                    <th class="px-2 py-1.5 text-center whitespace-nowrap border-b border-white/20">삭제</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in kvan_links %}
+                  <tr class="bg-black/20 hover:bg-black/30">
+                    {% for col in kvan_links_columns %}
+                    <td class="px-2 py-1.5 text-[11px] whitespace-nowrap border-r border-white/10">{{ row.get(col) if row.get(col) is not none and row.get(col) != '' else '-' }}</td>
+                    {% endfor %}
+                    <td class="px-2 py-1.5 text-center">
+                      <form method="post" action="{{ url_for('hq_admin') }}" class="inline" onsubmit="return confirm('이 K-VAN 링크를 DB에서 삭제하시겠습니까?');">
+                        <input type="hidden" name="action" value="delete_kvan_link" />
+                        <input type="hidden" name="link_id" value="{{ row.get('id') or '' }}" />
+                        <button type="submit" class="px-2 py-0.5 rounded bg-red-500/40 text-red-100 text-[10px] hover:bg-red-500/60">삭제</button>
+                      </form>
+                    </td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            {% else %}
+              <p class="text-xs text-white/60">K-VAN 결제링크 DB에 기록이 없습니다.</p>
+            {% endif %}
+          </section>
+
+          <!-- 6. K-VAN 거래내역 (DB kvan_transactions 전체 컬럼 실시간) -->
+          <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
+            <div class="flex items-center justify-between mb-3">
+              <h2 class="text-lg font-semibold flex items-center gap-2">
+                <i class="fa-solid fa-receipt text-brand-accent"></i> K-VAN 거래내역
+              </h2>
+              <a href="{{ url_for('hq_export_excel', scope='kvan_tx') }}" class="px-3 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25 text-[11px]">엑셀</a>
+            </div>
+            <div class="box-schema"><code>kvan_transactions</code> 전체 항목: {% for c in kvan_tx_columns %}<code>{{ c }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</div>
+            {% if kvan_transactions %}
+            <div class="overflow-x-auto max-h-[360px] overflow-y-auto border border-white/20 rounded-xl">
+              <table class="min-w-full text-sm border-collapse">
+                <thead class="text-xs text-white/70 bg-black/40 sticky top-0 z-10">
+                  <tr>
+                    {% for col in kvan_tx_columns %}
+                    <th class="px-2 py-1.5 text-left whitespace-nowrap border-b border-r border-white/20">{{ col }}</th>
+                    {% endfor %}
+                    <th class="px-2 py-1.5 text-center whitespace-nowrap border-b border-white/20">삭제</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in kvan_transactions %}
+                  <tr class="bg-black/20 hover:bg-black/30">
+                    {% for col in kvan_tx_columns %}
+                    <td class="px-2 py-1.5 text-[11px] whitespace-nowrap border-r border-white/10">{{ row.get(col) if row.get(col) is not none and row.get(col) != '' else '-' }}</td>
+                    {% endfor %}
+                    <td class="px-2 py-1.5 text-center">
+                      <form method="post" action="{{ url_for('hq_admin') }}" class="inline" onsubmit="return confirm('이 K-VAN 거래 내역을 DB에서 삭제하시겠습니까?');">
+                        <input type="hidden" name="action" value="delete_kvan_tx" />
+                        <input type="hidden" name="kvan_tx_id" value="{{ row.get('id') or '' }}" />
+                        <button type="submit" class="px-2 py-0.5 rounded bg-red-500/40 text-red-100 text-[10px] hover:bg-red-500/60">삭제</button>
+                      </form>
+                    </td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            {% else %}
+              <p class="text-xs text-white/60">K-VAN 거래내역 DB에 기록이 없습니다.</p>
+            {% endif %}
+          </section>
+
+          <!-- 7. K-VAN 대시보드 요약 (공유용) -->
           <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
             <div class="flex items-center justify-between mb-3">
               <h2 class="text-lg font-semibold flex items-center gap-2">
@@ -4702,6 +4821,35 @@ def hq_admin():
               엑셀 다운받기
             </a>
           </section>
+
+          <!-- 로그 박스 (맨 아래) -->
+          <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-4">
+            <div class="flex items-center justify-between mb-2">
+              <h2 class="text-sm font-semibold flex items-center gap-2">
+                <i class="fa-solid fa-terminal text-brand-accent"></i> K-VAN 크롤링 & 자동결제 로그
+              </h2>
+              <div class="flex items-center gap-2 text-[10px]">
+                <span class="text-white/50">최근 {{ admin_logs|length }}줄</span>
+                <form method="post" action="{{ url_for('hq_admin') }}" onsubmit="return confirm('로그 파일을 정말 삭제하시겠습니까?');">
+                  <input type="hidden" name="action" value="clear_logs">
+                  <button type="submit"
+                          class="px-2 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25">
+                    로그 삭제
+                  </button>
+                </form>
+              </div>
+            </div>
+            <p class="text-[10px] text-white/45 mb-2">로그 파일 경로: {{ admin_log_path }}</p>
+            {% if admin_logs %}
+            <div class="bg-black/40 rounded-xl border border-white/10 p-3 max-h-56 overflow-y-auto text-[11px] font-mono text-white/80 whitespace-pre-wrap">
+              {% for line in admin_logs %}
+              <div class="leading-tight">{{ line }}</div>
+              {% endfor %}
+            </div>
+            {% else %}
+            <p class="text-[11px] text-white/60">아직 기록된 K-VAN/매크로 로그가 없습니다.</p>
+            {% endif %}
+          </section>
         </div>
       </main>
       <script>
@@ -4790,6 +4938,12 @@ def hq_admin():
         expired_with_transactions_reversed=expired_with_transactions_reversed,
         expired_with_tx_unseen=expired_with_tx_unseen,
         tx_excel_columns=TX_EXCEL_COLUMNS,
+        app_columns=app_columns,
+        agency_columns=agency_columns,
+        kvan_links=kvan_links,
+        kvan_transactions=kvan_transactions,
+        kvan_links_columns=kvan_links_columns,
+        kvan_tx_columns=kvan_tx_columns,
         latest_dashboard=latest_dashboard,
         paged_agencies=paged_agencies,
         page=page,
@@ -4837,6 +4991,8 @@ def agency_admin():
     _st = lambda s: (str(s.get("status") or "결제중").strip())
     agency_active_sessions = [s for s in sessions if _st(s) == "결제중"]
     agency_completed_sessions = list(history) + [s for s in sessions if _st(s) != "결제중"]
+    # 삭제된(=K-VAN에서 삭제됨) 링크 기록은 완료/종료 목록에서도 숨긴다.
+    agency_completed_sessions = [s for s in agency_completed_sessions if not s.get("deleted_in_kvan")]
 
     # DB 기반 거래 내역 (transactions 테이블에서 이 대행사 건만)
     agency_transactions: list[dict] = []
@@ -5576,6 +5732,107 @@ def hq_export_excel():
     transactions = state.get("transactions") or []
     agencies = state.get("agencies") or []
     name_map = {str(ag.get("id")): ag.get("company_name", "") for ag in agencies}
+
+    # 단일 시트 엑셀 (applications, expired_links, kvan_links, kvan_tx)
+    if section == "applications":
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Applications"
+        applications = state.get("applications") or []
+        if applications:
+            cols = list(applications[0].keys())
+            ws.append(cols)
+            for a in applications:
+                ws.append([a.get(c) for c in cols])
+        buf = BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return send_file(
+            buf,
+            as_attachment=True,
+            download_name="sisa_hq_applications.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    if section == "expired_links":
+        expired = []
+        try:
+            if EXPIRED_WITH_TRANSACTIONS_PATH.exists():
+                raw = EXPIRED_WITH_TRANSACTIONS_PATH.read_text(encoding="utf-8")
+                data = json.loads(raw)
+                expired = data if isinstance(data, list) else []
+        except Exception:
+            pass
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "ExpiredLinks"
+        if expired:
+            cols = list(expired[0].keys())
+            ws.append(cols)
+            for e in expired:
+                ws.append([e.get(c) for c in cols])
+        buf = BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return send_file(
+            buf,
+            as_attachment=True,
+            download_name="sisa_hq_expired_links.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    if section == "kvan_links":
+        rows = []
+        try:
+            conn = get_db()
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM kvan_links ORDER BY captured_at DESC")
+                rows = cur.fetchall()
+            conn.close()
+        except Exception:
+            pass
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "KvanLinks"
+        if rows:
+            cols = list(rows[0].keys())
+            ws.append(cols)
+            for row in rows:
+                ws.append([row.get(c) for c in cols])
+        buf = BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return send_file(
+            buf,
+            as_attachment=True,
+            download_name="sisa_hq_kvan_links.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    if section == "kvan_tx":
+        rows = []
+        try:
+            conn = get_db()
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM kvan_transactions ORDER BY captured_at DESC")
+                rows = cur.fetchall()
+            conn.close()
+        except Exception:
+            pass
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "KvanTransactions"
+        if rows:
+            cols = list(rows[0].keys())
+            ws.append(cols)
+            for row in rows:
+                ws.append([row.get(c) for c in cols])
+        buf = BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return send_file(
+            buf,
+            as_attachment=True,
+            download_name="sisa_hq_kvan_tx.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
     wb = Workbook()
 
