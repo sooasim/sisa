@@ -1016,6 +1016,40 @@ def trigger_kvan_crawler_refresh() -> None:
         _append_hq_log("WEB", f"[ERROR] crawler 시작 실패: {e}")
 
 
+# 어드민 브라우저 새로고침(GET)마다 크롤을 돌리면 Selenium 기동이 과도해지므로 파일 기반 디바운스
+KVAN_PAGE_CRAWL_DEBOUNCE_PATH = DATA_DIR / "crawler_pageview_wakeup.txt"
+
+
+def maybe_trigger_kvan_crawler_on_page_view(source: str) -> None:
+    """
+    /admin, /hq-admin, /agency-admin 등을 GET(새로고침)으로 열 때 K-VAN 크롤러를 깨운다.
+
+    - 결제 링크(/payment-link)·거래(/transactions) 동기화는 kvan_crawler.py 루프에서 수행
+    - 수동 'K-VAN 새로고침' 버튼(refresh_kvan POST)과 달리, 연속 F5 에 대비해 디바운스 적용
+    """
+    try:
+        interval = float(os.environ.get("KVAN_PAGE_REFRESH_CRAWL_SEC", "45"))
+    except ValueError:
+        interval = 45.0
+    interval = max(15.0, min(interval, 600.0))
+    now = time.time()
+    try:
+        KVAN_PAGE_CRAWL_DEBOUNCE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if KVAN_PAGE_CRAWL_DEBOUNCE_PATH.exists():
+            raw = KVAN_PAGE_CRAWL_DEBOUNCE_PATH.read_text(encoding="utf-8").strip()
+            last = float(raw or "0")
+            if now - last < interval:
+                return
+        KVAN_PAGE_CRAWL_DEBOUNCE_PATH.write_text(str(now), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        _append_hq_log("WEB", f"[WARN] crawler pageview debounce 실패({source}): {e}")
+    _append_hq_log(
+        "WEB",
+        f"어드민 페이지 GET → K-VAN 크롤 요청 ({source}, debounce≤{int(interval)}s)",
+    )
+    trigger_kvan_crawler_refresh()
+
+
 def _parse_log_ts(line: str) -> datetime | None:
     """로그 한 줄에서 ISO 타임스탬프를 파싱한다."""
     try:
@@ -3047,6 +3081,8 @@ def agency_register_page():
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
     """본사 공용 K-VAN 세션 어드민 (HQ용). 최대 5개 세션 관리."""
+    if request.method == "GET":
+        maybe_trigger_kvan_crawler_on_page_view("admin")
     base_url = request.url_root.rstrip("/")
 
     # 기존 상태 로드 (sessions 리스트 기반)
@@ -3504,7 +3540,10 @@ def admin():
               .then(function (r) { return r.json(); })
               .then(function (d) {
                 if (d && d.ok && d.done) {
-                  stopRefreshOverlay("크롤러 상태 확인이 완료되었습니다.");
+                  stopRefreshOverlay("DB 최신 반영을 위해 페이지를 불러옵니다...");
+                  setTimeout(function () {
+                    window.location.assign(window.location.pathname + window.location.search);
+                  }, 500);
                   return;
                 }
                 if (Date.now() - startedAt > 90000) {
@@ -4084,6 +4123,9 @@ def hq_admin():
     if not session.get("hq_logged_in"):
         return redirect(url_for("hq_login"))
 
+    if request.method == "GET":
+        maybe_trigger_kvan_crawler_on_page_view("hq-admin")
+
     history_warnings = cleanup_history_files()
 
     state = _load_hq_state()
@@ -4612,7 +4654,10 @@ def hq_admin():
               .then(function (r) { return r.json(); })
               .then(function (d) {
                 if (d && d.ok && d.done) {
-                  stopOverlay("크롤러 상태 확인이 완료되었습니다.");
+                  stopOverlay("DB 최신 반영을 위해 페이지를 불러옵니다...");
+                  setTimeout(function () {
+                    window.location.assign(window.location.pathname + window.location.search);
+                  }, 500);
                   return;
                 }
                 if (Date.now() - startedAt > 90000) {
@@ -5608,6 +5653,9 @@ def agency_admin():
         session.pop("agency_id", None)
         return redirect(url_for("agency_login"))
 
+    if request.method == "GET":
+        maybe_trigger_kvan_crawler_on_page_view("agency-admin")
+
     # 세션/히스토리는 admin_state.json 에서 agency_id 기준으로만 필터 (비어있으면 표시 안 함)
     sessions: list[dict] = []
     history: list[dict] = []
@@ -5635,27 +5683,6 @@ def agency_admin():
     agency_completed_sessions = list(history) + [s for s in sessions if _st(s) != "결제중"]
     # 삭제된(=K-VAN에서 삭제됨) 링크 기록은 완료/종료 목록에서도 숨긴다.
     agency_completed_sessions = [s for s in agency_completed_sessions if not s.get("deleted_in_kvan")]
-
-    # DB 기반 거래 내역 (transactions 테이블에서 이 대행사 건만)
-    agency_transactions: list[dict] = []
-    try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT *
-                FROM transactions
-                WHERE agency_id = %s
-                ORDER BY created_at DESC
-                LIMIT 500
-                """,
-                (agency_id,),
-            )
-            agency_transactions = cur.fetchall()
-        conn.close()
-    except Exception as e:
-        print(f"[WARN] agency_admin transactions 조회 실패: {e}")
-        agency_transactions = []
 
     # 결제중 세션인데 주문 JSON이 없으면 자동 재생성 + 매크로 재트리거
     for s in sessions:
@@ -5825,6 +5852,27 @@ def agency_admin():
             message = "결제 완료 알림을 확인 처리했습니다."
             return redirect(url_for("agency_admin"))
 
+    # POST 처리(삭제·새로고침 신호 등) 이후 DB 기준으로 거래 목록을 다시 읽는다.
+    agency_transactions: list[dict] = []
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM transactions
+                WHERE agency_id = %s
+                ORDER BY created_at DESC
+                LIMIT 500
+                """,
+                (agency_id,),
+            )
+            agency_transactions = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        print(f"[WARN] agency_admin transactions 조회 실패: {e}")
+        agency_transactions = []
+
     # 미확인 결제 알림 건수 (현재 로그인한 대행사만)
     _agency_id = session.get("agency_id")
     payment_notifications_count = len(_load_payment_notifications(agency_id=_agency_id))
@@ -5878,7 +5926,10 @@ def agency_admin():
               .then(function (r) { return r.json(); })
               .then(function (d) {
                 if (d && d.ok && d.done) {
-                  stopRefresh("크롤러 상태 확인이 완료되었습니다.");
+                  stopRefresh("DB 최신 반영을 위해 페이지를 불러옵니다...");
+                  setTimeout(function () {
+                    window.location.assign(window.location.pathname + window.location.search);
+                  }, 500);
                   return;
                 }
                 if (Date.now() - startedAt > 90000) {

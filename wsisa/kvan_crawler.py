@@ -66,13 +66,19 @@ from selenium.common.exceptions import (
 # =========================================================
 
 FILE_DIR = Path(__file__).resolve().parent
+# web_form.py / auto_kvan.py 와 동일하게 리포지토리 루트의 data/ 를 쓴다.
+# (예전: wsisa/data 만 쓰면 로컬에서 crawler_wakeup.flag 가 웹과 달라 크롤이 안 깨어남)
+PROJECT_ROOT = FILE_DIR.parent
 
 _raw_data_dir = os.environ.get("SISA_DATA_DIR", "").strip()
 if _raw_data_dir:
     DATA_DIR = Path(_raw_data_dir)
 else:
     app_data = Path("/app/data")
-    DATA_DIR = app_data if app_data.exists() else (FILE_DIR / "data")
+    if app_data.exists():
+        DATA_DIR = app_data
+    else:
+        DATA_DIR = PROJECT_ROOT / "data"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 

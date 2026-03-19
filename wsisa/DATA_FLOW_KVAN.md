@@ -1,7 +1,7 @@
 # K-VAN 연동 데이터 흐름 (시뮬레이션)
 
-동일 **`SISA_DATA_DIR`**(또는 Docker `/app/data`) + 동일 **MySQL `MYSQL*`** 환경변수가  
-`web_form.py`, `kvan_crawler.py`, `auto_kvan.py` 에 공유되어야 표시/저장이 일치합니다.
+동일 **`SISA_DATA_DIR`**(또는 Docker `/app/data`, 로컬에서는 리포지토리 루트 **`./data`**) + 동일 **MySQL `MYSQL*`** 환경변수가  
+`web_form.py`, `kvan_crawler.py`, `auto_kvan.py` 에 공유되어야 표시/저장·`crawler_wakeup.flag` 가 일치합니다.
 
 ## 1) 본사 `/admin` — 세션·링크 생성 (웹)
 
@@ -47,6 +47,13 @@
 | `expired_with_transactions.json` + **history 병합** | 만료+거래 있음 목록 |
 | `payment_notifications.json` | 미확인 결제 알림 배지 |
 | `hq_logs.log` | 로그 tail |
+
+**페이지 새로고침(F5)과 크롤:** HQ/대행사/레거시 `/admin` 을 **GET**으로 열 때 `maybe_trigger_kvan_crawler_on_page_view()` 가  
+`crawler_wakeup.flag` + 필요 시 `kvan_crawler.py` 기동을 요청한다(기본 **45초**에 한 번, `KVAN_PAGE_REFRESH_CRAWL_SEC` 로 조절).  
+「결제 및 취소 내역」「결제 링크 관리」는 K-VAN **웹 URL**이 아니라 **DB에 반영된 스냅샷**이므로, 크롤 한 사이클이 끝난 뒤 다시 새로고침하면 최신에 가깝게 보인다.
+
+**「새로고침」버튼(수동):** `action=refresh_kvan` POST → `trigger_kvan_crawler_refresh()` → 로그에 사이클 완료가 찍히면  
+`/api/crawler-refresh-status` 폴링이 끝난 뒤 **브라우저가 GET으로 같은 페이지를 다시 로드**해 `transactions` / `kvan_links` 조회 결과를 갱신한다.
 
 ## 5) 대행사 `/agency-admin`
 
