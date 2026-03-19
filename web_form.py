@@ -5410,7 +5410,7 @@ def agency_admin():
                 FROM transactions
                 WHERE agency_id = %s
                 ORDER BY created_at DESC
-                LIMIT 100
+                LIMIT 500
                 """,
                 (agency_id,),
             )
@@ -5730,9 +5730,24 @@ def agency_admin():
           display: none !important;
           pointer-events: none !important;
         }
+        /* 거래 내역: 스크롤 영역 + 드래그로 텍스트 복사 */
+        .agency-tx-scroll {
+          max-height: min(60vh, 560px);
+          overflow: auto;
+          border: 1px solid rgba(255,255,255,0.18);
+          border-radius: 12px;
+        }
+        .agency-tx-selectable, .agency-tx-selectable td, .agency-tx-selectable th {
+          user-select: text !important;
+          -webkit-user-select: text !important;
+        }
+        .agency-tx-excel-scroll {
+          max-height: min(50vh, 440px);
+          overflow: auto;
+        }
       </style>
     </head>
-    <body class="bg-brand-blue text-white font-sans overflow-x-hidden antialiased min-h-screen flex flex-col">
+    <body class="bg-brand-blue text-white font-sans overflow-x-auto antialiased min-h-screen flex flex-col">
       <div id="pending-create-banner" class="pending-top-banner" aria-hidden="true">
         <i class="fa-solid fa-spinner fa-spin"></i>
         <span>K-VAN 링크 생성 중 (1분정도 소요됩니다.)</span>
@@ -5965,49 +5980,71 @@ def agency_admin():
 
           <!-- 거래 내역 (본사 DB 연동) -->
           <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
-            <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-3 gap-2">
-              <h2 class="text-lg font-semibold flex items-center gap-2">
-                <i class="fa-solid fa-list-ul text-brand-accent"></i> 거래 내역 (본사 DB 연동)
-              </h2>
-              <div class="flex flex-wrap items-center gap-2 text-[11px]">
+            <div class="flex flex-col gap-3 mb-3">
+              <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                <h2 class="text-lg font-semibold flex items-center gap-2">
+                  <i class="fa-solid fa-list-ul text-brand-accent"></i> 거래 내역 (본사 DB 연동)
+                </h2>
+                <div class="flex flex-wrap items-center gap-2">
+                  <a href="{{ url_for('agency_export_excel') }}"
+                     class="px-3 py-1.5 rounded-full bg-white text-brand-blue font-semibold text-xs hover:bg-brand-accent transition inline-flex items-center gap-1">
+                    <i class="fa-solid fa-file-excel text-[11px]"></i> 엑셀 다운로드
+                  </a>
+                </div>
+              </div>
+              <div class="flex flex-wrap items-end gap-2 text-[11px]">
                 <div class="flex items-center gap-1">
                   <span class="text-white/70">날짜:</span>
-                  <input id="agencyTxStart" type="date" onchange="filterAgencyTransactions()" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]" />
+                  <input id="agencyTxStart" type="date" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]" />
                   <span class="text-white/50">~</span>
-                  <input id="agencyTxEnd" type="date" onchange="filterAgencyTransactions()" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]" />
+                  <input id="agencyTxEnd" type="date" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]" />
                 </div>
                 <div class="flex items-center gap-1">
-                  <span class="text-white/70">상태:</span>
-                  <select id="agencyTxStatus" onchange="filterAgencyTransactions()" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]">
+                  <span class="text-white/70">결제:</span>
+                  <select id="agencyTxStatus" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]">
                     <option value="all">전체</option>
                     <option value="success">성공</option>
                     <option value="fail">실패</option>
                     <option value="other">기타</option>
                   </select>
                 </div>
+                <div class="flex items-center gap-1">
+                  <span class="text-white/70">정산(본사 DB):</span>
+                  <select id="agencyTxSettlement" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]">
+                    <option value="all">전체</option>
+                    <option value="unsettled">미정산</option>
+                    <option value="settled">정산완료</option>
+                  </select>
+                </div>
+                <button type="button" onclick="filterAgencyTransactions()"
+                        class="px-4 py-1.5 rounded-full bg-sky-500/90 text-white font-semibold text-xs hover:bg-sky-400 border border-sky-300/50">
+                  검색
+                </button>
               </div>
             </div>
-            <div class="box-schema"><code>transactions (agency_id 필터)</code> 항목: <code>created_at, amount, customer_name, status, settlement_status, fee_percent(계산), payable_amount(계산)</code></div>
+            <div class="box-schema"><code>transactions</code> 본사 DB 동기화 · <code>agency_id</code> 일치 건만 표시(최대 500건). 열: 시간, 거래금액, 수수료율·지급예정(계산), 구매자, 결제상태, <strong>정산상태(미정산/정산완료)</strong>, DB 원문. 아래 표는 드래그로 범위 선택 후 복사(Ctrl+C) 가능.</div>
             {% if agency_transactions %}
-            <form method="post" action="{{ url_for('agency_admin') }}">
+            <form method="post" action="{{ url_for('agency_admin') }}" onsubmit="return confirm('선택한 거래를 본사 DB에서 삭제할까요?');">
             <input type="hidden" name="action" value="bulk_delete_agency_tx" />
-            <div class="overflow-x-auto">
-              <table class="min-w-full text-xs border-separate border-spacing-y-2">
+            <div class="agency-tx-scroll overflow-x-auto">
+              <table class="min-w-full text-xs border-separate border-spacing-y-2 agency-tx-selectable">
                 <thead class="text-white/70">
                   <tr>
-                    <th class="px-3 py-1 text-center">
-                      <input type="checkbox" id="agency_tx_check_all" onclick="
+                    <th class="px-3 py-1 text-center sticky left-0 bg-slate-900/95 z-[5]">
+                      <input type="checkbox" id="agency_tx_check_all" title="전체 선택" onclick="
                         var cbs = document.querySelectorAll('.agency-tx-check');
-                        cbs.forEach(function(cb){ cb.checked = this.checked; }.bind(this));
+                        var v = this.checked;
+                        cbs.forEach(function(cb){ cb.checked = v; });
                       ">
                     </th>
                     <th class="px-3 py-1 text-left">시간</th>
-                    <th class="px-3 py-1 text-right">금액</th>
+                    <th class="px-3 py-1 text-right">거래금액</th>
                     <th class="px-3 py-1 text-right">수수료율</th>
-                    <th class="px-3 py-1 text-right">지급예정금액</th>
+                    <th class="px-3 py-1 text-right">지급예정</th>
                     <th class="px-3 py-1 text-left">구매자</th>
                     <th class="px-3 py-1 text-center">결제상태</th>
-                    <th class="px-3 py-1 text-center">정산상태</th>
+                    <th class="px-3 py-1 text-center">정산(본사)</th>
+                    <th class="px-3 py-1 text-center text-white/50">DB정산값</th>
                   </tr>
                 </thead>
                 <tbody id="agencyTxBody">
@@ -6016,17 +6053,20 @@ def agency_admin():
                   {% set amount = t.amount or 0 %}
                   {% set fee_amount = (amount * fee) // 100 %}
                   {% set payable = amount - fee_amount %}
+                  {% set stl = (t.settlement_status or '')|trim %}
+                  {% set settle_key = 'settled' if stl == '정산완료' else 'unsettled' %}
                   <tr class="bg-black/20 hover:bg-black/30 transition align-top"
                       data-date="{{ t.created_at.strftime('%Y-%m-%d') if t.created_at else '' }}"
-                      data-status="{{ t.status or '' }}">
-                    <td class="px-3 py-2 text-center">
+                      data-status="{{ t.status or '' }}"
+                      data-settlement="{{ settle_key }}">
+                    <td class="px-3 py-2 text-center sticky left-0 bg-slate-900/90 z-[1]" onclick="event.stopPropagation();">
                       <input type="checkbox" class="agency-tx-check" name="tx_ids" value="{{ t.id }}">
                     </td>
                     <td class="px-3 py-2 whitespace-nowrap">{{ t.created_at }}</td>
                     <td class="px-3 py-2 text-right">{{ amount }} 원</td>
                     <td class="px-3 py-2 text-right">{{ fee }}%</td>
                     <td class="px-3 py-2 text-right">{{ payable }} 원</td>
-                    <td class="px-3 py-2 whitespace-nowrap">{{ t.customer_name }}</td>
+                    <td class="px-3 py-2 whitespace-nowrap">{{ t.customer_name or '-' }}</td>
                     <td class="px-3 py-2 text-center">
                       {% if t.status == 'success' %}
                         <span class="px-2 py-1 rounded-full bg-emerald-500/20 text-emerald-200 border border-emerald-500/40 text-[10px]">성공</span>
@@ -6037,28 +6077,30 @@ def agency_admin():
                       {% endif %}
                     </td>
                     <td class="px-3 py-2 text-center">
-                      {% if t.settlement_status == '정산완료' %}
+                      {% if stl == '정산완료' %}
                         <span class="px-2 py-1 rounded-full bg-blue-500/20 text-blue-200 border border-blue-500/40 text-[10px]">정산완료</span>
                       {% else %}
                         <span class="px-2 py-1 rounded-full bg-yellow-500/20 text-yellow-200 border border-yellow-500/40 text-[10px]">미정산</span>
                       {% endif %}
                     </td>
+                    <td class="px-3 py-2 text-center text-[10px] text-white/60 font-mono">{{ stl if stl else '미정산' }}</td>
                   </tr>
                   {% endfor %}
                 </tbody>
               </table>
             </div>
-            <div class="mt-3 text-right">
-              <button type="submit" class="px-3 py-1 rounded-full bg-red-500/40 text-red-100 font-semibold hover:bg-red-500/60 transition text-xs">
-                선택 거래 삭제
+            <div class="mt-3 flex flex-wrap items-center justify-between gap-2">
+              <span class="text-[10px] text-white/45">체크한 행만 삭제됩니다.</span>
+              <button type="submit" class="px-3 py-1.5 rounded-full bg-red-500/40 text-red-100 font-semibold hover:bg-red-500/60 transition text-xs border border-red-400/40">
+                <i class="fa-solid fa-trash text-[10px]"></i> 선택 삭제
               </button>
             </div>
             </form>
             <div class="mt-6 pt-4 border-t border-white/10">
               <h3 class="text-sm font-semibold mb-2 text-white/90">거래 내역 (엑셀형 전체 컬럼)</h3>
-              <p class="text-[11px] text-white/50 mb-2">DB transactions 테이블의 모든 컬럼을 리스트로 표시합니다. 가로 스크롤 가능.</p>
-              <div class="overflow-x-auto max-h-[360px] overflow-y-auto border border-white/20 rounded-xl">
-                <table class="min-w-max text-[11px] border-collapse">
+              <p class="text-[11px] text-white/50 mb-2">가로·세로 스크롤 · 드래그로 셀 범위 선택 후 복사 가능.</p>
+              <div class="agency-tx-excel-scroll overflow-x-auto border border-white/20 rounded-xl">
+                <table class="min-w-max text-[11px] border-collapse agency-tx-selectable">
                   <thead class="text-white/80 bg-black/40 sticky top-0 z-10">
                     <tr>
                       {% for col in tx_excel_columns %}
@@ -6109,13 +6151,16 @@ def agency_admin():
           var startInput = document.getElementById("agencyTxStart");
           var endInput = document.getElementById("agencyTxEnd");
           var statusSel = document.getElementById("agencyTxStatus");
+          var settleSel = document.getElementById("agencyTxSettlement");
           var startDate = startInput && startInput.value ? startInput.value : "";
           var endDate = endInput && endInput.value ? endInput.value : "";
           var statusVal = statusSel ? (statusSel.value || "all") : "all";
+          var settleVal = settleSel ? (settleSel.value || "all") : "all";
           var rows = document.querySelectorAll("#agencyTxBody tr");
           rows.forEach(function (row) {
             var date = row.getAttribute("data-date") || "";
             var status = (row.getAttribute("data-status") || "").toLowerCase();
+            var settlement = row.getAttribute("data-settlement") || "";
             var show = true;
             if (startDate && (!date || date < startDate)) show = false;
             if (show && endDate && (!date || date > endDate)) show = false;
@@ -6125,6 +6170,9 @@ def agency_admin():
               } else if (status !== statusVal) {
                 show = false;
               }
+            }
+            if (show && settleVal !== "all") {
+              if (settlement !== settleVal) show = false;
             }
             row.style.display = show ? "" : "none";
           });
@@ -6433,34 +6481,48 @@ def agency_export_excel():
     filtered = [
         t for t in transactions if str(t.get("agency_id")) == str(agency_id)
     ]
+    filtered.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+
+    fee_p = int(agency.get("fee_percent") or 10) if agency else 10
 
     wb = Workbook()
     ws = wb.active
     ws.title = "AgencyTransactions"
     headers = [
         "시간",
-        "금액",
-        "이름",
+        "거래금액",
+        "수수료율(%)",
+        "수수료금액",
+        "지급예정금액",
+        "구매자명",
         "카드구분",
         "생년월일(앞6)",
         "전화번호(뒷자리)",
         "결제상태",
-        "정산상태",
+        "정산상태(본사DB)",
+        "승인번호",
         "메모",
     ]
     ws.append(headers)
 
     for t in filtered:
+        amt = int(t.get("amount") or 0)
+        fee_amt = amt * fee_p // 100
+        payable = amt - fee_amt
         ws.append(
             [
                 t.get("created_at", ""),
-                t.get("amount", 0),
+                amt,
+                fee_p,
+                fee_amt,
+                payable,
                 t.get("customer_name", ""),
                 t.get("card_type", ""),
                 t.get("resident_front", ""),
                 t.get("phone_number", ""),
                 t.get("status", ""),
-                t.get("settlement_status", ""),
+                t.get("settlement_status", "") or "미정산",
+                t.get("kvan_approval_no", ""),
                 t.get("message", ""),
             ]
         )
