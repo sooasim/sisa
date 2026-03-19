@@ -970,25 +970,6 @@ class KVStore:
         conn.close()
         return rows
 
-    def load_agency_mid_map(self) -> dict[str, str]:
-        out: dict[str, str] = {}
-        if self.use_json:
-            for ag in _json_load_rows("agencies"):
-                m = (ag.get("kvan_mid") or "").strip()
-                if m:
-                    out[m] = str(ag.get("id") or "")
-            return out
-
-        conn = get_db()
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, kvan_mid FROM agencies")
-            for ag in cur.fetchall() or []:
-                m = (ag.get("kvan_mid") or "").strip()
-                if m:
-                    out[m] = str(ag.get("id") or "")
-        conn.close()
-        return out
-
     def upsert_popup_transaction(
         self,
         session_id: str,

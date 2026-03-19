@@ -1498,7 +1498,8 @@ def _sync_kvan_to_transactions() -> bool:
     3) 그래도 없으면 신규 transactions 레코드 INSERT
 
     agency_id 매핑:
-    - agencies.kvan_mid 와 kvan_transactions.mid 를 비교해 일치하는 대행사를 찾는다.
+    - admin_state 의 세션(KEY) 기준 _get_agency_id_for_session 만 사용한다.
+    - MID→대행사 폴백은 사용하지 않는다(동일 MID 공유로 구분 불가).
     """
     if LOCAL_TEST:
         print("[LOCAL_TEST] kvan_transactions → transactions 매핑/생성을 건너뜁니다.")
@@ -1509,17 +1510,6 @@ def _sync_kvan_to_transactions() -> bool:
     try:
         conn = get_db()
         with conn.cursor() as cur:
-            # 0) MID -> agency_id 매핑 테이블 생성
-            agency_mid_map: dict[str, str] = {}
-            try:
-                cur.execute("SELECT id, kvan_mid FROM agencies")
-                for ag in cur.fetchall():
-                    m = (ag.get("kvan_mid") or "").strip()
-                    if m:
-                        agency_mid_map[m] = ag["id"]
-            except Exception as e_ag:
-                print(f"[WARN] agencies.kvan_mid 조회 중 오류(계속 진행): {e_ag}")
-
             # 1) 최근 K-VAN 거래 200건만 사용 (raw_text로 세션 KEY 추출 → 대행사 구분)
             cur.execute(
                 """
@@ -1546,13 +1536,11 @@ def _sync_kvan_to_transactions() -> bool:
                 # 등록일에서 날짜 부분만 추출 (예: '2026-03-12 10:20:30' -> '2026-03-12')
                 reg_date = reg.split(" ")[0] if reg else ""
 
-                # 대행사/본사 구분: KEY로 시작하는 세션ID 추출 → admin_state에서 agency_id 조회, 없으면 MID 폴백
+                # 대행사/본사 구분: KEY로 시작하는 세션ID 추출 → admin_state에서 agency_id 조회만 (MID 미사용)
                 agency_id: str | None = None
                 session_match = re.search(r"KEY[0-9A-Za-z]+", raw_text) if raw_text else None
                 if session_match:
                     agency_id = _get_agency_id_for_session(session_match.group(0))
-                if not agency_id and mid and mid in agency_mid_map:
-                    agency_id = agency_mid_map[mid]
 
                 # K-VAN 결제유형 기준으로 내부 status 유추
                 tx_status = "other"
