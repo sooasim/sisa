@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import List
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 from datetime import datetime, timedelta
 import os
 from io import BytesIO
@@ -352,6 +354,107 @@ TX_EXCEL_COLUMNS = [
 ]
 KVAN_CRAWLER_WAKEUP_PATH = DATA_DIR / "crawler_wakeup.flag"
 KVAN_CRAWLER_HEARTBEAT_PATH = DATA_DIR / "kvan_crawler.heartbeat"
+
+
+def _hq_load_admin_state_json() -> dict:
+    """HQ 화면에서 K-VAN 링크 ↔ 대행사 표시용 admin_state.json."""
+    try:
+        p = Path(ADMIN_STATE_PATH)
+        if p.exists():
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {"sessions": [], "history": []}
+
+
+def _hq_link_matches_session(link: str, key_or_sid: str) -> bool:
+    """admin_state의 kvan_link와 세션 키(KEY…) / sessionId 매칭 (auto_kvan과 유사)."""
+    link = (link or "").strip()
+    key = (key_or_sid or "").strip()
+    if not key or not link:
+        return False
+    if key in link:
+        return True
+    uk, ul = unquote(key), unquote(link)
+    if uk in ul or key in ul:
+        return True
+    try:
+        q = parse_qs(urlparse(link).query)
+        for sid in (q.get("sessionId") or []) + (q.get("sessionid") or []):
+            if sid and (key in sid or sid in key):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _hq_kvan_link_owner_display(
+    row: dict,
+    admin_st: dict,
+    agency_by_id: dict,
+) -> str:
+    """결제링크 행의 소유 표시: 대행사 업체명 또는 본사 / 미매칭."""
+    link = (row.get("kvan_link") or "").strip()
+    ks = (row.get("kvan_session_id") or "").strip()
+    key = ks
+    if not key and link:
+        m = re.search(r"(KEY[A-Za-z0-9]+)", link)
+        if m:
+            key = m.group(1)
+    combined = (admin_st.get("sessions") or []) + (admin_st.get("history") or [])
+    for s in combined:
+        s_link = (s.get("kvan_link") or "").strip()
+        if not s_link:
+            continue
+        if key and _hq_link_matches_session(s_link, key):
+            aid = str(s.get("agency_id") or "").strip()
+            if aid and aid in agency_by_id:
+                return str(agency_by_id[aid].get("company_name") or aid)
+            if not aid:
+                return "본사"
+            return aid
+    return "미매칭"
+
+
+def _hq_enrich_kvan_links_for_admin(kvan_links: list, agencies: list) -> list[dict]:
+    admin_st = _hq_load_admin_state_json()
+    agency_by_id = {
+        str(ag.get("id")): ag for ag in agencies if ag.get("id") is not None
+    }
+    out: list[dict] = []
+    for row in kvan_links:
+        r = dict(row)
+        r["_owner_display"] = _hq_kvan_link_owner_display(r, admin_st, agency_by_id)
+        amt = r.get("amount")
+        try:
+            r["_amount_int"] = int(amt) if amt is not None and str(amt).strip() != "" else 0
+        except (TypeError, ValueError):
+            r["_amount_int"] = 0
+        r["_title_short"] = (r.get("title") or r.get("product_name") or "-") or "-"
+        kl = (r.get("kvan_link") or "") or ""
+        r["_link_preview"] = (kl[:72] + "…") if len(kl) > 72 else kl
+        out.append(r)
+    return out
+
+
+def _hq_purge_old_kvan_links(conn, days: int = 3) -> None:
+    """캡처 시각 기준 N일 지난 kvan_links 자동 삭제."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM kvan_links
+                WHERE captured_at IS NOT NULL
+                  AND captured_at < DATE_SUB(NOW(), INTERVAL %s DAY)
+                """,
+                (days,),
+            )
+        conn.commit()
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] kvan_links 자동 삭제(보관 {days}일) 실패: {e}")
 
 
 def _load_payment_notifications(agency_id: str | None = None) -> list[dict]:
@@ -3531,19 +3634,6 @@ def hq_admin():
     message = ""
     crawler_refresh_since = ""
 
-    # 최신 K-VAN 대시보드 스냅샷 1건 조회
-    latest_dashboard = None
-    try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT * FROM kvan_dashboard ORDER BY captured_at DESC LIMIT 1"
-            )
-            latest_dashboard = cur.fetchone()
-        conn.close()
-    except Exception as e:  # noqa: BLE001
-        print(f"[WARN] kvan_dashboard 조회 실패: {e}")
-
     if request.method == "POST":
         action = request.form.get("action", "").strip()
         if action == "approve_application":
@@ -3841,6 +3931,86 @@ def hq_admin():
                     message = "해당 K-VAN 거래 내역을 삭제했습니다."
                 except Exception as e:
                     message = f"K-VAN 거래 삭제 중 오류: {e}"
+        elif action == "bulk_delete_kvan_links":
+            link_ids = request.form.getlist("link_ids")
+            if link_ids:
+                lid_set = {str(x).strip() for x in link_ids if str(x).strip()}
+                if lid_set:
+                    try:
+                        conn = get_db()
+                        with conn.cursor() as cur:
+                            ph = ",".join(["%s"] * len(lid_set))
+                            cur.execute(
+                                f"DELETE FROM kvan_links WHERE id IN ({ph})",
+                                tuple(lid_set),
+                            )
+                        conn.commit()
+                        conn.close()
+                        message = f"K-VAN 결제링크 {len(lid_set)}건을 삭제했습니다."
+                    except Exception as e:  # noqa: BLE001
+                        message = f"K-VAN 링크 일괄 삭제 오류: {e}"
+        elif action == "delete_all_kvan_links":
+            confirm = (request.form.get("confirm_phrase") or "").strip()
+            if confirm == "전체삭제":
+                try:
+                    conn = get_db()
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM kvan_links")
+                    conn.commit()
+                    conn.close()
+                    message = "K-VAN 결제링크 DB를 모두 비웠습니다."
+                except Exception as e:  # noqa: BLE001
+                    message = f"K-VAN 링크 전체 삭제 오류: {e}"
+            else:
+                message = '전체 삭제 확인 문구가 올바르지 않습니다. 입력란에 "전체삭제"를 입력하세요.'
+        elif action == "bulk_delete_applications":
+            app_ids = request.form.getlist("application_ids")
+            if app_ids:
+                aid_set = {str(x).strip() for x in app_ids if str(x).strip()}
+                if aid_set:
+                    try:
+                        conn = get_db()
+                        with conn.cursor() as cur:
+                            ph = ",".join(["%s"] * len(aid_set))
+                            cur.execute(
+                                f"DELETE FROM applications WHERE id IN ({ph})",
+                                tuple(aid_set),
+                            )
+                        conn.commit()
+                        conn.close()
+                        message = f"대행사 신청 {len(aid_set)}건을 삭제했습니다."
+                    except Exception as e:  # noqa: BLE001
+                        message = f"신청 일괄 삭제 오류: {e}"
+        elif action == "bulk_delete_expired_with_tx":
+            sids = request.form.getlist("expired_session_ids")
+            if sids and EXPIRED_WITH_TRANSACTIONS_PATH.exists():
+                sid_set = {str(x).strip() for x in sids if str(x).strip()}
+                if sid_set:
+                    try:
+                        items = json.loads(
+                            EXPIRED_WITH_TRANSACTIONS_PATH.read_text(encoding="utf-8")
+                        )
+                        if isinstance(items, list):
+                            items = [
+                                it
+                                for it in items
+                                if str(it.get("session_id") or "").strip() not in sid_set
+                            ]
+                            EXPIRED_WITH_TRANSACTIONS_PATH.write_text(
+                                json.dumps(items, ensure_ascii=False, indent=2),
+                                encoding="utf-8",
+                            )
+                        message = f"만료+거래 목록에서 {len(sid_set)}건을 삭제했습니다."
+                    except Exception as e:  # noqa: BLE001
+                        message = f"만료 목록 일괄 삭제 오류: {e}"
+        elif action == "clear_all_expired_with_tx":
+            try:
+                EXPIRED_WITH_TRANSACTIONS_PATH.write_text(
+                    json.dumps([], ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                message = "만료+거래 링크 목록을 모두 비웠습니다."
+            except Exception as e:  # noqa: BLE001
+                message = f"만료 목록 전체 비우기 오류: {e}"
 
     # POST 처리 후 화면은 항상 DB 기준 최신 상태를 다시 로드한다.
     state = _load_hq_state()
@@ -3863,26 +4033,24 @@ def hq_admin():
     expired_with_tx_unseen = sum(1 for x in expired_with_transactions if not x.get("seen"))
     expired_with_transactions_reversed = list(reversed(expired_with_transactions))  # 최신순 표시
 
-    # K-VAN 결제링크/거래내역 DB 전체 로드 (실시간 표시)
+    # K-VAN 결제링크 DB (3일 지난 행 자동 삭제 후 로드)
     kvan_links: list = []
-    kvan_transactions: list = []
+    kvan_links_display: list[dict] = []
     try:
         conn = get_db()
+        _hq_purge_old_kvan_links(conn, days=3)
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM kvan_links ORDER BY captured_at DESC")
             kvan_links = cur.fetchall()
-            cur.execute("SELECT * FROM kvan_transactions ORDER BY captured_at DESC")
-            kvan_transactions = cur.fetchall()
         conn.close()
     except Exception as e:
-        print(f"[WARN] hq_admin kvan_links/kvan_transactions 조회 실패: {e}")
+        print(f"[WARN] hq_admin kvan_links 조회 실패: {e}")
+
+    kvan_links_display = _hq_enrich_kvan_links_for_admin(kvan_links, agencies)
 
     # 각 테이블 전체 컬럼 목록 (DB 모든 항목 표시용)
     app_columns = list(applications[0].keys()) if applications else []
     agency_columns = list(agencies[0].keys()) if agencies else []
-    kvan_links_columns = list(kvan_links[0].keys()) if kvan_links else []
-    kvan_tx_columns = list(kvan_transactions[0].keys()) if kvan_transactions else []
-
     # 대행사 관리 페이징 (20개씩)
     try:
         page = int(request.args.get("page", "1"))
@@ -4100,6 +4268,14 @@ def hq_admin():
                 <input type="hidden" name="action" value="mark_expired_with_transactions_seen" />
                 <button type="submit" class="px-2 py-1 rounded bg-amber-600/80 text-white text-xs hover:bg-amber-600">전체 확인</button>
               </form>
+              <form id="formBulkExpired" method="post" action="{{ url_for('hq_admin') }}" class="inline" onsubmit="return confirm('선택한 만료 링크 항목을 삭제할까요?');">
+                <input type="hidden" name="action" value="bulk_delete_expired_with_tx" />
+                <button type="submit" class="px-2 py-1 rounded bg-red-500/50 text-white text-xs hover:bg-red-500/70">선택 삭제</button>
+              </form>
+              <form method="post" action="{{ url_for('hq_admin') }}" class="inline" onsubmit="return confirm('만료+거래 목록을 모두 비울까요?');">
+                <input type="hidden" name="action" value="clear_all_expired_with_tx" />
+                <button type="submit" class="px-2 py-1 rounded bg-red-800/60 text-white text-xs hover:bg-red-800/80">전체 삭제</button>
+              </form>
               <a href="{{ url_for('hq_export_excel', scope='expired_links') }}" class="px-2 py-1 rounded bg-white/10 border border-white/30 text-white text-xs hover:bg-white/25">엑셀</a>
               {% endif %}
             </div>
@@ -4109,6 +4285,9 @@ def hq_admin():
               <table class="min-w-full text-sm border-separate border-spacing-y-1">
                 <thead class="text-xs text-white/70 sticky top-0 bg-brand-blue">
                   <tr>
+                    <th class="px-2 py-1 text-center w-8">
+                      <input type="checkbox" title="전체 선택" onclick="document.querySelectorAll('.exp-chk').forEach(function(c){c.checked=this.checked;}.bind(this));" />
+                    </th>
                     <th class="px-2 py-1 text-left">세션 ID</th>
                     <th class="px-2 py-1 text-left">제목</th>
                     <th class="px-2 py-1 text-left">대행사 ID</th>
@@ -4120,6 +4299,9 @@ def hq_admin():
                 <tbody>
                   {% for e in expired_with_transactions_reversed %}
                   <tr class="bg-black/20 hover:bg-black/30 text-[11px] {{ 'opacity-70' if e.seen else '' }}">
+                    <td class="px-2 py-1 text-center">
+                      <input type="checkbox" class="exp-chk" form="formBulkExpired" name="expired_session_ids" value="{{ e.session_id or '' }}" />
+                    </td>
                     <td class="px-2 py-1 font-mono text-blue-200">{{ e.session_id or '' }}</td>
                     <td class="px-2 py-1 max-w-[200px] truncate" title="{{ e.title or '' }}">{{ e.title or '-' }}</td>
                     <td class="px-2 py-1 text-white/80">{{ e.agency_id or '본사' }}</td>
@@ -4158,10 +4340,19 @@ def hq_admin():
             </div>
             <div class="box-schema"><code>applications</code> 전체 항목: {% for c in app_columns %}<code>{{ c }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</div>
             {% if applications %}
+            <div class="mb-2 flex flex-wrap items-center gap-2 text-[11px]">
+              <form id="formBulkApp" method="post" action="{{ url_for('hq_admin') }}" class="inline-flex items-center gap-2" onsubmit="return confirm('선택한 신청 건을 삭제할까요?');">
+                <input type="hidden" name="action" value="bulk_delete_applications" />
+                <button type="submit" class="px-2 py-1 rounded-full bg-red-500/40 text-red-100 hover:bg-red-500/60">선택 삭제</button>
+              </form>
+            </div>
             <div class="overflow-x-auto max-h-[420px] overflow-y-auto border border-white/20 rounded-xl">
               <table class="min-w-full text-sm border-collapse">
                 <thead class="text-xs text-white/70 bg-black/40 sticky top-0 z-10">
                   <tr>
+                    <th class="px-2 py-1.5 text-center whitespace-nowrap border-b border-r border-white/20 w-8">
+                      <input type="checkbox" title="전체" onclick="document.querySelectorAll('.app-chk').forEach(function(c){c.checked=this.checked;}.bind(this));" />
+                    </th>
                     {% for col in app_columns %}
                     <th class="px-2 py-1.5 text-left whitespace-nowrap border-b border-r border-white/20">{{ col }}</th>
                     {% endfor %}
@@ -4173,6 +4364,9 @@ def hq_admin():
                 <tbody>
                   {% for a in applications %}
                   <tr class="bg-black/20 hover:bg-black/30">
+                    <td class="px-2 py-1.5 text-center border-r border-white/10">
+                      <input type="checkbox" class="app-chk" form="formBulkApp" name="application_ids" value="{{ a.id }}" />
+                    </td>
                     {% for col in app_columns %}
                     <td class="px-2 py-1.5 text-[11px] whitespace-nowrap border-r border-white/10">
                       {% set val = a.get(col) %}
@@ -4232,7 +4426,7 @@ def hq_admin():
                 </h2>
                 <p class="text-[11px] text-white/60 hidden sm:block">시간순으로 성사된 주문 결제 건을 확인하고, 정산 상태를 관리합니다.</p>
               </div>
-              <div class="flex flex-wrap items-center gap-2 text-[11px]">
+              <div class="flex flex-wrap items-center gap-2 text-[10px]">
                 <form method="post" action="{{ url_for('hq_admin') }}">
                   <input type="hidden" name="action" value="refresh_kvan" />
                   <button type="submit"
@@ -4243,7 +4437,7 @@ def hq_admin():
                 </form>
                 <div class="flex items-center gap-1">
                   <span class="text-white/70">업체:</span>
-                  <select id="txAgencyFilter" onchange="filterTransactions()" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]">
+                  <select id="txAgencyFilter" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]">
                     <option value="all">전체</option>
                     {% for ag in agencies %}
                     <option value="{{ ag.id }}">{{ ag.company_name }}</option>
@@ -4252,45 +4446,73 @@ def hq_admin():
                 </div>
                 <div class="flex items-center gap-1">
                   <span class="text-white/70">날짜:</span>
-                  <input id="txStartDate" type="date" value="{{ today_str }}" onchange="filterTransactions()" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]" />
+                  <input id="txStartDate" type="date" value="" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]" title="비우면 시작 제한 없음" />
                   <span class="text-white/50">~</span>
-                  <input id="txEndDate" type="date" value="{{ today_str }}" onchange="filterTransactions()" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]" />
+                  <input id="txEndDate" type="date" value="{{ today_str }}" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]" title="비우면 종료 제한 없음" />
                 </div>
                 <div class="flex items-center gap-1">
-                  <span class="text-white/70">상태:</span>
-                  <select id="txStatusFilter" onchange="filterTransactions()" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]">
+                  <span class="text-white/70">결제:</span>
+                  <select id="txStatusFilter" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]">
                     <option value="all">전체</option>
                     <option value="success">성공</option>
                     <option value="fail">실패</option>
                     <option value="other">기타</option>
                   </select>
                 </div>
+                <div class="flex items-center gap-1">
+                  <span class="text-white/70">정산:</span>
+                  <select id="txSettlementFilter" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]">
+                    <option value="all">전체</option>
+                    <option value="pending">미정산</option>
+                    <option value="done">정산완료</option>
+                  </select>
+                </div>
+                <div class="flex items-center gap-1">
+                  <span class="text-white/70">정렬:</span>
+                  <select id="txSortSettlement" class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px]"
+                          onchange="sortTransactionRows(); updateSelectionSummary();">
+                    <option value="none">시간순</option>
+                    <option value="unsettled_first">미정산 우선</option>
+                    <option value="settled_first">정산완료 우선</option>
+                  </select>
+                </div>
+                <input id="txKeyword" type="search" placeholder="업체·구매자·메모 검색" autocomplete="off"
+                       class="bg-black/30 border border-white/30 rounded px-2 py-1 text-[11px] w-36 sm:w-48" />
+                <button type="button" onclick="applyTxFilters()"
+                        class="px-3 py-1 rounded-full bg-brand-accent text-brand-blue font-semibold hover:bg-white transition text-[11px]">검색</button>
+                <button type="button" onclick="resetTxFilters()"
+                        class="px-2 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25 text-[11px]">초기화</button>
                 <a href="{{ url_for('hq_export_excel', scope='transactions') }}"
-                   class="ml-auto px-3 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25">
+                   class="px-3 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25">
                   엑셀
                 </a>
               </div>
             </div>
             <div class="box-schema"><code>transactions</code> 항목: <code>created_at, agency_id, amount, customer_name, status, settlement_status, message, card_type, resident_front, phone_number</code></div>
             {% if transactions %}
-            <form method="post" action="{{ url_for('hq_admin') }}" class="space-y-3" onsubmit="return confirm('선택한 거래 내역 처리(삭제/정산완료)를 진행할까요?');">
-              <div class="overflow-x-auto">
-                <table class="min-w-full text-xs border-separate border-spacing-y-2">
-                  <thead class="text-white/70">
+            <form id="formTxBulk" method="post" action="{{ url_for('hq_admin') }}" onsubmit="return confirm('선택한 거래 내역 처리(삭제/정산완료)를 진행할까요?');"></form>
+            <div class="space-y-3">
+              <div class="overflow-x-auto max-h-[min(70vh,520px)] overflow-y-auto border border-white/15 rounded-xl">
+                <table class="min-w-full text-[10px] border-collapse">
+                  <thead class="text-white/70 bg-black/50 sticky top-0 z-10">
                     <tr>
-                      <th class="px-3 py-1 text-center"><input type="checkbox" id="tx_check_all" onclick="
-                        var cbs = document.querySelectorAll('.tx-check'); 
-                        cbs.forEach(function(cb){ cb.checked = this.checked; }.bind(this));
-                      "></th>
-                      <th class="px-3 py-1 text-left">시간</th>
-                      <th class="px-3 py-1 text-left">대행사</th>
-                      <th class="px-3 py-1 text-right">금액</th>
-                      <th class="px-3 py-1 text-left">구매자</th>
-                      <th class="px-3 py-1 text-center">결제상태</th>
-                      <th class="px-3 py-1 text-center">정산상태</th>
+                      <th class="px-1.5 py-1 text-center border-b border-white/10 w-7">
+                        <input type="checkbox" id="tx_check_all" onclick="
+                          var cbs = document.querySelectorAll('.tx-check');
+                          cbs.forEach(function(cb){ cb.checked = this.checked; updateSelectionSummary(); }.bind(this));
+                        ">
+                      </th>
+                      <th class="px-1.5 py-1 text-left border-b border-white/10">시간</th>
+                      <th class="px-1.5 py-1 text-left border-b border-white/10">대행사</th>
+                      <th class="px-1.5 py-1 text-right border-b border-white/10">금액</th>
+                      <th class="px-1.5 py-1 text-left border-b border-white/10">구매자</th>
+                      <th class="px-1.5 py-1 text-center border-b border-white/10">결제</th>
+                      <th class="px-1.5 py-1 text-center border-b border-white/10">정산</th>
+                      <th class="px-1.5 py-1 text-left border-b border-white/10 min-w-[200px]">상세</th>
+                      <th class="px-1.5 py-1 text-center border-b border-white/10 w-16">삭제</th>
                     </tr>
                   </thead>
-                  <tbody>
+                  <tbody id="hqTxTableBody">
                     {% set unsettled_total = 0 %}
                     {% for t in transactions|sort(attribute="created_at", reverse=True) %}
                     {% set ag_name = "" %}
@@ -4308,57 +4530,53 @@ def hq_admin():
                       {% set unsettled_total = unsettled_total + (t.amount or 0) %}
                     {% endif %}
                     {% set amount = t.amount or 0 %}
-                    <tr class="bg-black/20 hover:bg-black/30 transition align-top"
+                    {% set settled_flag = '1' if t.settlement_status == '정산완료' else '0' %}
+                    {% set search_blob = ((ag_name ~ ' ' ~ (t.customer_name or '') ~ ' ' ~ (t.message or '') ~ ' ' ~ (t.created_at|string if t.created_at else ''))|lower) %}
+                    <tr class="bg-black/20 hover:bg-black/35 border-b border-white/5 align-top"
                         data-tx-row="1"
+                        data-orig-idx="{{ loop.index0 }}"
                         data-agency-id="{{ t.agency_id or '' }}"
+                        data-agency-name="{{ ag_name }}"
                         data-amount="{{ amount }}"
                         data-fee-percent="{{ ag_fee }}"
                         data-date="{{ t.created_at.strftime('%Y-%m-%d') if t.created_at else '' }}"
-                        data-status="{{ t.status or '' }}">
-                      <td class="px-3 py-2 text-center">
-                        <input type="checkbox" class="tx-check" name="tx_ids" value="{{ t.id }}" onclick="updateSelectionSummary()">
+                        data-status="{{ t.status or '' }}"
+                        data-settled="{{ settled_flag }}"
+                        data-search="{{ search_blob|e }}">
+                      <td class="px-1.5 py-1 text-center align-middle">
+                        <input type="checkbox" class="tx-check" form="formTxBulk" name="tx_ids" value="{{ t.id }}" onclick="updateSelectionSummary()">
                       </td>
-                      <td class="px-3 py-2 whitespace-nowrap">{{ t.created_at }}</td>
-                      <td class="px-3 py-2 whitespace-nowrap">{{ ag_name }}</td>
-                      <td class="px-3 py-2 text-right">{{ amount }} 원</td>
-                      <td class="px-3 py-2 whitespace-nowrap">{{ t.customer_name }}</td>
-                      <td class="px-3 py-2 text-center">
+                      <td class="px-1.5 py-1 whitespace-nowrap align-middle">{{ t.created_at }}</td>
+                      <td class="px-1.5 py-1 whitespace-nowrap align-middle max-w-[100px] truncate" title="{{ ag_name }}">{{ ag_name }}</td>
+                      <td class="px-1.5 py-1 text-right whitespace-nowrap align-middle">{{ amount }}</td>
+                      <td class="px-1.5 py-1 whitespace-nowrap align-middle max-w-[80px] truncate" title="{{ t.customer_name }}">{{ t.customer_name }}</td>
+                      <td class="px-1.5 py-1 text-center align-middle">
                         {% if t.status == 'success' %}
-                          <span class="px-2 py-1 rounded-full bg-emerald-500/20 text-emerald-200 border border-emerald-500/40 text-[10px]">성공</span>
+                          <span class="px-1 py-0.5 rounded bg-emerald-500/20 text-emerald-200 text-[9px]">성공</span>
                         {% elif t.status == 'fail' %}
-                          <span class="px-2 py-1 rounded-full bg-red-500/20 text-red-200 border border-red-500/40 text-[10px]">실패</span>
+                          <span class="px-1 py-0.5 rounded bg-red-500/20 text-red-200 text-[9px]">실패</span>
                         {% else %}
-                          <span class="px-2 py-1 rounded-full bg-gray-500/20 text-gray-200 border border-gray-500/40 text-[10px]">기타</span>
+                          <span class="px-1 py-0.5 rounded bg-gray-500/20 text-gray-200 text-[9px]">기타</span>
                         {% endif %}
                       </td>
-                      <td class="px-3 py-2 text-center">
+                      <td class="px-1.5 py-1 text-center align-middle">
                         {% if t.settlement_status == '정산완료' %}
-                          <span class="px-2 py-1 rounded-full bg-blue-500/20 text-blue-200 border border-blue-500/40 text-[10px]">정산완료</span>
+                          <span class="px-1 py-0.5 rounded bg-blue-500/20 text-blue-200 text-[9px]">완료</span>
                         {% else %}
-                          <span class="px-2 py-1 rounded-full bg-yellow-500/20 text-yellow-200 border border-yellow-500/40 text-[10px]">미정산</span>
+                          <span class="px-1 py-0.5 rounded bg-yellow-500/20 text-yellow-200 text-[9px]">미정산</span>
                         {% endif %}
                       </td>
-                    </tr>
-                    <tr class="bg-black/10" data-tx-detail="1">
-                      <td></td>
-                      <td colspan="6" class="px-3 pb-3 text-[11px] text-white/70">
-                        <div class="flex flex-wrap gap-3">
-                          <span><strong>카드구분:</strong> {{ t.card_type }}</span>
-                          <span><strong>생년월일(앞 6자리):</strong> {{ t.resident_front }}</span>
-                          <span><strong>전화번호(뒷자리):</strong> {{ t.phone_number }}</span>
-                          {% if t.message %}
-                          <span class="block w-full"><strong>메모:</strong> {{ t.message }}</span>
-                          {% endif %}
-                          {% if amount == 0 or t.status != 'success' %}
-                          <form method="post" action="{{ url_for('hq_admin') }}" class="inline-block ml-auto">
-                            <input type="hidden" name="action" value="delete_tx">
-                            <input type="hidden" name="tx_id" value="{{ t.id }}">
-                            <button type="submit" class="px-2 py-1 rounded-full bg-red-500/30 text-red-100 border border-red-400/60 text-[10px] hover:bg-red-500/50">
-                              거래 내역 삭제
-                            </button>
-                          </form>
-                          {% endif %}
-                        </div>
+                      <td class="px-1.5 py-1 text-white/55 leading-tight align-middle">
+                        <span class="line-clamp-2" title="카드 {{ t.card_type }} / 생년 {{ t.resident_front }} / 전화 {{ t.phone_number }}{% if t.message %} / {{ t.message }}{% endif %}">
+                          카드 {{ t.card_type or '-' }} · 생년 {{ t.resident_front or '-' }} · 전화 {{ t.phone_number or '-' }}{% if t.message %} · {{ t.message }}{% endif %}
+                        </span>
+                      </td>
+                      <td class="px-1.5 py-1 text-center align-middle">
+                        <form method="post" action="{{ url_for('hq_admin') }}" class="inline" onsubmit="return confirm('이 거래 행을 DB에서 삭제할까요?');">
+                          <input type="hidden" name="action" value="delete_tx">
+                          <input type="hidden" name="tx_id" value="{{ t.id }}">
+                          <button type="submit" class="px-1.5 py-0.5 rounded bg-red-500/35 text-red-100 text-[9px] hover:bg-red-500/55">삭제</button>
+                        </form>
                       </td>
                     </tr>
                     {% endfor %}
@@ -4378,53 +4596,22 @@ def hq_admin():
                     입금 예정액 <span id="selNetAmount" class="font-semibold text-emerald-200">0 원</span>
                   </div>
                 </div>
-                <div class="flex items-center gap-2">
+                <div class="flex items-center gap-2 flex-wrap">
                   <span>선택 건을</span>
-                  <button type="submit" name="action" value="bulk_delete_tx"
+                  <button type="submit" form="formTxBulk" name="action" value="bulk_delete_tx"
                           class="px-3 py-1 rounded-full bg-red-500/40 text-red-100 font-semibold hover:bg-red-500/60 transition">
                     삭제
                   </button>
-                  <button type="submit" name="action" value="bulk_settle"
+                  <button type="submit" form="formTxBulk" name="action" value="bulk_settle"
                           class="px-3 py-1 rounded-full bg-brand-accent text-brand-blue font-semibold hover:bg-white transition">
                     정산완료 처리
                   </button>
                 </div>
               </div>
-            </form>
+            </div>
             {% else %}
               <p class="text-xs text-white/60">아직 집계된 거래 내역이 없습니다.</p>
             {% endif %}
-            <div class="mt-6 pt-4 border-t border-white/10">
-              <h3 class="text-sm font-semibold mb-2 text-white/90">거래 내역 (엑셀형 전체 컬럼)</h3>
-              <p class="text-[11px] text-white/50 mb-2">DB transactions 테이블의 모든 컬럼을 리스트로 표시합니다. 가로 스크롤 가능.</p>
-              {% if transactions %}
-              <div class="overflow-x-auto max-h-[420px] overflow-y-auto border border-white/20 rounded-xl">
-                <table class="min-w-max text-[11px] border-collapse">
-                  <thead class="text-white/80 bg-black/40 sticky top-0 z-10">
-                    <tr>
-                      {% for col in tx_excel_columns %}
-                      <th class="px-2 py-1.5 text-left whitespace-nowrap border-b border-r border-white/20 font-semibold">{{ col }}</th>
-                      {% endfor %}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {% for t in transactions|sort(attribute="created_at", reverse=True) %}
-                    <tr class="bg-black/20 hover:bg-black/30 border-b border-white/10">
-                      {% for col in tx_excel_columns %}
-                      <td class="px-2 py-1.5 whitespace-nowrap border-r border-white/10 text-white/90">
-                        {% set val = t.get(col) %}
-                        {% if col == 'amount' and val is not none and val != '' %}{{ val }} 원{% elif val is not none and val != '' %}{{ val }}{% else %}-{% endif %}
-                      </td>
-                      {% endfor %}
-                    </tr>
-                    {% endfor %}
-                  </tbody>
-                </table>
-              </div>
-              {% else %}
-              <p class="text-xs text-white/60">표시할 거래가 없습니다.</p>
-              {% endif %}
-            </div>
           </section>
 
           <!-- 3. 대행사별 거래 내역 및 정산 시스템 (요약) -->
@@ -4441,7 +4628,7 @@ def hq_admin():
                 </a>
               </div>
             </div>
-            <div class="box-schema"><code>agencies + transactions(집계)</code> 항목: <code>company_name, domain, login_id, fee_percent, total_amount, unsettled_amount, net_amount, status</code></div>
+            <div class="box-schema"><code>agencies + transactions(집계)</code> 항목: <code>company_name, domain, login_id, fee_percent, 거래건수, 미정산건수, total_amount, unsettled_amount, net_amount, status</code></div>
             {% if agencies %}
             <div class="overflow-x-auto">
               <table class="min-w-full text-sm border-separate border-spacing-y-2">
@@ -4451,6 +4638,8 @@ def hq_admin():
                     <th class="px-3 py-1 text-left">도메인</th>
                     <th class="px-3 py-1 text-left">아이디</th>
                     <th class="px-3 py-1 text-center">수수료%</th>
+                    <th class="px-3 py-1 text-center">거래건수</th>
+                    <th class="px-3 py-1 text-center">미정산건수</th>
                     <th class="px-3 py-1 text-right">총 거래금액</th>
                     <th class="px-3 py-1 text-right">미정산 금액</th>
                     <th class="px-3 py-1 text-right">입금 예정액</th>
@@ -4461,12 +4650,15 @@ def hq_admin():
                   {% for ag in agencies %}
                   {% set total_amount = 0 %}
                   {% set unsettled_amount = 0 %}
+                  {% set ns = namespace(ok=0, unc=0) %}
                   {% for t in transactions %}
                     {% set amt = t.amount or 0 %}
                     {% if t.agency_id == ag.id and t.status == 'success' and amt > 0 %}
                       {% set total_amount = total_amount + amt %}
+                      {% set ns.ok = ns.ok + 1 %}
                       {% if t.settlement_status != '정산완료' %}
                         {% set unsettled_amount = unsettled_amount + amt %}
+                        {% set ns.unc = ns.unc + 1 %}
                       {% endif %}
                     {% endif %}
                   {% endfor %}
@@ -4478,6 +4670,8 @@ def hq_admin():
                     <td class="px-3 py-2 text-center text-[11px] text-white/80">
                       {{ ag.fee_percent or 0 }}%
                     </td>
+                    <td class="px-3 py-2 text-center text-[11px] text-cyan-200">{{ ns.ok }}</td>
+                    <td class="px-3 py-2 text-center text-[11px] text-amber-200">{{ ns.unc }}</td>
                     <td class="px-3 py-2 text-right text-[11px] text-white/80">{{ total_amount }} 원</td>
                     <td class="px-3 py-2 text-right text-[11px] text-yellow-200">{{ unsettled_amount }} 원</td>
                     <td class="px-3 py-2 text-right text-[11px] text-emerald-200">{{ net_amount }} 원</td>
@@ -4512,7 +4706,7 @@ def hq_admin():
                 </a>
               </div>
             </div>
-            <div class="box-schema"><code>agencies + transactions(관리/정산)</code> 항목: <code>company_name, phone, bank_name, account_number, email_or_sheet, fee_percent, status, kvan_mid, kvan_login_id, kvan_login_password, kvan_login_pin</code></div>
+            <div class="box-schema"><code>agencies + transactions(관리/정산)</code> 항목: <code>company_name, phone, bank_name, account_number, email_or_sheet, fee_percent, 거래건수, 미정산건수, status, kvan_mid…</code></div>
             {% if paged_agencies %}
             <div class="overflow-x-auto">
               <table class="min-w-full text-sm border-separate border-spacing-y-2">
@@ -4523,6 +4717,8 @@ def hq_admin():
                     <th class="px-3 py-1 text-left">은행/계좌</th>
                     <th class="px-3 py-1 text-left">이메일/구글시트</th>
                     <th class="px-3 py-1 text-center">수수료%</th>
+                    <th class="px-3 py-1 text-center">거래건수</th>
+                    <th class="px-3 py-1 text-center">미정산건수</th>
                     <th class="px-3 py-1 text-right">총 거래금액</th>
                     <th class="px-3 py-1 text-right">미정산 금액</th>
                     <th class="px-3 py-1 text-right">입금 예정액</th>
@@ -4534,12 +4730,15 @@ def hq_admin():
                   {% for ag in paged_agencies %}
                   {% set total_amount = 0 %}
                   {% set unsettled_amount = 0 %}
+                  {% set ns2 = namespace(ok=0, unc=0) %}
                   {% for t in transactions %}
                     {% set amt = t.amount or 0 %}
                     {% if t.agency_id == ag.id and t.status == 'success' and amt > 0 %}
                       {% set total_amount = total_amount + amt %}
+                      {% set ns2.ok = ns2.ok + 1 %}
                       {% if t.settlement_status != '정산완료' %}
                         {% set unsettled_amount = unsettled_amount + amt %}
+                        {% set ns2.unc = ns2.unc + 1 %}
                       {% endif %}
                     {% endif %}
                   {% endfor %}
@@ -4550,6 +4749,8 @@ def hq_admin():
                     <td class="px-3 py-2 text-[11px] text-white/80 whitespace-nowrap">{{ ag.bank_name }} / {{ ag.account_number }}</td>
                     <td class="px-3 py-2 text-[11px] text-white/80 max-w-[160px] truncate">{{ ag.email_or_sheet }}</td>
                     <td class="px-3 py-2 text-center text-[11px] text-white/80">{{ ag.fee_percent or 0 }}%</td>
+                    <td class="px-3 py-2 text-center text-[11px] text-cyan-200">{{ ns2.ok }}</td>
+                    <td class="px-3 py-2 text-center text-[11px] text-amber-200">{{ ns2.unc }}</td>
                     <td class="px-3 py-2 text-right text-[11px] text-white/80">{{ total_amount }} 원</td>
                     <td class="px-3 py-2 text-right text-[11px] text-yellow-200">{{ unsettled_amount }} 원</td>
                     <td class="px-3 py-2 text-right text-[11px] text-emerald-200">{{ net_amount }} 원</td>
@@ -4631,32 +4832,59 @@ def hq_admin():
             {% endif %}
           </section>
 
-          <!-- 5. K-VAN 결제링크 (DB kvan_links 전체 컬럼 실시간) -->
+          <!-- 5. K-VAN 결제링크 (소유·금액·제목 중심, 3일 경과 행은 서버에서 자동 삭제) -->
           <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
-            <div class="flex items-center justify-between mb-3">
+            <div class="flex flex-col sm:flex-row sm:items-center justify-between mb-3 gap-2">
               <h2 class="text-lg font-semibold flex items-center gap-2">
                 <i class="fa-solid fa-link text-brand-accent"></i> K-VAN 결제링크
               </h2>
-              <a href="{{ url_for('hq_export_excel', scope='kvan_links') }}" class="px-3 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25 text-[11px]">엑셀</a>
+              <div class="flex flex-wrap items-center gap-2 text-[11px]">
+                <form id="formBulkKvanLinks" method="post" action="{{ url_for('hq_admin') }}" class="inline-flex items-center gap-1" onsubmit="return confirm('선택한 결제링크를 DB에서 삭제할까요?');">
+                  <input type="hidden" name="action" value="bulk_delete_kvan_links" />
+                  <button type="submit" class="px-2 py-1 rounded-full bg-red-500/40 text-red-100 hover:bg-red-500/60">선택 삭제</button>
+                </form>
+                <form method="post" action="{{ url_for('hq_admin') }}" class="inline-flex items-center gap-1 flex-wrap" onsubmit="return confirm('kvan_links 테이블의 모든 행을 삭제합니다. 계속할까요?');">
+                  <input type="hidden" name="action" value="delete_all_kvan_links" />
+                  <input type="text" name="confirm_phrase" placeholder="전체삭제" class="bg-black/40 border border-white/25 rounded px-2 py-1 text-[10px] w-24" autocomplete="off" />
+                  <button type="submit" class="px-2 py-1 rounded-full bg-red-800/50 text-white hover:bg-red-800/70">전체 삭제</button>
+                </form>
+                <a href="{{ url_for('hq_export_excel', scope='kvan_links') }}" class="px-3 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25">엑셀</a>
+              </div>
             </div>
-            <div class="box-schema"><code>kvan_links</code> 전체 항목: {% for c in kvan_links_columns %}<code>{{ c }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</div>
-            {% if kvan_links %}
-            <div class="overflow-x-auto max-h-[360px] overflow-y-auto border border-white/20 rounded-xl">
-              <table class="min-w-full text-sm border-collapse">
-                <thead class="text-xs text-white/70 bg-black/40 sticky top-0 z-10">
+            <div class="box-schema"><code>kvan_links</code> 표시: <code>소유(업체/본사), 금액, title, status, captured_at, kvan_link</code> · 캡처 3일 초과 분은 페이지 로드 시 자동 삭제</div>
+            {% if kvan_links_display %}
+            <div class="overflow-x-auto max-h-[min(60vh,400px)] overflow-y-auto border border-white/20 rounded-xl">
+              <table class="min-w-full text-[11px] border-collapse">
+                <thead class="text-white/70 bg-black/40 sticky top-0 z-10">
                   <tr>
-                    {% for col in kvan_links_columns %}
-                    <th class="px-2 py-1.5 text-left whitespace-nowrap border-b border-r border-white/20">{{ col }}</th>
-                    {% endfor %}
-                    <th class="px-2 py-1.5 text-center whitespace-nowrap border-b border-white/20">삭제</th>
+                    <th class="px-2 py-1.5 text-center border-b border-white/15 w-8">
+                      <input type="checkbox" title="전체" onclick="document.querySelectorAll('.kvan-lnk-chk').forEach(function(c){c.checked=this.checked;}.bind(this));" />
+                    </th>
+                    <th class="px-2 py-1.5 text-left border-b border-white/15">소유</th>
+                    <th class="px-2 py-1.5 text-right border-b border-white/15">금액</th>
+                    <th class="px-2 py-1.5 text-left border-b border-white/15">제목</th>
+                    <th class="px-2 py-1.5 text-left border-b border-white/15">상태</th>
+                    <th class="px-2 py-1.5 text-left border-b border-white/15">캡처</th>
+                    <th class="px-2 py-1.5 text-left border-b border-white/15">링크</th>
+                    <th class="px-2 py-1.5 text-center border-b border-white/15">삭제</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {% for row in kvan_links %}
-                  <tr class="bg-black/20 hover:bg-black/30">
-                    {% for col in kvan_links_columns %}
-                    <td class="px-2 py-1.5 text-[11px] whitespace-nowrap border-r border-white/10">{{ row.get(col) if row.get(col) is not none and row.get(col) != '' else '-' }}</td>
-                    {% endfor %}
+                  {% for row in kvan_links_display %}
+                  <tr class="bg-black/20 hover:bg-black/30 border-b border-white/5">
+                    <td class="px-2 py-1.5 text-center">
+                      <input type="checkbox" class="kvan-lnk-chk" form="formBulkKvanLinks" name="link_ids" value="{{ row.get('id') or '' }}" />
+                    </td>
+                    <td class="px-2 py-1.5 text-emerald-200/90 font-medium whitespace-nowrap max-w-[120px] truncate" title="{{ row._owner_display }}">{{ row._owner_display }}</td>
+                    <td class="px-2 py-1.5 text-right text-amber-200 whitespace-nowrap">{{ row._amount_int }} 원</td>
+                    <td class="px-2 py-1.5 max-w-[200px] truncate text-white/90" title="{{ row._title_short }}"><span class="text-white/50">[{{ row._owner_display }}]</span> {{ row._title_short }}</td>
+                    <td class="px-2 py-1.5 text-white/70">{{ row.get('status') or '-' }}</td>
+                    <td class="px-2 py-1.5 text-white/55 whitespace-nowrap">{{ row.get('captured_at') or '-' }}</td>
+                    <td class="px-2 py-1.5 font-mono text-[9px] text-blue-200/90 max-w-[220px] truncate">
+                      {% if row.get('kvan_link') %}
+                      <a href="{{ row.kvan_link }}" target="_blank" rel="noopener" class="underline hover:text-white">{{ row._link_preview }}</a>
+                      {% else %}-{% endif %}
+                    </td>
                     <td class="px-2 py-1.5 text-center">
                       <form method="post" action="{{ url_for('hq_admin') }}" class="inline" onsubmit="return confirm('이 K-VAN 링크를 DB에서 삭제하시겠습니까?');">
                         <input type="hidden" name="action" value="delete_kvan_link" />
@@ -4671,143 +4899,6 @@ def hq_admin():
             </div>
             {% else %}
               <p class="text-xs text-white/60">K-VAN 결제링크 DB에 기록이 없습니다.</p>
-            {% endif %}
-          </section>
-
-          <!-- 6. K-VAN 거래내역 (DB kvan_transactions 전체 컬럼 실시간) -->
-          <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
-            <div class="flex items-center justify-between mb-3">
-              <h2 class="text-lg font-semibold flex items-center gap-2">
-                <i class="fa-solid fa-receipt text-brand-accent"></i> K-VAN 거래내역
-              </h2>
-              <a href="{{ url_for('hq_export_excel', scope='kvan_tx') }}" class="px-3 py-1 rounded-full bg-white/10 border border-white/30 text-white hover:bg-white/25 text-[11px]">엑셀</a>
-            </div>
-            <div class="box-schema"><code>kvan_transactions</code> 전체 항목: {% for c in kvan_tx_columns %}<code>{{ c }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</div>
-            {% if kvan_transactions %}
-            <div class="overflow-x-auto max-h-[360px] overflow-y-auto border border-white/20 rounded-xl">
-              <table class="min-w-full text-sm border-collapse">
-                <thead class="text-xs text-white/70 bg-black/40 sticky top-0 z-10">
-                  <tr>
-                    {% for col in kvan_tx_columns %}
-                    <th class="px-2 py-1.5 text-left whitespace-nowrap border-b border-r border-white/20">{{ col }}</th>
-                    {% endfor %}
-                    <th class="px-2 py-1.5 text-center whitespace-nowrap border-b border-white/20">삭제</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {% for row in kvan_transactions %}
-                  <tr class="bg-black/20 hover:bg-black/30">
-                    {% for col in kvan_tx_columns %}
-                    <td class="px-2 py-1.5 text-[11px] whitespace-nowrap border-r border-white/10">{{ row.get(col) if row.get(col) is not none and row.get(col) != '' else '-' }}</td>
-                    {% endfor %}
-                    <td class="px-2 py-1.5 text-center">
-                      <form method="post" action="{{ url_for('hq_admin') }}" class="inline" onsubmit="return confirm('이 K-VAN 거래 내역을 DB에서 삭제하시겠습니까?');">
-                        <input type="hidden" name="action" value="delete_kvan_tx" />
-                        <input type="hidden" name="kvan_tx_id" value="{{ row.get('id') or '' }}" />
-                        <button type="submit" class="px-2 py-0.5 rounded bg-red-500/40 text-red-100 text-[10px] hover:bg-red-500/60">삭제</button>
-                      </form>
-                    </td>
-                  </tr>
-                  {% endfor %}
-                </tbody>
-              </table>
-            </div>
-            {% else %}
-              <p class="text-xs text-white/60">K-VAN 거래내역 DB에 기록이 없습니다.</p>
-            {% endif %}
-          </section>
-
-          <!-- 7. K-VAN 대시보드 요약 (공유용) -->
-          <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
-            <div class="flex items-center justify-between mb-3">
-              <h2 class="text-lg font-semibold flex items-center gap-2">
-                <i class="fa-solid fa-chart-line text-brand-accent"></i> K-VAN 대시보드 요약
-              </h2>
-              <p class="text-[11px] text-white/60">자동 결제 매크로가 수집한 OneQue 대시보드 요약 정보를 공유합니다.</p>
-            </div>
-            <div class="box-schema"><code>kvan_dashboard</code> 항목: <code>captured_at, monthly_sales_amount, monthly_approved_count, monthly_approved_amount, monthly_canceled_count, monthly_canceled_amount, yesterday_sales_amount, settlement_expected_amount, today_settlement_expected_amount, credit_amount</code></div>
-            {% if latest_dashboard %}
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
-              <div class="bg-black/30 rounded-xl border border-white/10 p-4 space-y-2">
-                <div class="text-[11px] text-white/70 mb-1">
-                  <span class="font-semibold">월 매출</span>
-                  <span class="ml-2 text-white/50">({{ latest_dashboard.captured_at }})</span>
-                </div>
-                <p class="text-lg font-bold text-brand-accent">
-                  {{ latest_dashboard.monthly_sales_amount or 0 }} 원
-                </p>
-                <div class="mt-2 space-y-1">
-                  <p class="text-white/70">
-                    승인:
-                    <span class="font-semibold text-emerald-300">
-                      {{ latest_dashboard.monthly_approved_count or 0 }}건 /
-                      {{ latest_dashboard.monthly_approved_amount or 0 }} 원
-                    </span>
-                  </p>
-                  <p class="text-white/70">
-                    취소:
-                    <span class="font-semibold text-red-300">
-                      {{ latest_dashboard.monthly_canceled_count or 0 }}건 /
-                      {{ latest_dashboard.monthly_canceled_amount or 0 }} 원
-                    </span>
-                  </p>
-                </div>
-              </div>
-              <div class="bg-black/30 rounded-xl border border-white/10 p-4 space-y-2">
-                <div class="text-[11px] text-white/70 mb-1">
-                  <span class="font-semibold">전일 매출</span>
-                </div>
-                <p class="text-lg font-bold text-blue-300">
-                  {{ latest_dashboard.yesterday_sales_amount or 0 }} 원
-                </p>
-                <div class="mt-2 space-y-1">
-                  <p class="text-white/70">
-                    승인:
-                    <span class="font-semibold text-emerald-300">
-                      {{ latest_dashboard.yesterday_approved_count or 0 }}건 /
-                      {{ latest_dashboard.yesterday_approved_amount or 0 }} 원
-                    </span>
-                  </p>
-                  <p class="text-white/70">
-                    취소:
-                    <span class="font-semibold text-red-300">
-                      {{ latest_dashboard.yesterday_canceled_count or 0 }}건 /
-                      {{ latest_dashboard.yesterday_canceled_amount or 0 }} 원
-                    </span>
-                  </p>
-                </div>
-              </div>
-              <div class="bg-black/30 rounded-xl border border-white/10 p-4 space-y-2">
-                <div class="text-[11px] text-white/70 mb-1">
-                  <span class="font-semibold">정산 예정 및 크레딧</span>
-                </div>
-                <p class="text-[11px] text-white/70">
-                  정산 예정 금액:
-                  <span class="font-semibold text-brand-accent">
-                    {{ latest_dashboard.settlement_expected_amount or 0 }} 원
-                  </span>
-                </p>
-                <p class="text-[11px] text-white/70">
-                  금일 정산 예정금:
-                  <span class="font-semibold text-emerald-300">
-                    {{ latest_dashboard.today_settlement_expected_amount or 0 }} 원
-                  </span>
-                </p>
-                <p class="text-[11px] text-white/70">
-                  나의 크레딧:
-                  <span class="font-semibold text-blue-300">
-                    {{ latest_dashboard.credit_amount or 0 }} 원
-                  </span>
-                </p>
-                <div class="mt-2 p-2 bg-black/40 rounded-lg border border-white/10 max-h-24 overflow-y-auto">
-                  <p class="text-[10px] text-white/60 whitespace-pre-line">
-                    {{ latest_dashboard.recent_tx_summary or "최근 거래 내역 정보가 없습니다." }}
-                  </p>
-                </div>
-              </div>
-            </div>
-            {% else %}
-              <p class="text-xs text-white/60">아직 수집된 K-VAN 대시보드 데이터가 없습니다. 매크로가 한 번 이상 실행되면 자동으로 표시됩니다.</p>
             {% endif %}
           </section>
 
@@ -4853,21 +4944,51 @@ def hq_admin():
         </div>
       </main>
       <script>
-        function filterTransactions() {
+        function sortTransactionRows() {
+          var tbody = document.getElementById('hqTxTableBody');
+          if (!tbody) return;
+          var modeEl = document.getElementById('txSortSettlement');
+          var mode = modeEl ? (modeEl.value || 'none') : 'none';
+          var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr[data-tx-row="1"]'));
+          rows.sort(function(a, b) {
+            var oa = parseInt(a.getAttribute('data-orig-idx') || '0', 10);
+            var ob = parseInt(b.getAttribute('data-orig-idx') || '0', 10);
+            if (mode === 'unsettled_first') {
+              var as = a.getAttribute('data-settled') === '1' ? 1 : 0;
+              var bs = b.getAttribute('data-settled') === '1' ? 1 : 0;
+              if (as !== bs) return as - bs;
+            } else if (mode === 'settled_first') {
+              var as2 = a.getAttribute('data-settled') === '1' ? 0 : 1;
+              var bs2 = b.getAttribute('data-settled') === '1' ? 0 : 1;
+              if (as2 !== bs2) return as2 - bs2;
+            }
+            return oa - ob;
+          });
+          rows.forEach(function(r) { tbody.appendChild(r); });
+        }
+
+        function applyTxFilters() {
           var selAgency = document.getElementById('txAgencyFilter');
           var selStatus = document.getElementById('txStatusFilter');
+          var selSettle = document.getElementById('txSettlementFilter');
           var startInput = document.getElementById('txStartDate');
           var endInput = document.getElementById('txEndDate');
+          var kwEl = document.getElementById('txKeyword');
           var agencyVal = selAgency ? (selAgency.value || 'all') : 'all';
           var statusVal = selStatus ? (selStatus.value || 'all') : 'all';
+          var settleVal = selSettle ? (selSettle.value || 'all') : 'all';
           var startDate = startInput && startInput.value ? startInput.value : '';
           var endDate = endInput && endInput.value ? endInput.value : '';
+          var keyword = kwEl ? (kwEl.value || '').toLowerCase().trim() : '';
 
           var rows = document.querySelectorAll('tr[data-tx-row="1"]');
           rows.forEach(function(row) {
             var ag = row.getAttribute('data-agency-id') || '';
+            var agName = (row.getAttribute('data-agency-name') || '').toLowerCase();
             var date = row.getAttribute('data-date') || '';
             var status = (row.getAttribute('data-status') || '').toLowerCase();
+            var settled = row.getAttribute('data-settled') || '0';
+            var blob = (row.getAttribute('data-search') || '').toLowerCase();
 
             var show = true;
             if (agencyVal !== 'all' && ag !== agencyVal) {
@@ -4886,14 +5007,36 @@ def hq_admin():
                 show = false;
               }
             }
+            if (show && settleVal === 'pending' && settled === '1') {
+              show = false;
+            }
+            if (show && settleVal === 'done' && settled !== '1') {
+              show = false;
+            }
+            if (show && keyword) {
+              if (blob.indexOf(keyword) === -1 && agName.indexOf(keyword) === -1) {
+                show = false;
+              }
+            }
 
             row.style.display = show ? '' : 'none';
-            var detail = row.nextElementSibling;
-            if (detail && detail.getAttribute('data-tx-detail') === '1') {
-              detail.style.display = show ? '' : 'none';
-            }
           });
+          sortTransactionRows();
           updateSelectionSummary();
+        }
+
+        function resetTxFilters() {
+          var elStart = document.getElementById('txStartDate');
+          var elEnd = document.getElementById('txEndDate');
+          if (elStart) elStart.value = '';
+          if (elEnd) elEnd.value = '{{ today_str }}';
+          ['txAgencyFilter', 'txStatusFilter', 'txSettlementFilter', 'txSortSettlement'].forEach(function(id) {
+            var el = document.getElementById(id);
+            if (el && el.tagName === 'SELECT') el.selectedIndex = 0;
+          });
+          var kw = document.getElementById('txKeyword');
+          if (kw) kw.value = '';
+          applyTxFilters();
         }
 
         function updateSelectionSummary() {
@@ -4905,11 +5048,15 @@ def hq_admin():
             if (cb.checked) {
               var row = cb.closest('tr');
               if (!row || row.style.display === 'none') return;
-              var amount = parseInt(row.getAttribute('data-amount') || '0', 10);
-              var fee = parseInt(row.getAttribute('data-fee-percent') || '0', 10);
+              var amount = parseInt(row.getAttribute('data-amount') || '0', 10) || 0;
+              var fee = parseInt(row.getAttribute('data-fee-percent') || '0', 10) || 0;
+              var settled = row.getAttribute('data-settled') === '1';
+              var status = (row.getAttribute('data-status') || '').toLowerCase();
               total += amount;
-              unsettled += amount;
-              net += Math.floor(amount * (100 - fee) / 100);
+              if (status === 'success' && !settled) {
+                unsettled += amount;
+                net += Math.floor(amount * (100 - fee) / 100);
+              }
             }
           });
           var elTotal = document.getElementById('selTotalAmount');
@@ -4919,6 +5066,19 @@ def hq_admin():
           if (elUn) elUn.textContent = unsettled.toLocaleString('ko-KR') + ' 원';
           if (elNet) elNet.textContent = net.toLocaleString('ko-KR') + ' 원';
         }
+
+        document.addEventListener('DOMContentLoaded', function() {
+          var kw = document.getElementById('txKeyword');
+          if (kw) {
+            kw.addEventListener('keydown', function(ev) {
+              if (ev.key === 'Enter') {
+                ev.preventDefault();
+                applyTxFilters();
+              }
+            });
+          }
+          applyTxFilters();
+        });
       </script>
     </body>
     </html>
@@ -4937,14 +5097,9 @@ def hq_admin():
         expired_with_transactions=expired_with_transactions,
         expired_with_transactions_reversed=expired_with_transactions_reversed,
         expired_with_tx_unseen=expired_with_tx_unseen,
-        tx_excel_columns=TX_EXCEL_COLUMNS,
         app_columns=app_columns,
         agency_columns=agency_columns,
-        kvan_links=kvan_links,
-        kvan_transactions=kvan_transactions,
-        kvan_links_columns=kvan_links_columns,
-        kvan_tx_columns=kvan_tx_columns,
-        latest_dashboard=latest_dashboard,
+        kvan_links_display=kvan_links_display,
         paged_agencies=paged_agencies,
         page=page,
         total_pages=total_pages,

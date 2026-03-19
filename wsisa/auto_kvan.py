@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import random
 import re
 from urllib.parse import urlparse, parse_qs, unquote
@@ -54,7 +54,15 @@ def _append_admin_log(source: str, message: str) -> None:
 
 # 서버(Railway 등)에서 실행 시 헤드리스 + 자동 종료
 def _is_server_env() -> bool:
-    return bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RUN_HEADLESS"))
+    s = str(os.environ.get("SISA_SERVER", "")).strip().lower()
+    k = str(os.environ.get("K_VAN_SERVER", "")).strip().lower()
+    truthy = ("1", "true", "yes", "y", "on")
+    return bool(
+        os.environ.get("RAILWAY_ENVIRONMENT")
+        or os.environ.get("RUN_HEADLESS")
+        or s in truthy
+        or k in truthy
+    )
 
 
 def _step_start(label: str) -> float:
@@ -364,13 +372,49 @@ AUCTION_ITEMS: list[dict] = []
 AUCTION_LOADED = False
 
 
+def _parse_session_datetime_auto(ts) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        s = str(ts).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+
+def _session_considered_terminal_auto(s: dict) -> bool:
+    if not isinstance(s, dict):
+        return True
+    if s.get("deleted") or s.get("has_approval"):
+        return True
+    st = str(s.get("status") or "").strip()
+    if not st:
+        return False
+    low = st.lower()
+    for token in (
+        "완료",
+        "만료",
+        "취소",
+        "실패",
+        "종료",
+        "삭제",
+        "expired",
+        "취소완료",
+        "결제완료",
+    ):
+        if token in st or token in low:
+            return True
+    return False
+
+
 def _has_active_sessions(window_minutes: int = 10) -> bool:
     """
-    admin_state.json 기준으로 '결제중' 세션이 있거나,
-    최근 window_minutes 분 이내에 생성된 세션이 있으면 True.
+    admin_state.json 기준으로 '지금은 자주 돌아야 하는가'.
 
-    - 링크 생성 매크로(auto_kvan)가 새 세션을 만들면 크롤러가 4~7초 주기로 동작하도록
-      크롤러에서 이 함수를 사용한다.
+    (kvan_crawler.py 와 동일 규칙 — status 미설정을 '결제중'으로 보지 않음)
     """
     try:
         st = _load_admin_state()
@@ -381,34 +425,30 @@ def _has_active_sessions(window_minutes: int = 10) -> bool:
 
         cutoff = datetime.utcnow() - timedelta(minutes=window_minutes)
 
-        # 1) 진행 중 세션
         for s in sessions:
-            status = str(s.get("status") or "결제중")
-            if status == "결제중":
+            if _session_considered_terminal_auto(s):
+                continue
+            if str(s.get("status") or "").strip() == "결제중":
                 return True
 
-        # 2) 최근에 생성된 세션 (예: 매크로가 방금 만든 세션)
         for s in sessions:
-            ts = s.get("created_at")
-            if not ts:
+            if _session_considered_terminal_auto(s):
                 continue
-            try:
-                dt = datetime.fromisoformat(ts)
-            except Exception:
+            dt = _parse_session_datetime_auto(s.get("created_at"))
+            if dt is None:
                 continue
             if dt >= cutoff:
                 return True
 
-        # history 도 참고하고 싶으면 여기서 추가 검사 가능
         for h in history:
-            ts = h.get("created_at")
-            if not ts:
+            if _session_considered_terminal_auto(h):
                 continue
-            try:
-                dt = datetime.fromisoformat(ts)
-            except Exception:
+            if str(h.get("status") or "").strip() != "결제중":
                 continue
-            if dt >= cutoff and h.get("status") == "결제중":
+            dt = _parse_session_datetime_auto(h.get("created_at"))
+            if dt is None:
+                continue
+            if dt >= cutoff:
                 return True
 
         return False
@@ -1607,7 +1647,8 @@ def _sync_kvan_to_transactions() -> bool:
             )
     except Exception as e:
         print(f"[WARN] K-VAN ↔ 내부 transactions 매핑/생성 중 오류: {e}")
-    return bool(updated or inserted)
+    # 크롤러와 동일: 신규 INSERT 만 '작업 발생'으로 본다(매 사이클 UPDATE 로 빠른 폴링 고착 방지)
+    return bool(inserted)
 
 
 def _ensure_kvan_links_table() -> None:

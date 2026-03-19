@@ -7,6 +7,16 @@ K-VAN 통합 실행 파일
 - create 모드: 결제 링크 생성
 - crawl 모드: 로그인 → /payment-link → 만료+거래없음 즉시 삭제 → 링크/거래 동기화
 
+스케줄(로컬/서버 동일, 환경변수로 조절):
+    K_VAN_IDLE_SLEEP_SEC         장시간 대기(기본 180)
+    K_VAN_ACTIVE_SLEEP_SEC       활성/신규 거래 시(기본 2)
+    K_VAN_MEDIUM_SLEEP_SEC       중간(기본 30)
+    K_VAN_STARTUP_FAST_CYCLES    초반 빠른 사이클 횟수(기본 3)
+    K_VAN_STARTUP_SLEEP_SEC      초반 대기(기본 2)
+    K_VAN_ACTIVE_SESSION_WINDOW_MINUTES  '최근 세션' 판정 창(기본 3, 예전 10분은 과도)
+    K_VAN_POPUP_SESSION_WINDOW_MINUTES   팝업 허용용(기본 30)
+배포 환경 감지: RAILWAY_ENVIRONMENT, RUN_HEADLESS, SISA_SERVER=1, K_VAN_SERVER=1
+
 실행:
     python kvan_crawler.py
     python kvan_crawler.py --mode crawl
@@ -22,7 +32,7 @@ import time
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs, unquote
 from typing import Optional, List, Dict, Any
 
@@ -80,7 +90,16 @@ DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("MYSQL_URL") or 
 
 
 def _is_server_env() -> bool:
-    return bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RUN_HEADLESS"))
+    """Railway·Docker·헤드리스 등 배포 환경 감지 (미설정 시 로컬로 간주)."""
+    s = str(os.environ.get("SISA_SERVER", "")).strip().lower()
+    k = str(os.environ.get("K_VAN_SERVER", "")).strip().lower()
+    truthy = ("1", "true", "yes", "y", "on")
+    return bool(
+        os.environ.get("RAILWAY_ENVIRONMENT")
+        or os.environ.get("RUN_HEADLESS")
+        or s in truthy
+        or k in truthy
+    )
 
 
 _local_flag = os.environ.get("SISA_LOCAL_TEST")
@@ -420,7 +439,59 @@ def _is_session_already_processed(session_id: str) -> bool:
         return False
 
 
+def _parse_session_datetime(ts) -> datetime | None:
+    """admin_state 시각 문자열 → naive UTC (utcnow 와 비교용)."""
+    if not ts:
+        return None
+    try:
+        s = str(ts).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+
+def _session_considered_terminal(s: dict) -> bool:
+    """완료·만료 등으로 '빠른 폴링' 대상이 아닌 세션."""
+    if not isinstance(s, dict):
+        return True
+    if s.get("deleted") or s.get("has_approval"):
+        return True
+    st = str(s.get("status") or "").strip()
+    if not st:
+        return False
+    low = st.lower()
+    for token in (
+        "완료",
+        "만료",
+        "취소",
+        "실패",
+        "종료",
+        "삭제",
+        "expired",
+        "취소완료",
+        "결제완료",
+    ):
+        if token in st or token in low:
+            return True
+    return False
+
+
 def _has_active_sessions(window_minutes: int = 10) -> bool:
+    """
+    admin_state.json 기준 '지금은 자주 돌아야 하는가'.
+
+    주의(서버 이슈 원인이었음):
+    - status 미설정을 '결제중'으로 보면 세션이 하나만 있어도 영구적으로 active=True → 2초 폴링.
+    - 생성 시각만 보고 10분 동안 active면 트래픽이 과도해짐.
+
+    규칙:
+    - 명시적으로 status == '결제중' 이고 종료 상태가 아닐 때만 True.
+    - 그 외에는 created_at 이 window 이내이되, 종료/승인 처리된 세션은 제외.
+    - history 는 명시적 '결제중' + 최근 생성일 때만 True.
+    """
     try:
         st = _load_admin_state()
         sessions = st.get("sessions") or []
@@ -428,29 +499,29 @@ def _has_active_sessions(window_minutes: int = 10) -> bool:
         cutoff = datetime.utcnow() - timedelta(minutes=window_minutes)
 
         for s in sessions:
-            if str(s.get("status") or "결제중") == "결제중":
+            if _session_considered_terminal(s):
+                continue
+            if str(s.get("status") or "").strip() == "결제중":
                 return True
 
         for s in sessions:
-            ts = s.get("created_at")
-            if not ts:
+            if _session_considered_terminal(s):
                 continue
-            try:
-                dt = datetime.fromisoformat(ts)
-            except Exception:
+            dt = _parse_session_datetime(s.get("created_at"))
+            if dt is None:
                 continue
             if dt >= cutoff:
                 return True
 
         for h in history:
-            ts = h.get("created_at")
-            if not ts:
+            if _session_considered_terminal(h):
                 continue
-            try:
-                dt = datetime.fromisoformat(ts)
-            except Exception:
+            if str(h.get("status") or "").strip() != "결제중":
                 continue
-            if dt >= cutoff and h.get("status") == "결제중":
+            dt = _parse_session_datetime(h.get("created_at"))
+            if dt is None:
+                continue
+            if dt >= cutoff:
                 return True
 
         return False
@@ -1250,7 +1321,9 @@ class KVStore:
                 print(
                     f"[INFO] K-VAN → transactions 동기화 완료 (updated={updated}, inserted={inserted}, json={self.use_json})"
                 )
-            return bool(updated or inserted)
+            # 크롤러 대기: 매 사이클마다 동일 행 UPDATE 만 일어나면 had_new 로 보지 않는다.
+            # (서버 MySQL에서 매 루프 sync 가 True 가 되어 2초 폴링에 고착되던 원인 제거)
+            return bool(inserted)
 
         except Exception as e:
             print(f"[WARN] K-VAN ↔ transactions 동기화 오류: {e}")
@@ -2939,6 +3012,13 @@ def run_crawler_loop(max_cycles: int = 0, max_runtime_sec: int = 0) -> int:
 
         backup_interval = int(os.environ.get("K_VAN_CRAWL_INTERVAL", "600"))
         startup_fast_cycles = int(os.environ.get("K_VAN_STARTUP_FAST_CYCLES", "3"))
+        # 로컬/서버 동일 기본 스케줄 (필요 시 환경변수로만 조절)
+        sleep_idle = int(os.environ.get("K_VAN_IDLE_SLEEP_SEC", "180"))
+        sleep_active = int(os.environ.get("K_VAN_ACTIVE_SLEEP_SEC", "2"))
+        sleep_medium = int(os.environ.get("K_VAN_MEDIUM_SLEEP_SEC", "30"))
+        sleep_startup = int(os.environ.get("K_VAN_STARTUP_SLEEP_SEC", "2"))
+        active_win = int(os.environ.get("K_VAN_ACTIVE_SESSION_WINDOW_MINUTES", "3"))
+        popup_win = int(os.environ.get("K_VAN_POPUP_SESSION_WINDOW_MINUTES", "30"))
         last_backup_ts = 0.0
         cycle = 0
         empty_cycles = 0
@@ -2973,7 +3053,7 @@ def run_crawler_loop(max_cycles: int = 0, max_runtime_sec: int = 0) -> int:
                 has_links = link_count > 0 or _has_payment_links_quick(driver)
 
                 # 3) 팝업 동기화
-                active_for_popup = _has_active_sessions(window_minutes=30)
+                active_for_popup = _has_active_sessions(window_minutes=popup_win)
                 if has_links:
                     if _scan_payment_link_popups_and_sync(driver, store, allow_popup_for_non_expired=active_for_popup):
                         had_new = True
@@ -3017,12 +3097,13 @@ def run_crawler_loop(max_cycles: int = 0, max_runtime_sec: int = 0) -> int:
                 _alog(msg)
                 break
 
-            active = _has_active_sessions(window_minutes=10)
+            active = _has_active_sessions(window_minutes=active_win)
 
-            delay = 2
+            delay = sleep_startup
+            delay_reason = "startup"
             if cycle >= startup_fast_cycles:
                 # 삭제가 발생했거나(=DB 상태 변화 가능) / 신규가 없고(=바로 크롤링할 게 없음)
-                # 이 경우에는 추가로 결제/취소 페이지와 결제링크 생성페이지(payment-link)를 한 번 더 확인 후 3분 대기
+                # 이 경우에는 추가로 결제/취소 페이지와 결제링크 생성페이지(payment-link)를 한 번 더 확인 후 장시간 대기
                 no_new_work = (not had_new and not active and empty_cycles >= 1)
                 if deleted_any or no_new_work:
                     try:
@@ -3054,21 +3135,27 @@ def run_crawler_loop(max_cycles: int = 0, max_runtime_sec: int = 0) -> int:
                     except Exception as _e_pl:
                         _dbg(f"[NO_WORK/DELETE] payment-link 확인 실패(무시): {_e_pl!r}")
 
-                    delay = 180
-                elif empty_cycles >= 3:
-                    delay = 30 if LOCAL_TEST else 600
+                    delay = sleep_idle
+                    delay_reason = "idle_after_check"
                 elif active or had_new:
-                    delay = 2
+                    delay = sleep_active
+                    delay_reason = "active_or_new"
+                elif empty_cycles >= 3:
+                    delay = sleep_idle
+                    delay_reason = "empty_links_stable"
                 else:
-                    delay = 5 if LOCAL_TEST else 30
+                    # 로컬/서버 구분 없이 동일 (구 로컬 5초는 K_VAN_MEDIUM_SLEEP_SEC=5 로 설정 가능)
+                    delay = sleep_medium
+                    delay_reason = "medium"
 
             print(
                 f"[crawler] 다음 크롤링까지 {delay}초 대기 "
-                f"(active_sessions={active}, had_new={had_new}, empty_cycles={empty_cycles})"
+                f"({delay_reason}, active={active}, had_new={had_new}, empty_cycles={empty_cycles}, "
+                f"active_win={active_win}m)"
             )
             _alog(
-                f"다음 크롤링까지 {delay}초 대기 "
-                f"(active_sessions={active}, had_new={had_new}, empty_cycles={empty_cycles})"
+                f"다음 크롤링까지 {delay}초 ({delay_reason}, active={active}, had_new={had_new}, "
+                f"empty_cycles={empty_cycles})"
             )
             _wait_with_wakeup(delay)
 
