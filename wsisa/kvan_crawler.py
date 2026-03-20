@@ -956,6 +956,23 @@ def _has_any_admin_sessions() -> bool:
         return False
 
 
+def _count_open_sessions() -> int:
+    try:
+        st = _load_admin_state()
+        sessions = st.get("sessions") or []
+        cnt = 0
+        for s in sessions:
+            if not isinstance(s, dict):
+                continue
+            if _session_considered_terminal(s):
+                continue
+            if str(s.get("status") or "").strip() == "결제중":
+                cnt += 1
+        return cnt
+    except Exception:
+        return 0
+
+
 def _backfill_admin_state_from_kvan_links(store: "KVStore", max_rows: int = 300) -> None:
     """
     admin_state 가 비어 있을 때 kvan_links DB 스냅샷으로 최소 세션 정보를 복원한다.
@@ -1794,8 +1811,16 @@ class KVStore:
                         st_probe = _load_admin_state()
                         s_cnt = len(st_probe.get("sessions") or [])
                         h_cnt = len(st_probe.get("history") or [])
+                        open_cnt = _count_open_sessions()
                         if s_cnt == 0 and h_cnt == 0 and krows:
                             _trace("sync_mapping_source_empty", sessions=s_cnt, history=h_cnt, krows=len(krows))
+                        _trace(
+                            "sync_mapping_source_state",
+                            sessions=s_cnt,
+                            history=h_cnt,
+                            open_sessions=open_cnt,
+                            krows=len(krows),
+                        )
                     except Exception:
                         pass
                     valid_agency_ids = _load_valid_agency_ids(cur)
@@ -1968,14 +1993,26 @@ class KVStore:
                                         path="approval_match",
                                     )
                                 else:
-                                    _trace(
-                                        "sync_mark_unresolved",
-                                        approval=approval,
-                                        amount=amt,
-                                        agency_id=resolved_agency_id or "",
-                                        reg_date=reg_date,
-                                        path="approval_match",
-                                    )
+                                    open_cnt = _count_open_sessions()
+                                    if open_cnt <= 0:
+                                        _trace(
+                                            "sync_mark_skipped_no_open_session",
+                                            approval=approval,
+                                            amount=amt,
+                                            agency_id=resolved_agency_id or "",
+                                            reg_date=reg_date,
+                                            path="approval_match",
+                                        )
+                                    else:
+                                        _trace(
+                                            "sync_mark_unresolved",
+                                            approval=approval,
+                                            amount=amt,
+                                            agency_id=resolved_agency_id or "",
+                                            reg_date=reg_date,
+                                            open_sessions=open_cnt,
+                                            path="approval_match",
+                                        )
                             updated += 1
                             continue
 
@@ -1983,7 +2020,7 @@ class KVStore:
                         # 가능한 경우 resolved_agency_id로 좁힌다.
                         params = [amt, reg_date, reg_date]
                         sql = """
-                            SELECT id, message
+                            SELECT id, message, kvan_approval_no, agency_id
                             FROM transactions
                             WHERE amount = %s
                               AND (%s = '' OR DATE(created_at) = %s)
@@ -1991,22 +2028,44 @@ class KVStore:
                         if resolved_agency_id:
                             sql += " AND agency_id = %s"
                             params.append(resolved_agency_id)
-                        sql += " ORDER BY created_at DESC LIMIT 1"
+                        else:
+                            # agency_id 미해결 상태에서는 다른 대행사 건을 덮어쓰지 않도록
+                            # agency_id 비어있는 후보만 보정 대상으로 제한한다.
+                            sql += " AND (agency_id IS NULL OR TRIM(agency_id) = '')"
+                        sql += " ORDER BY created_at DESC LIMIT 10"
                         if resolved_agency_id:
                             cur.execute(sql, tuple(params))
                         else:
                             cur.execute(
                                 """
-                                SELECT id, message
+                                SELECT id, message, kvan_approval_no, agency_id
                                 FROM transactions
                                 WHERE amount = %s
                                   AND (%s = '' OR DATE(created_at) = %s)
+                                  AND (agency_id IS NULL OR TRIM(agency_id) = '')
                                 ORDER BY created_at DESC
-                                LIMIT 1
+                                LIMIT 10
                                 """,
                                 (amt, reg_date, reg_date),
                             )
-                        tx = cur.fetchone()
+                        candidates = cur.fetchall() or []
+                        tx = None
+                        for cand in candidates:
+                            existing_ap = str(cand.get("kvan_approval_no") or "").strip()
+                            # 이미 다른 승인번호가 박혀 있는 행은 덮어쓰지 않는다.
+                            if existing_ap and existing_ap != approval:
+                                _trace(
+                                    "sync_amount_date_skip_conflict_approval",
+                                    amount=amt,
+                                    reg_date=reg_date,
+                                    existing_approval=existing_ap,
+                                    incoming_approval=approval,
+                                )
+                                continue
+                            tx = cand
+                            # 같은 승인번호가 있으면 최우선 채택
+                            if existing_ap == approval:
+                                break
                         if tx:
                             tx_id = tx["id"]
                             cur.execute(
@@ -2056,14 +2115,26 @@ class KVStore:
                                         path="amount_date_match",
                                     )
                                 else:
-                                    _trace(
-                                        "sync_mark_unresolved",
-                                        approval=approval,
-                                        amount=amt,
-                                        agency_id=resolved_agency_id or "",
-                                        reg_date=reg_date,
-                                        path="amount_date_match",
-                                    )
+                                    open_cnt = _count_open_sessions()
+                                    if open_cnt <= 0:
+                                        _trace(
+                                            "sync_mark_skipped_no_open_session",
+                                            approval=approval,
+                                            amount=amt,
+                                            agency_id=resolved_agency_id or "",
+                                            reg_date=reg_date,
+                                            path="amount_date_match",
+                                        )
+                                    else:
+                                        _trace(
+                                            "sync_mark_unresolved",
+                                            approval=approval,
+                                            amount=amt,
+                                            agency_id=resolved_agency_id or "",
+                                            reg_date=reg_date,
+                                            open_sessions=open_cnt,
+                                            path="amount_date_match",
+                                        )
                             updated += 1
                             continue
 
@@ -3759,6 +3830,7 @@ def _delete_expired_no_tx_links_fast(driver: webdriver.Chrome, store: KVStore, m
 
                 popup_text = _safe_text(dialog)
                 no_history = _popup_has_no_history(popup_text)
+                popup_rows_unknown = False
 
                 rows = []
                 try:
@@ -3767,12 +3839,24 @@ def _delete_expired_no_tx_links_fast(driver: webdriver.Chrome, store: KVStore, m
                     rows = []
 
                 if not no_history and len(rows) == 0:
-                    no_history = True
+                    # 팝업 로딩 지연으로 tbody 행이 아직 없을 수 있다.
+                    # 이 경우를 "거래없음"으로 간주하면 거래가 있는 링크를 오삭제할 수 있으므로
+                    # 즉시 삭제를 건너뛰고 다음 사이클에서 재검증한다.
+                    popup_rows_unknown = True
 
                 if not no_history and rows:
                     first_row_text = (rows[0].text or "").strip()
                     if "없습니다" in first_row_text or "없음" in first_row_text:
                         no_history = True
+
+                if popup_rows_unknown:
+                    _trace(
+                        "expired_skip_delete_unknown_popup",
+                        session_id=session_id or "-",
+                        title=title[:60],
+                    )
+                    _close_dialog(driver, dialog)
+                    continue
 
                 if no_history:
                     _close_dialog(driver, dialog)

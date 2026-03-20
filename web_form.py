@@ -566,7 +566,9 @@ def _hq_merge_expired_with_tx_from_admin_history(items: list) -> list:
     for h in admin_st.get("history") or []:
         if not isinstance(h, dict):
             continue
-        if not h.get("has_transaction"):
+        # 과거 버전은 has_transaction 플래그를 남기지 못한 경우가 있어
+        # has_approval 도 "거래 발생"으로 간주해 HQ 만료+거래 목록에 병합한다.
+        if not (h.get("has_transaction") or h.get("has_approval")):
             continue
         st = str(h.get("status") or "").strip()
         if "만료" not in st:
@@ -585,6 +587,138 @@ def _hq_merge_expired_with_tx_from_admin_history(items: list) -> list:
             }
         )
     return out
+
+
+def _hq_merge_expired_with_tx_from_transactions(items: list, transactions: list) -> list:
+    """
+    expired_with_transactions.json / history 누락을 보완하기 위해
+    transactions.message 의 세션 힌트(KEY/내부세션ID)와 대조해 만료+거래 건을 병합한다.
+    """
+    if not isinstance(items, list):
+        items = []
+    try:
+        admin_st = _hq_load_admin_state_json()
+    except Exception:
+        return items
+    seen = {
+        str(x.get("session_id") or "").strip()
+        for x in items
+        if str(x.get("session_id") or "").strip()
+    }
+    tx_keys: set[str] = set()
+    for t in transactions or []:
+        if str(t.get("status") or "").strip().lower() != "success":
+            continue
+        for k in _extract_session_keys_from_tx_message(str(t.get("message") or "")):
+            tx_keys.add(k)
+    out = list(items)
+    for h in admin_st.get("history") or []:
+        if not isinstance(h, dict):
+            continue
+        st = str(h.get("status") or "").strip()
+        if "만료" not in st:
+            continue
+        sid = str(h.get("id") or "").strip()
+        ksid = str(h.get("kvan_session_id") or "").strip()
+        if not sid or sid in seen:
+            continue
+        if not (h.get("has_transaction") or h.get("has_approval") or sid in tx_keys or (ksid and ksid in tx_keys)):
+            continue
+        seen.add(sid)
+        out.append(
+            {
+                "session_id": sid,
+                "kvan_session_id": ksid,
+                "title": str(h.get("checked_title") or h.get("title") or "")[:200],
+                "agency_id": str(h.get("agency_id") or ""),
+                "finished_at": str(h.get("finished_at") or ""),
+                "seen": True,
+            }
+        )
+    return out
+
+
+def _extract_session_keys_from_tx_message(msg: str) -> list[str]:
+    out: list[str] = []
+    m = str(msg or "")
+    for tok in re.findall(r"KEY[0-9A-Za-z]+", m, re.IGNORECASE):
+        t = (tok or "").strip()
+        if t and t not in out:
+            out.append(t)
+    # 기존 내부 세션ID(12자리 숫자) 힌트도 보조적으로 수집
+    for tok in re.findall(r"\b\d{12}\b", m):
+        t = (tok or "").strip()
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+def _session_key_candidates_from_session_blob(s: dict) -> list[str]:
+    out: list[str] = []
+    sid = str(s.get("id") or "").strip()
+    if sid:
+        out.append(sid)
+    ksid = str(s.get("kvan_session_id") or "").strip()
+    if ksid and ksid not in out:
+        out.append(ksid)
+    link = str(s.get("kvan_link") or "").strip()
+    if link:
+        key = extract_kvan_session_key_from_url(link)
+        if key and key not in out:
+            out.append(key)
+        for tok in re.findall(r"KEY[0-9A-Za-z]+", link, re.IGNORECASE):
+            t = (tok or "").strip()
+            if t and t not in out:
+                out.append(t)
+    return out
+
+
+def _build_agency_completed_settlement_map(
+    completed_sessions: list[dict], agency_transactions: list[dict]
+) -> dict[str, str]:
+    """
+    완료/종료 세션별 정산 상태를 계산한다.
+    1) tx.message 의 세션KEY/세션ID 힌트로 직접 매칭
+    2) 보조: 같은 날짜 + 같은 금액의 성공 거래가 1건이면 매칭
+    """
+    by_key: dict[str, list[dict]] = {}
+    by_amount_date: dict[tuple[int, str], list[dict]] = {}
+    for tx in agency_transactions or []:
+        if str(tx.get("status") or "").strip().lower() != "success":
+            continue
+        for k in _extract_session_keys_from_tx_message(str(tx.get("message") or "")):
+            by_key.setdefault(k, []).append(tx)
+        try:
+            amt = int(tx.get("amount") or 0)
+        except Exception:
+            amt = 0
+        cdt = str(tx.get("created_at") or "")[:10]
+        if amt > 0 and cdt:
+            by_amount_date.setdefault((amt, cdt), []).append(tx)
+
+    result: dict[str, str] = {}
+    for s in completed_sessions or []:
+        sid = str(s.get("id") or "").strip()
+        if not sid:
+            continue
+        matched: list[dict] = []
+        for k in _session_key_candidates_from_session_blob(s):
+            matched.extend(by_key.get(k, []))
+        if not matched:
+            try:
+                amt = int(str(s.get("amount") or "0").replace(",", "").strip() or "0")
+            except Exception:
+                amt = 0
+            sdt = str(s.get("finished_at") or s.get("created_at") or "")[:10]
+            cands = by_amount_date.get((amt, sdt), []) if (amt > 0 and sdt) else []
+            if len(cands) == 1:
+                matched = cands
+        if not matched:
+            result[sid] = "-"
+            continue
+        settled_vals = [str(t.get("settlement_status") or "").strip() for t in matched]
+        result[sid] = "정산완료" if settled_vals and all(v == "정산완료" for v in settled_vals) else "미정산"
+    return result
 
 
 def _hq_link_matches_kvan_session_id(link: str, session_id: str) -> bool:
@@ -4631,6 +4765,9 @@ def hq_admin():
     expired_with_transactions = _hq_merge_expired_with_tx_from_admin_history(
         expired_with_transactions
     )
+    expired_with_transactions = _hq_merge_expired_with_tx_from_transactions(
+        expired_with_transactions, transactions
+    )
     expired_with_tx_unseen = sum(1 for x in expired_with_transactions if not x.get("seen"))
     expired_with_transactions_reversed = list(reversed(expired_with_transactions))  # 최신순 표시
 
@@ -5924,6 +6061,41 @@ def agency_admin():
                     pass
                 sessions = [s for s in sessions if str(s.get("id")) != sid]
             return redirect(url_for("agency_admin"))
+        elif action == "bulk_delete_completed_sessions":
+            sid_set = {
+                str(x).strip()
+                for x in request.form.getlist("completed_session_ids")
+                if str(x).strip()
+            }
+            if sid_set:
+                try:
+                    full = load_admin_state_json_for_web()
+                    aid_s = str(agency_id or "").strip()
+                    all_sessions = list(full.get("sessions") or [])
+                    all_history = list(full.get("history") or [])
+                    all_sessions = [
+                        s
+                        for s in all_sessions
+                        if not (
+                            str(s.get("id") or "").strip() in sid_set
+                            and str(s.get("agency_id") or "").strip() == aid_s
+                        )
+                    ]
+                    all_history = [
+                        h
+                        for h in all_history
+                        if not (
+                            str(h.get("id") or "").strip() in sid_set
+                            and str(h.get("agency_id") or "").strip() == aid_s
+                        )
+                    ]
+                    full["sessions"] = all_sessions
+                    full["history"] = all_history
+                    save_admin_state_json_for_web(full)
+                    message = f"완료/종료 세션 {len(sid_set)}건을 삭제했습니다."
+                except Exception as e:  # noqa: BLE001
+                    message = f"완료/종료 세션 삭제 중 오류: {e}"
+            return redirect(url_for("agency_admin"))
         elif action == "bulk_delete_agency_tx":
             tx_ids = request.form.getlist("tx_ids")
             tx_id_set = {str(x).strip() for x in tx_ids if str(x).strip()}
@@ -5952,21 +6124,58 @@ def agency_admin():
     try:
         conn = get_db()
         with conn.cursor() as cur:
-            cur.execute(
-                """
+            agency_mid = str(agency.get("kvan_mid") or "").strip()
+            # 기본: agency_id 정확 매칭
+            # 보조: 과거/누락 데이터에서 agency_id 가 비어도
+            #      kvan_mid 일치 또는 kvan_transactions.agency_id 매칭이면 노출
+            sql = """
                 SELECT *
-                FROM transactions
-                WHERE agency_id = %s
+                FROM (
+                    SELECT t.*
+                    FROM transactions t
+                    WHERE t.agency_id = %s
+
+                    UNION
+
+                    SELECT t.*
+                    FROM transactions t
+                    JOIN kvan_transactions kt
+                      ON kt.approval_no = t.kvan_approval_no
+                    WHERE (t.agency_id IS NULL OR TRIM(t.agency_id) = '')
+                      AND kt.agency_id = %s
+
+                    UNION
+
+                    SELECT t.*
+                    FROM transactions t
+                    WHERE (t.agency_id IS NULL OR TRIM(t.agency_id) = '')
+                      AND %s <> ''
+                      AND t.kvan_mid = %s
+                ) x
                 ORDER BY created_at DESC
                 LIMIT 500
-                """,
-                (agency_id,),
-            )
+            """
+            cur.execute(sql, (agency_id, agency_id, agency_mid, agency_mid))
             agency_transactions = cur.fetchall()
         conn.close()
+        try:
+            _append_hq_log(
+                "WEB",
+                f"agency_tx_load agency_id={agency_id} kvan_mid={agency_mid or '-'} rows={len(agency_transactions)}",
+            )
+        except Exception:
+            pass
     except Exception as e:
         print(f"[WARN] agency_admin transactions 조회 실패: {e}")
         agency_transactions = []
+
+    # 완료/종료 세션 요약 박스에 정산 상태(미정산/정산완료)를 표기한다.
+    completed_settlement_map = _build_agency_completed_settlement_map(
+        agency_completed_sessions, agency_transactions
+    )
+    for h in agency_completed_sessions:
+        sid = str(h.get("id") or "").strip()
+        h["settlement_status_ui"] = completed_settlement_map.get(sid, "-")
 
     # 미확인 결제 알림 건수 (현재 로그인한 대행사만)
     _agency_id = session.get("agency_id")
@@ -6315,25 +6524,42 @@ def agency_admin():
 
           <!-- 과거 세션(요약) -->
           <section class="glass-card rounded-2xl border border-white/20 shadow-xl p-5">
-            <h2 class="text-lg font-semibold mb-3 flex items-center gap-2">
-              <i class="fa-solid fa-list-check text-brand-accent"></i> 완료/종료된 세션 요약
-            </h2>
+            <div class="flex items-center justify-between mb-3 gap-2 flex-wrap">
+              <h2 class="text-lg font-semibold flex items-center gap-2">
+                <i class="fa-solid fa-list-check text-brand-accent"></i> 완료/종료된 세션 요약
+              </h2>
+              {% if agency_completed_sessions %}
+              <form id="formCompletedBulkDelete" method="post" action="{{ url_for('agency_admin') }}" onsubmit="return confirm('선택한 완료/종료 세션을 삭제할까요?');">
+                <input type="hidden" name="action" value="bulk_delete_completed_sessions" />
+                <button type="submit" class="px-3 py-1.5 rounded-full bg-red-500/40 text-red-100 font-semibold hover:bg-red-500/60 transition text-xs border border-red-400/40">
+                  <i class="fa-solid fa-trash text-[10px]"></i> 선택 삭제
+                </button>
+              </form>
+              {% endif %}
+            </div>
             <div class="box-schema">크롤링 결과에 따라 링크만료·결제완료·결제 실패 등이 이 섹션에 표시됩니다.</div>
             {% if agency_completed_sessions %}
-            <div class="overflow-x-auto">
+            <div class="overflow-x-auto max-h-[380px] overflow-y-auto border border-white/20 rounded-xl">
               <table class="min-w-full text-xs border-separate border-spacing-y-2">
                 <thead class="text-white/70">
                   <tr>
+                    <th class="px-3 py-1 text-center w-8">
+                      <input type="checkbox" title="전체 선택" onclick="document.querySelectorAll('.completed-session-chk').forEach(function(c){c.checked=this.checked;}.bind(this));" />
+                    </th>
                     <th class="px-3 py-1 text-left">세션ID</th>
                     <th class="px-3 py-1 text-right">금액</th>
                     <th class="px-3 py-1 text-left">할부</th>
                     <th class="px-3 py-1 text-left">상태</th>
+                    <th class="px-3 py-1 text-center">정산상태</th>
                     <th class="px-3 py-1 text-left">메모</th>
                   </tr>
                 </thead>
                 <tbody>
                   {% for h in agency_completed_sessions %}
                   <tr class="bg-black/20 hover:bg-black/30 transition">
+                    <td class="px-3 py-2 text-center">
+                      <input type="checkbox" class="completed-session-chk" form="formCompletedBulkDelete" name="completed_session_ids" value="{{ h.id }}">
+                    </td>
                     <td class="px-3 py-2 font-mono text-blue-200">{{ h.id }}</td>
                     <td class="px-3 py-2 text-right">{{ h.amount }}</td>
                     <td class="px-3 py-2">{{ h.installment }}</td>
@@ -6349,6 +6575,16 @@ def agency_admin():
                         {{ st or '-' }}
                       {% endif %}
                       {% if h.deleted_in_kvan %}<span class="text-red-300"> · 삭제됨</span>{% endif %}
+                    </td>
+                    <td class="px-3 py-2 text-center">
+                      {% set cst = (h.settlement_status_ui or '-') %}
+                      {% if cst == '정산완료' %}
+                        <span class="px-2 py-1 rounded-full bg-blue-500/20 text-blue-200 border border-blue-500/40 text-[10px]">정산완료</span>
+                      {% elif cst == '미정산' %}
+                        <span class="px-2 py-1 rounded-full bg-yellow-500/20 text-yellow-200 border border-yellow-500/40 text-[10px]">미정산</span>
+                      {% else %}
+                        <span class="text-[10px] text-white/40">-</span>
+                      {% endif %}
                     </td>
                     <td class="px-3 py-2 text-[11px] text-white/70 max-w-[200px] truncate">{{ h.result_message }}</td>
                   </tr>
@@ -6405,7 +6641,7 @@ def agency_admin():
                 </button>
               </div>
             </div>
-            <div class="box-schema"><code>transactions</code> 본사 DB 동기화 · <code>agency_id</code> 일치 건만 표시(최대 500건). 열: 시간, 거래금액, 수수료율·지급예정(계산), 구매자, 결제상태, <strong>정산상태(미정산/정산완료)</strong>, DB 원문. 아래 표는 드래그로 범위 선택 후 복사(Ctrl+C) 가능.</div>
+            <div class="box-schema"><code>transactions</code> 본사 DB 동기화 · <code>agency_id</code> 우선 + 보조 매핑(<code>kvan_mid</code>, <code>kvan_approval_no↔kvan_transactions.agency_id</code>) 표시(최대 500건). 열: 시간, 거래금액, 수수료율·지급예정(계산), 구매자, 결제상태, <strong>정산상태(미정산/정산완료)</strong>, DB 원문. 아래 표는 드래그로 범위 선택 후 복사(Ctrl+C) 가능.</div>
             {% if agency_transactions %}
             <form method="post" action="{{ url_for('agency_admin') }}" onsubmit="return confirm('선택한 거래를 본사 DB에서 삭제할까요?');">
             <input type="hidden" name="action" value="bulk_delete_agency_tx" />
