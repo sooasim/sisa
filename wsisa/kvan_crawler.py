@@ -1407,11 +1407,11 @@ class KVStore:
                 FROM kvan_links
                 ORDER BY id DESC
             """
-            params: tuple = ()
             if isinstance(limit, int) and limit > 0:
                 sql += " LIMIT %s"
-                params = (int(limit),)
-            cur.execute(sql, params)
+                cur.execute(sql, (int(limit),))
+            else:
+                cur.execute(sql)
             rows = cur.fetchall() or []
         conn.close()
         return rows
