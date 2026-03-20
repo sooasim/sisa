@@ -874,6 +874,64 @@ def _has_any_admin_sessions() -> bool:
         return False
 
 
+def _backfill_admin_state_from_kvan_links(store: "KVStore", max_rows: int = 300) -> None:
+    """
+    admin_state 가 비어 있을 때 kvan_links DB 스냅샷으로 최소 세션 정보를 복원한다.
+    서버 재시작/파일 유실 후에도 KEY-세션 매핑이 끊기지 않도록 보강.
+    """
+    try:
+        st = _load_admin_state()
+        if (st.get("sessions") or []) or (st.get("history") or []):
+            return
+        rows = store.load_kvan_links(limit=max_rows) or []
+        if not rows:
+            return
+
+        sessions: list[dict] = []
+        history: list[dict] = []
+        seen_ids: set[str] = set()
+        for r in rows:
+            sid = str(r.get("internal_session_id") or "").strip() or str(
+                r.get("kvan_session_id") or ""
+            ).strip()
+            if not sid or sid in seen_ids:
+                continue
+            seen_ids.add(sid)
+            created_at = (
+                str(r.get("link_created_at") or "").strip()
+                or str(r.get("captured_at") or "").strip()
+                or datetime.utcnow().isoformat()
+            )
+            entry = {
+                "id": sid,
+                "amount": int(r.get("amount") or 0),
+                "installment": "",
+                "status": "결제중",
+                "created_at": created_at,
+                "agency_id": str(r.get("agency_id") or "").strip(),
+                "kvan_link": str(r.get("kvan_link") or "").strip(),
+                "kvan_session_id": str(r.get("kvan_session_id") or "").strip(),
+                "title": str(r.get("title") or "").strip(),
+            }
+            status_text = str(r.get("status") or "").strip()
+            if _is_expired_link_status(status_text):
+                entry["status"] = "만료"
+                entry["deleted_in_kvan"] = True
+                entry["finished_at"] = created_at
+                history.append(entry)
+            else:
+                sessions.append(entry)
+        if sessions or history:
+            _save_admin_state({"sessions": sessions, "history": history})
+            _trace(
+                "admin_state_backfilled_from_kvan_links",
+                sessions=len(sessions),
+                history=len(history),
+            )
+    except Exception as e:
+        _trace("admin_state_backfill_error", error=str(e)[:220])
+
+
 # =========================================================
 # 저장소
 # =========================================================
@@ -1481,7 +1539,8 @@ class KVStore:
                 cur.execute(
                     """
                     UPDATE transactions
-                    SET amount = COALESCE(amount, %s),
+                    SET created_at = COALESCE(created_at, NOW()),
+                        amount = COALESCE(amount, %s),
                         customer_name = COALESCE(customer_name, %s),
                         card_prefix4 = COALESCE(NULLIF(card_prefix4, ''), %s),
                         status = 'success',
@@ -1775,7 +1834,8 @@ class KVStore:
                             cur.execute(
                                 """
                                 UPDATE transactions
-                                SET amount = COALESCE(amount, %s),
+                                SET created_at = COALESCE(created_at, NOW()),
+                                    amount = COALESCE(amount, %s),
                                     status = %s,
                                     kvan_mid = %s,
                                     kvan_approval_no = %s,
@@ -1833,7 +1893,8 @@ class KVStore:
                             cur.execute(
                                 """
                                 UPDATE transactions
-                                SET status = %s,
+                                SET created_at = COALESCE(created_at, NOW()),
+                                    status = %s,
                                     kvan_mid = %s,
                                     kvan_approval_no = %s,
                                     kvan_tx_type = %s,
@@ -3929,6 +3990,8 @@ def run_crawler_loop(max_cycles: int = 0, max_runtime_sec: int = 0) -> int:
             deleted_any = False
 
             try:
+                if not _has_any_admin_sessions():
+                    _backfill_admin_state_from_kvan_links(store)
                 # 1) 가장 먼저 즉시 삭제
                 deleted = _delete_expired_no_tx_links_fast(driver, store, max_delete=FAST_DELETE_PER_PASS)
                 if deleted > 0:
