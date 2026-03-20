@@ -500,6 +500,67 @@ def _resolve_agency_id_by_kvan_key_db(cur, session_key: str) -> Optional[str]:
     return None
 
 
+def _extract_session_id_from_tx_message(message: str) -> str:
+    msg = str(message or "").strip()
+    if not msg:
+        return ""
+    m = re.search(r"세션ID=([^,\)\s]+)", msg)
+    if m:
+        return str(m.group(1) or "").strip()
+    m2 = re.search(r"(KEY[0-9A-Za-z]+)", msg, re.I)
+    if m2:
+        return str(m2.group(1) or "").strip()
+    return ""
+
+
+def _guess_open_session_id_for_success(
+    amount: int,
+    agency_id: Optional[str],
+    reg_date: str = "",
+) -> str:
+    """
+    transactions.message에 세션ID 힌트가 없을 때, admin_state의 '결제중' 세션에서
+    금액/소유자(본사·대행사) 기준으로 단일 후보를 찾아 완료 처리에 사용한다.
+    """
+    try:
+        st = _load_admin_state()
+        sessions = st.get("sessions") or []
+        target_amount = int(amount or 0)
+        target_agency = str(agency_id or "").strip()
+        candidates: list[str] = []
+        for s in sessions:
+            if not isinstance(s, dict):
+                continue
+            if _session_considered_terminal(s):
+                continue
+            if str(s.get("status") or "").strip() != "결제중":
+                continue
+            try:
+                s_amt = int(str(s.get("amount") or "0").replace(",", "").strip() or "0")
+            except Exception:
+                s_amt = 0
+            if target_amount > 0 and s_amt != target_amount:
+                continue
+            s_ag = str(s.get("agency_id") or "").strip()
+            if target_agency and s_ag != target_agency:
+                continue
+            if not target_agency and s_ag:
+                continue
+            if reg_date:
+                s_dt = _parse_session_datetime(s.get("created_at"))
+                if s_dt is not None and s_dt.strftime("%Y-%m-%d") > reg_date:
+                    continue
+            sid = str(s.get("id") or "").strip()
+            if sid:
+                candidates.append(sid)
+        uniq = list(dict.fromkeys(candidates))
+        if len(uniq) == 1:
+            return uniq[0]
+    except Exception:
+        pass
+    return ""
+
+
 def _lookup_internal_session_id_for_kvan_key(kvan_key: str) -> str:
     kk = (kvan_key or "").strip()
     if not kk:
@@ -838,7 +899,9 @@ def _has_active_sessions(window_minutes: int = 10) -> bool:
             if _session_considered_terminal(s):
                 continue
             if str(s.get("status") or "").strip() == "결제중":
-                return True
+                dt = _parse_session_datetime(s.get("created_at"))
+                if dt is not None and dt >= cutoff:
+                    return True
 
         for s in sessions:
             if _session_considered_terminal(s):
@@ -1826,7 +1889,7 @@ class KVStore:
 
                         cur.execute(
                             """
-                            SELECT id
+                            SELECT id, message
                             FROM transactions
                             WHERE kvan_approval_no = %s
                             LIMIT 1
@@ -1863,6 +1926,28 @@ class KVStore:
                                     tx_id,
                                 ),
                             )
+                            if tx_status == "success":
+                                sid_hint = _extract_session_id_from_tx_message(
+                                    tx.get("message") or ""
+                                )
+                                if not sid_hint:
+                                    sid_hint = _guess_open_session_id_for_success(
+                                        amount=int(amt or 0),
+                                        agency_id=resolved_agency_id,
+                                        reg_date=reg_date,
+                                    )
+                                if sid_hint:
+                                    _mark_session_checked(
+                                        sid_hint,
+                                        title="거래내역 자동 동기화",
+                                        has_approval=True,
+                                    )
+                                    _trace(
+                                        "sync_mark_checked",
+                                        approval=approval,
+                                        session_id=sid_hint,
+                                        path="approval_match",
+                                    )
                             updated += 1
                             continue
 
@@ -1870,7 +1955,7 @@ class KVStore:
                         # 가능한 경우 resolved_agency_id로 좁힌다.
                         params = [amt, reg_date, reg_date]
                         sql = """
-                            SELECT id
+                            SELECT id, message
                             FROM transactions
                             WHERE amount = %s
                               AND (%s = '' OR DATE(created_at) = %s)
@@ -1884,7 +1969,7 @@ class KVStore:
                         else:
                             cur.execute(
                                 """
-                                SELECT id
+                                SELECT id, message
                                 FROM transactions
                                 WHERE amount = %s
                                   AND (%s = '' OR DATE(created_at) = %s)
@@ -1920,6 +2005,28 @@ class KVStore:
                                     tx_id,
                                 ),
                             )
+                            if tx_status == "success":
+                                sid_hint = _extract_session_id_from_tx_message(
+                                    tx.get("message") or ""
+                                )
+                                if not sid_hint:
+                                    sid_hint = _guess_open_session_id_for_success(
+                                        amount=int(amt or 0),
+                                        agency_id=resolved_agency_id,
+                                        reg_date=reg_date,
+                                    )
+                                if sid_hint:
+                                    _mark_session_checked(
+                                        sid_hint,
+                                        title="거래내역 자동 동기화",
+                                        has_approval=True,
+                                    )
+                                    _trace(
+                                        "sync_mark_checked",
+                                        approval=approval,
+                                        session_id=sid_hint,
+                                        path="amount_date_match",
+                                    )
                             updated += 1
                             continue
 
