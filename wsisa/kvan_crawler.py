@@ -42,6 +42,7 @@ from kvan_link_common import (
     append_payment_notification,
     ensure_kvan_links_internal_session_column,
     ensure_kvan_links_link_created_at,
+    extract_kvan_session_key_from_url,
     load_kvan_link_preserved_by_url,
     parse_amount_won,
     parse_kvan_link_ui_created_at,
@@ -446,6 +447,28 @@ def _sanitize_agency_id_for_fk(
     return None
 
 
+def _resolve_agency_id_by_mid_unique(cur, mid: str) -> Optional[str]:
+    m = (mid or "").strip()
+    if not m:
+        return None
+    try:
+        cur.execute(
+            """
+            SELECT id FROM agencies
+            WHERE TRIM(COALESCE(kvan_mid, '')) = %s
+            """,
+            (m,),
+        )
+        rows = cur.fetchall() or []
+        ids = [str(r.get("id") or "").strip() for r in rows if str(r.get("id") or "").strip()]
+        ids = list(dict.fromkeys(ids))
+        if len(ids) == 1:
+            return ids[0]
+    except Exception:
+        pass
+    return None
+
+
 def _lookup_internal_session_id_for_kvan_key(kvan_key: str) -> str:
     kk = (kvan_key or "").strip()
     if not kk:
@@ -459,6 +482,26 @@ def _lookup_internal_session_id_for_kvan_key(kvan_key: str) -> str:
         return ""
     except Exception:
         return ""
+
+
+def _normalize_session_id_for_admin_state(session_id: str) -> tuple[str, str]:
+    """
+    admin_state 세션 id는 내부세션(숫자)일 수 있고, K-VAN 화면은 KEY 토큰만 줄 수 있다.
+    반환: (admin_state 조회용 session_id, kvan_key)
+    """
+    raw = (session_id or "").strip()
+    if not raw:
+        return "", ""
+    key = ""
+    m = re.search(r"(KEY[0-9A-Za-z]+)", raw, re.I)
+    if m:
+        key = m.group(1)
+    if not key:
+        return raw, ""
+    internal = _lookup_internal_session_id_for_kvan_key(key)
+    if internal:
+        return internal, key
+    return key, key
 
 
 def _session_order_path_candidates(session_id: str) -> list[Path]:
@@ -501,6 +544,8 @@ def _mark_session_checked(session_id: str, title: str, has_approval: bool) -> No
     if not session_id:
         return
     try:
+        target_session_id, kvan_key = _normalize_session_id_for_admin_state(session_id)
+        session_lookup = target_session_id or (session_id or "")
         st = _load_admin_state()
         sessions = list(st.get("sessions") or [])
         history = list(st.get("history") or [])
@@ -511,13 +556,15 @@ def _mark_session_checked(session_id: str, title: str, has_approval: bool) -> No
             moved_session: Optional[dict] = None
 
             for s in sessions:
-                if str(s.get("id") or "") == str(session_id):
+                if str(s.get("id") or "") == str(session_lookup):
                     moved_session = dict(s)
                 else:
                     remaining_sessions.append(s)
 
             if moved_session is None:
-                moved_session = {"id": session_id}
+                moved_session = {"id": session_lookup}
+            if kvan_key:
+                moved_session["kvan_session_id"] = kvan_key
 
             moved_session["status"] = "결제완료"
             moved_session["has_approval"] = True
@@ -536,6 +583,8 @@ def _mark_session_checked(session_id: str, title: str, has_approval: bool) -> No
 
 def _mark_session_deleted(session_id: str, title: str) -> None:
     try:
+        target_session_id, kvan_key = _normalize_session_id_for_admin_state(session_id)
+        session_lookup = target_session_id or (session_id or "")
         st = _load_admin_state()
         sessions = list(st.get("sessions") or [])
         history = list(st.get("history") or [])
@@ -545,13 +594,15 @@ def _mark_session_deleted(session_id: str, title: str) -> None:
         removed_session: Optional[dict] = None
 
         for s in sessions:
-            if str(s.get("id") or "") == str(session_id):
+            if str(s.get("id") or "") == str(session_lookup):
                 removed_session = dict(s)
             else:
                 remaining_sessions.append(s)
 
         if removed_session is None:
-            removed_session = {"id": session_id}
+            removed_session = {"id": session_lookup}
+        if kvan_key:
+            removed_session["kvan_session_id"] = kvan_key
 
         removed_session["status"] = "만료"
         removed_session["deleted"] = True
@@ -568,6 +619,12 @@ def _mark_session_deleted(session_id: str, title: str) -> None:
         st["sessions"] = remaining_sessions
         st["history"] = history
         _save_admin_state(st)
+        _trace(
+            "mark_session_deleted",
+            input_session_id=session_id,
+            normalized_session_id=session_lookup,
+            kvan_key=kvan_key,
+        )
     except Exception as e:
         print(f"[WARN] _mark_session_deleted 실패: {e}")
 
@@ -578,6 +635,8 @@ def _mark_session_expired_with_transactions(session_id: str, title: str) -> None
     (auto_kvan.py 와 동일. 이전에는 크롤러가 JSON을 쓰지 않아 본사 어드민 목록이 항상 비었음.)
     """
     try:
+        target_session_id, kvan_key = _normalize_session_id_for_admin_state(session_id)
+        session_lookup = target_session_id or (session_id or "")
         st = _load_admin_state()
         sessions = list(st.get("sessions") or [])
         history = list(st.get("history") or [])
@@ -587,15 +646,24 @@ def _mark_session_expired_with_transactions(session_id: str, title: str) -> None
         moved: Optional[dict] = None
 
         for s in sessions:
-            if str(s.get("id") or "") == str(session_id):
+            if str(s.get("id") or "") == str(session_lookup):
                 moved = dict(s)
             else:
                 remaining_sessions.append(s)
 
         if moved is None:
-            moved = {"id": session_id}
+            moved = {"id": session_lookup}
+        if kvan_key:
+            moved["kvan_session_id"] = kvan_key
 
         agency_id = str(moved.get("agency_id") or "").strip()
+        if not agency_id:
+            try:
+                agency_id = str(
+                    _get_agency_id_for_session(kvan_key or session_lookup) or ""
+                ).strip()
+            except Exception:
+                agency_id = ""
 
         moved["status"] = "만료"
         moved["has_transaction"] = True
@@ -629,7 +697,8 @@ def _mark_session_expired_with_transactions(session_id: str, title: str) -> None
                 ]
             items.append(
                 {
-                    "session_id": session_id,
+                    "session_id": session_lookup,
+                    "kvan_session_id": kvan_key,
                     "title": (title or "")[:200],
                     "agency_id": agency_id,
                     "finished_at": now_iso,
@@ -644,7 +713,14 @@ def _mark_session_expired_with_transactions(session_id: str, title: str) -> None
             )
             _append_admin_log(
                 "CRAWLER",
-                f"만료+거래있음 세션 기록 session_id={session_id} (어드민 알림 JSON)",
+                f"만료+거래있음 세션 기록 session_id={session_lookup}, key={kvan_key or '-'} (어드민 알림 JSON)",
+            )
+            _trace(
+                "mark_session_expired_with_tx",
+                input_session_id=session_id,
+                normalized_session_id=session_lookup,
+                kvan_key=kvan_key,
+                agency_id=agency_id,
             )
         except Exception as e_json:
             print(f"[WARN] 만료+거래있음 목록(JSON) 저장 실패: {e_json}")
@@ -1516,6 +1592,14 @@ class KVStore:
             else:
                 conn = _get_db_with_retry()
                 with conn.cursor() as cur:
+                    try:
+                        st_probe = _load_admin_state()
+                        s_cnt = len(st_probe.get("sessions") or [])
+                        h_cnt = len(st_probe.get("history") or [])
+                        if s_cnt == 0 and h_cnt == 0 and krows:
+                            _trace("sync_mapping_source_empty", sessions=s_cnt, history=h_cnt, krows=len(krows))
+                    except Exception:
+                        pass
                     valid_agency_ids = _load_valid_agency_ids(cur)
                     # kvan_transactions(원천)에서 찾으려는 승인번호/카드 prefix 목록
                     approvals = []
@@ -1614,6 +1698,14 @@ class KVStore:
                             print(
                                 f"[KVAN-TX-SYNC][crawler] approval={approval_raw or approval} key={kkey} "
                                 f"agency_id={(resolved_agency_id or '')!r}"
+                            )
+                        if not resolved_agency_id:
+                            mid_agency = _resolve_agency_id_by_mid_unique(cur, mid)
+                            resolved_agency_id = _sanitize_agency_id_for_fk(
+                                mid_agency,
+                                valid_agency_ids,
+                                step="map_from_mid_unique",
+                                hint=approval_raw or approval,
                             )
 
                         cur.execute(
@@ -2741,8 +2833,6 @@ def _parse_link_card(card) -> Optional[dict]:
 
     lines = [ln.strip() for ln in card_text.splitlines() if ln.strip()]
     session_id = _get_session_id_from_text(card_text)
-    if not session_id:
-        return None
 
     title = ""
     for ln in lines:
@@ -2761,6 +2851,11 @@ def _parse_link_card(card) -> Optional[dict]:
     status = ""
     mid = ""
     kvan_link = _extract_link_from_card(card)
+    if not session_id and kvan_link:
+        session_id = extract_kvan_session_key_from_url(kvan_link)
+    if not session_id:
+        _trace("link_card_skip_no_session", text_preview=card_text[:120])
+        return None
 
     for ln in lines:
         if not amount and "원" in ln:
