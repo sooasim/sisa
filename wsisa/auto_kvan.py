@@ -295,7 +295,14 @@ WAKEUP_FLAG_PATH = DATA_DIR / "crawler_wakeup.flag"
 # - 없으면 "서버 환경이 아니면" 기본적으로 LOCAL_TEST=True 로 동작하게 만든다.
 _local_flag = os.environ.get("SISA_LOCAL_TEST")
 if _local_flag is None:
-    LOCAL_TEST = not _is_server_env()
+    # 기본은 DB 모드(운영 동작). JSON 모드가 필요하면 명시적으로 켠다.
+    LOCAL_TEST = str(os.environ.get("K_VAN_USE_JSON", "")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
 else:
     LOCAL_TEST = _local_flag.strip().lower() in ("1", "true", "yes", "y")
 

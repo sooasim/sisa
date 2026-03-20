@@ -183,10 +183,10 @@ def _append_hq_log(source: str, message: str) -> None:
 def get_db():
     """
     공용 MySQL 커넥션 헬퍼.
-
-    - connect_timeout 을 짧게 두어(2초) DB 연결 문제로 크롤러/서버가 오래 멈추지 않게 한다.
-    - read/write_timeout 도 3초로 제한해, 쿼리 중 연결이 끊기면 빠르게 예외를 발생시킨다.
     """
+    connect_timeout = int(os.environ.get("MYSQL_CONNECT_TIMEOUT", "3"))
+    read_timeout = int(os.environ.get("MYSQL_READ_TIMEOUT", "6"))
+    write_timeout = int(os.environ.get("MYSQL_WRITE_TIMEOUT", "6"))
     return pymysql.connect(
         host=DB_HOST,
         port=DB_PORT,
@@ -196,9 +196,26 @@ def get_db():
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=False,
-        connect_timeout=2,
-        read_timeout=3,
-        write_timeout=3,
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+        write_timeout=write_timeout,
+    )
+
+
+def _is_retryable_db_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return any(
+        k in msg
+        for k in (
+            "2013",
+            "2006",
+            "lost connection",
+            "server has gone away",
+            "connection reset",
+            "connection refused",
+            "broken pipe",
+            "timed out",
+        )
     )
 
 
@@ -2777,18 +2794,45 @@ def debug_paths():
 def _load_hq_state() -> dict:
     """본사 어드민 상태를 MySQL 에서 로드."""
     state = {"applications": [], "agencies": [], "transactions": []}
-    try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM applications ORDER BY created_at DESC")
-            state["applications"] = cur.fetchall()
-            cur.execute("SELECT * FROM agencies ORDER BY created_at DESC")
-            state["agencies"] = cur.fetchall()
-            cur.execute("SELECT * FROM transactions ORDER BY created_at DESC")
-            state["transactions"] = cur.fetchall()
-        conn.close()
-    except Exception as e:  # noqa: BLE001
-        print(f"[WARN] _load_hq_state 실패: {e}")
+    for attempt in range(1, 4):
+        conn = None
+        try:
+            conn = get_db()
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM applications ORDER BY created_at DESC")
+                state["applications"] = cur.fetchall()
+                cur.execute("SELECT * FROM agencies ORDER BY created_at DESC")
+                state["agencies"] = cur.fetchall()
+                cur.execute("SELECT * FROM transactions ORDER BY created_at DESC")
+                state["transactions"] = cur.fetchall()
+            conn.close()
+            return state
+        except Exception as e:  # noqa: BLE001
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+            if attempt < 3 and _is_retryable_db_error(e):
+                time.sleep(0.6 * attempt)
+                continue
+            print(f"[WARN] _load_hq_state 실패: {e}")
+            # DB 장애 시 read-only JSON 폴백(크롤러가 JSON 모드로 적재한 데이터 표시)
+            try:
+                local_db = Path(DATA_DIR) / "local_db"
+                tx_path = local_db / "transactions.json"
+                ag_path = local_db / "agencies.json"
+                if tx_path.exists():
+                    state["transactions"] = json.loads(
+                        tx_path.read_text(encoding="utf-8")
+                    ) or []
+                if ag_path.exists():
+                    state["agencies"] = json.loads(
+                        ag_path.read_text(encoding="utf-8")
+                    ) or []
+            except Exception:
+                pass
+            break
     return state
 
 

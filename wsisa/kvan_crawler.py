@@ -30,10 +30,11 @@ import re
 import json
 import time
 import argparse
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, quote
 from typing import Optional, List, Dict, Any
 
 import pymysql
@@ -102,10 +103,26 @@ LOCAL_DB_DIR.mkdir(parents=True, exist_ok=True)
 
 DEBUG_CRAWLER = os.environ.get("K_VAN_DEBUG", "1") == "1"
 
-MYSQL_DEFAULT_URL = (
-    "mysql://root:mzLCEjeoFjOCfqdHQjOVevFJbgaZunnZ@mysql.railway.internal:3306/railway"
+
+def _build_mysql_url_from_env() -> str:
+    host = os.environ.get("MYSQLHOST") or os.environ.get("MYSQL_HOST") or "localhost"
+    port = os.environ.get("MYSQLPORT") or os.environ.get("MYSQL_PORT") or "3306"
+    user = os.environ.get("MYSQLUSER") or os.environ.get("MYSQL_USER") or "root"
+    password = os.environ.get("MYSQLPASSWORD") or os.environ.get("MYSQL_PASSWORD") or ""
+    db = (
+        os.environ.get("MYSQL_DATABASE")
+        or os.environ.get("MYSQLDATABASE")
+        or os.environ.get("MYSQL_DB")
+        or "railway"
+    )
+    return f"mysql://{quote(str(user))}:{quote(str(password))}@{host}:{port}/{db}"
+
+
+DATABASE_URL = (
+    os.environ.get("DATABASE_URL")
+    or os.environ.get("MYSQL_URL")
+    or _build_mysql_url_from_env()
 )
-DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("MYSQL_URL") or MYSQL_DEFAULT_URL
 
 
 def _is_server_env() -> bool:
@@ -123,7 +140,14 @@ def _is_server_env() -> bool:
 
 _local_flag = os.environ.get("SISA_LOCAL_TEST")
 if _local_flag is None:
-    LOCAL_TEST = not _is_server_env()
+    # 기본은 DB 모드(운영 동작). JSON 모드가 필요하면 명시적으로 켠다.
+    LOCAL_TEST = str(os.environ.get("K_VAN_USE_JSON", "")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
 else:
     LOCAL_TEST = _local_flag.strip().lower() in ("1", "true", "yes", "y")
 
@@ -738,6 +762,9 @@ def _parse_mysql_url(db_url: str) -> dict:
 
 def get_db():
     cfg = _parse_mysql_url(DATABASE_URL)
+    connect_timeout = int(os.environ.get("MYSQL_CONNECT_TIMEOUT", "3"))
+    read_timeout = int(os.environ.get("MYSQL_READ_TIMEOUT", "6"))
+    write_timeout = int(os.environ.get("MYSQL_WRITE_TIMEOUT", "6"))
     return pymysql.connect(
         host=cfg["host"],
         port=cfg["port"],
@@ -747,9 +774,9 @@ def get_db():
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=False,
-        connect_timeout=5,
-        read_timeout=10,
-        write_timeout=10,
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+        write_timeout=write_timeout,
     )
 
 
@@ -790,10 +817,43 @@ def _get_db_with_retry(max_attempts: int = 3, delay_sec: float = 0.8):
     raise RuntimeError("DB connection retry failed")
 
 
+def _get_db_dashboard_quick():
+    """
+    대시보드 요약은 보조 정보이므로 짧은 타임아웃 연결을 사용한다.
+    (여기서 오래 막혀 결제링크/거래 크롤 본 루프가 지연되는 것을 방지)
+    """
+    cfg = _parse_mysql_url(DATABASE_URL)
+    connect_timeout = int(os.environ.get("K_VAN_DASH_DB_CONNECT_TIMEOUT", "2"))
+    read_timeout = int(os.environ.get("K_VAN_DASH_DB_READ_TIMEOUT", "3"))
+    write_timeout = int(os.environ.get("K_VAN_DASH_DB_WRITE_TIMEOUT", "3"))
+    return pymysql.connect(
+        host=cfg["host"],
+        port=cfg["port"],
+        user=cfg["user"],
+        password=cfg["password"],
+        database=cfg["database"],
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False,
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+        write_timeout=write_timeout,
+    )
+
+
 class KVStore:
     def __init__(self) -> None:
         self.use_json = _use_json_store()
-        self.ensure_tables()
+        try:
+            self.ensure_tables()
+        except Exception as e:
+            if self.use_json:
+                raise
+            # DB 장애 시 크롤러가 즉시 죽지 않도록 JSON 폴백(원인 로그는 강하게 남김).
+            _alog(f"[ERROR] DB 초기화 실패 - JSON 폴백 전환: {e}")
+            print(f"[WARN] DB 초기화 실패 - JSON 폴백 전환: {e}")
+            self.use_json = True
+            self.ensure_tables()
 
     def ensure_tables(self) -> None:
         if self.use_json:
@@ -801,7 +861,7 @@ class KVStore:
                 _json_ensure_table(name)
             return
 
-        conn = get_db()
+        conn = _get_db_with_retry()
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -954,7 +1014,7 @@ class KVStore:
 
         if not rows:
             print(
-                "[INFO] /payment-link 스냅샷 0건 — kvan_links 는 건드리지 않습니다(빈 응답으로 DB 초기화 방지)."
+                "[INFO] /payment-link 스냅샷 0건 - kvan_links 는 건드리지 않습니다(빈 응답으로 DB 초기화 방지)."
             )
             return
 
@@ -968,7 +1028,7 @@ class KVStore:
             return
 
         preserved = load_kvan_link_preserved_by_url(new_urls)
-        conn = get_db()
+        conn = _get_db_with_retry()
         ensure_kvan_links_internal_session_column(conn)
         ensure_kvan_links_link_created_at(conn)
         with conn.cursor() as cur:
@@ -1081,7 +1141,7 @@ class KVStore:
             return
 
         if not rows and not force_empty:
-            print("[INFO] kvan_transactions(MySQL): 빈 스냅샷 — TRUNCATE 생략(기존 행 유지)")
+            print("[INFO] kvan_transactions(MySQL): 빈 스냅샷 - TRUNCATE 생략(기존 행 유지)")
             return
 
         conn = get_db()
@@ -1284,14 +1344,15 @@ class KVStore:
 
                 for kr in krows:
                     amt = kr.get("amount") or 0
-                    approval = (kr.get("approval_no") or "").strip()
+                    approval_raw = (kr.get("approval_no") or "").strip()
+                    approval = _normalized_approval_for_sync(approval_raw, kr)
                     mid = (kr.get("mid") or "").strip()
                     tx_type = (kr.get("tx_type") or "").strip()
                     reg = (kr.get("registered_at") or "").strip()
                     card_number = (kr.get("card_number") or "").strip()
                     prefix4 = _card_prefix4(card_number)
 
-                    if not amt or not approval:
+                    if not amt:
                         continue
 
                     tx_status = (
@@ -1351,7 +1412,10 @@ class KVStore:
                                 "resident_front": "",
                                 "card_prefix4": prefix4,
                                 "status": tx_status,
-                                "message": f"K-VAN {tx_type or '거래'} 자동 연동 (승인번호={approval})",
+                                "message": (
+                                    f"K-VAN {tx_type or '거래'} 자동 연동 "
+                                    f"(승인번호={approval_raw or '없음'})"
+                                ),
                                 "settlement_status": "미정산",
                                 "settled_at": None,
                                 "kvan_mid": mid,
@@ -1370,7 +1434,7 @@ class KVStore:
                 _json_save_rows("transactions", tx_rows)
 
             else:
-                conn = get_db()
+                conn = _get_db_with_retry()
                 with conn.cursor() as cur:
                     # kvan_transactions(원천)에서 찾으려는 승인번호/카드 prefix 목록
                     approvals = []
@@ -1424,14 +1488,15 @@ class KVStore:
 
                     for kr in krows:
                         amt = kr.get("amount") or 0
-                        approval = (kr.get("approval_no") or "").strip()
+                        approval_raw = (kr.get("approval_no") or "").strip()
+                        approval = _normalized_approval_for_sync(approval_raw, kr)
                         mid = (kr.get("mid") or "").strip()
                         tx_type = (kr.get("tx_type") or "").strip()
                         reg = (kr.get("registered_at") or "").strip()
                         card_number = (kr.get("card_number") or "").strip()
                         prefix4 = _card_prefix4(card_number)
 
-                        if not amt or not approval:
+                        if not amt:
                             continue
 
                         reg_date = reg.split(" ")[0] if reg else ""
@@ -1452,7 +1517,7 @@ class KVStore:
                         if kkey:
                             resolved_agency_id = (key_agency or "").strip()
                             print(
-                                f"[KVAN-TX-SYNC][crawler] approval={approval} key={kkey} "
+                                f"[KVAN-TX-SYNC][crawler] approval={approval_raw or approval} key={kkey} "
                                 f"agency_id={(resolved_agency_id or '')!r}"
                             )
 
@@ -1553,7 +1618,10 @@ class KVStore:
                             continue
 
                         new_tx_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")[-18:]
-                        message = f"K-VAN {tx_type or '거래'} 자동 연동 (승인번호={approval})"
+                        message = (
+                            f"K-VAN {tx_type or '거래'} 자동 연동 "
+                            f"(승인번호={approval_raw or '없음'})"
+                        )
 
                         cur.execute(
                             """
@@ -1783,6 +1851,28 @@ def _card_prefix4(card_number: str) -> str:
     """
     digits = re.sub(r"[^\d]", "", str(card_number or ""))
     return digits[:4] if digits else ""
+
+
+def _normalized_approval_for_sync(approval: str, kr: dict) -> str:
+    """
+    승인번호가 비어도 /transactions 행을 내부 transactions 로 동기화하기 위한 대체 키.
+    (MID/거래일시/카드/금액/유형 기반으로 안정적인 해시 생성)
+    """
+    ap = (approval or "").strip()
+    if ap:
+        return ap
+    raw = "|".join(
+        [
+            str(kr.get("mid") or "").strip(),
+            str(kr.get("registered_at") or "").strip(),
+            str(kr.get("card_number") or "").strip(),
+            str(int(kr.get("amount") or 0)),
+            str(kr.get("tx_type") or "").strip(),
+            str(kr.get("raw_text") or "").strip()[:80],
+        ]
+    )
+    digest = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    return f"NOAPP-{digest}"
 
 
 def _poll_until(fn, timeout: float, interval: float = FAST_POLL):
@@ -2682,14 +2772,14 @@ def _scrape_payment_links_and_store(driver: webdriver.Chrome, store: KVStore) ->
 
 def _scrape_transactions_and_store(driver: webdriver.Chrome, store: KVStore) -> int:
     """
-    /transactions 스크랩 — `kvan_tx_table_scrape` (구버전 단순 헤더 + infer 폴백).
+    /transactions 스크랩 - `kvan_tx_table_scrape` (구버전 단순 헤더 + infer 폴백).
     """
     snapshot_rows, body_rows, used_label, _attempts, h_tr1 = (
         extract_kvan_transactions_from_page(driver, navigate=True)
     )
     if used_label == "timeout":
         print(
-            "[WARN] /transactions 테이블 로딩 타임아웃 — kvan_transactions 는 비우지 않고 유지합니다."
+            "[WARN] /transactions 테이블 로딩 타임아웃 - kvan_transactions 는 비우지 않고 유지합니다."
         )
         _alog("/transactions tbody 로딩 타임아웃")
         return 0
@@ -2709,7 +2799,7 @@ def _scrape_transactions_and_store(driver: webdriver.Chrome, store: KVStore) -> 
 
     if not snapshot_rows and body_rows:
         print(
-            f"[WARN] /transactions tbody {len(body_rows)}행이 있으나 유효 파싱 0건 — "
+            f"[WARN] /transactions tbody {len(body_rows)}행이 있으나 유효 파싱 0건 - "
             "헤더·열 불일치 가능. kvan_transactions DB 유지."
         )
         try:
@@ -2725,7 +2815,7 @@ def _scrape_transactions_and_store(driver: webdriver.Chrome, store: KVStore) -> 
 
     if not snapshot_rows and not body_rows:
         store.replace_kvan_transactions([], force_empty=True)
-        print("[INFO] /transactions 거래 행 0건 — kvan_transactions 비움")
+        print("[INFO] /transactions 거래 행 0건 - kvan_transactions 비움")
         return 0
 
     store.replace_kvan_transactions(snapshot_rows)
@@ -2739,30 +2829,60 @@ def _scrape_transactions_and_store(driver: webdriver.Chrome, store: KVStore) -> 
 def _scrape_dashboard_and_store(driver: webdriver.Chrome) -> None:
     """
     가맹점 홈(대시보드)에서 월/전일 매출·정산·크레딧 요약을 읽어 kvan_dashboard 테이블에 INSERT.
-    (구 auto_kvan.py 에만 있던 로직 — 링크 생성 전용 main() 에서는 호출되지 않아 크롤러로 이전)
+    (구 auto_kvan.py 에만 있던 로직 - 링크 생성 전용 main() 에서는 호출되지 않아 크롤러로 이전)
     """
     if _use_json_store():
-        print("[INFO] kvan_dashboard: JSON 저장소 모드 — 대시보드 DB 스킵")
+        print("[INFO] kvan_dashboard: JSON 저장소 모드 - 대시보드 DB 스킵")
         return
     try:
-        time.sleep(0.5)
-        wait = WebDriverWait(driver, 3)
+        started = time.perf_counter()
+        time.sleep(0.2)
 
-        def find_block(label_text: str):
-            try:
-                label_el = wait.until(
-                    EC.presence_of_element_located(
-                        (By.XPATH, f"//*[normalize-space(text())='{label_text}']")
+        max_wait = float(os.environ.get("K_VAN_DASHBOARD_WAIT_SEC", "1.2"))
+        poll = float(os.environ.get("K_VAN_DASHBOARD_POLL_SEC", "0.12"))
+
+        labels = {
+            "monthly": "월 매출",
+            "yesterday": "전일 매출",
+            "settlement": "정산 예정 금액",
+            "credit": "나의 크레딧",
+        }
+        found: dict[str, Any] = {k: None for k in labels}
+        end_ts = time.time() + max(0.4, max_wait)
+        while time.time() <= end_ts:
+            progressed = False
+            for key, label_text in labels.items():
+                if found.get(key) is not None:
+                    continue
+                try:
+                    els = driver.find_elements(
+                        By.XPATH, f"//*[normalize-space(text())='{label_text}']"
                     )
+                    if els:
+                        found[key] = els[0].find_element(By.XPATH, "./ancestor::div[1]")
+                        progressed = True
+                except Exception:
+                    continue
+            if all(found.values()):
+                break
+            if not progressed:
+                time.sleep(poll)
+        # 경계 타이밍에 라벨이 뜬 경우를 한 번 더 보정
+        for key, label_text in labels.items():
+            if found.get(key) is not None:
+                continue
+            try:
+                els = driver.find_elements(
+                    By.XPATH, f"//*[normalize-space(text())='{label_text}']"
                 )
-                return label_el.find_element(By.XPATH, "./ancestor::div[1]")
-            except TimeoutException:
-                return None
-
-        monthly_block = find_block("월 매출")
-        yesterday_block = find_block("전일 매출")
-        settlement_block = find_block("정산 예정 금액")
-        credit_block = find_block("나의 크레딧")
+                if els:
+                    found[key] = els[0].find_element(By.XPATH, "./ancestor::div[1]")
+            except Exception:
+                continue
+        monthly_block = found.get("monthly")
+        yesterday_block = found.get("yesterday")
+        settlement_block = found.get("settlement")
+        credit_block = found.get("credit")
 
         monthly_sales = monthly_approved_cnt = monthly_approved_amt = 0
         monthly_canceled_cnt = monthly_canceled_amt = 0
@@ -2857,7 +2977,7 @@ def _scrape_dashboard_and_store(driver: webdriver.Chrome) -> None:
         except Exception:
             pass
 
-        conn = get_db()
+        conn = _get_db_dashboard_quick()
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -2899,8 +3019,9 @@ def _scrape_dashboard_and_store(driver: webdriver.Chrome) -> None:
             )
         conn.commit()
         conn.close()
-        print("[INFO] 대시보드 요약을 kvan_dashboard 에 저장했습니다.")
-        _alog("대시보드 요약 kvan_dashboard 저장")
+        elapsed = time.perf_counter() - started
+        print(f"[INFO] 대시보드 요약을 kvan_dashboard 에 저장했습니다. ({elapsed:.2f}s)")
+        _alog(f"대시보드 요약 kvan_dashboard 저장 ({elapsed:.2f}s)")
     except Exception as e:
         print(f"[WARN] 대시보드 크롤링/DB 저장 실패: {e}")
         _alog(f"[WARN] 대시보드 크롤링 실패: {e}")
@@ -2909,9 +3030,14 @@ def _scrape_dashboard_and_store(driver: webdriver.Chrome) -> None:
 def _dashboard_home_and_scrape(driver: webdriver.Chrome) -> None:
     """스토어 루트로 이동 후 대시보드 스크랩. 이후 호출측에서 /payment-link 로 복귀."""
     try:
-        driver.get(SIGN_IN_URL)
-        time.sleep(0.6)
+        t0 = time.perf_counter()
+        # 이미 dashboard/루트에 있으면 불필요한 재이동을 줄인다.
+        cur = (driver.current_url or "").lower()
+        if "dashboard" not in cur and "store.k-van.app" not in cur:
+            driver.get(SIGN_IN_URL)
+            time.sleep(0.25)
         _scrape_dashboard_and_store(driver)
+        _alog(f"대시보드 홈 스크랩 완료 ({time.perf_counter() - t0:.2f}s)")
     except Exception as e:
         _alog(f"[WARN] 대시보드 홈 이동/스크랩: {e}")
 
@@ -3099,7 +3225,15 @@ def _delete_expired_no_tx_links_fast(driver: webdriver.Chrome, store: KVStore, m
     _wait_payment_link_page_ready(driver, timeout=FAST_NAV_WAIT)
     deleted = 0
 
+    max_elapsed = float(os.environ.get("K_VAN_DELETE_PASS_MAX_SEC", "12"))
+    started = time.perf_counter()
     while deleted < max_delete:
+        if (time.perf_counter() - started) >= max(3.0, max_elapsed):
+            _dbg(
+                f"[DELETE] pass time budget reached ({time.perf_counter() - started:.2f}s) "
+                f"deleted={deleted}"
+            )
+            break
         try:
             tx_buttons = driver.find_elements(By.XPATH, TX_BUTTON_XPATH)
         except Exception:
@@ -3551,6 +3685,23 @@ def run_crawler_loop(max_cycles: int = 0, max_runtime_sec: int = 0) -> int:
                 print(f"[crawler][WARN] 크롤링 오류: {e}")
                 _alog(f"[WARN] 크롤링 오류: {e}")
                 try:
+                    emsg = str(e or "").lower()
+                    driver_dead = any(
+                        k in emsg
+                        for k in (
+                            "invalid session id",
+                            "failed to establish a new connection",
+                            "max retries exceeded",
+                            "session deleted because of page crash",
+                        )
+                    )
+                    if driver_dead:
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
+                        driver = create_driver(headless=_is_server_env())
+                        _alog("[WARN] webdriver 세션 장애 감지 → driver 재생성")
                     sign_in(driver, env_row)
                 except Exception as e2:
                     print(f"[crawler][ERROR] 재로그인 오류: {e2}")
