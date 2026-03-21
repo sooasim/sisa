@@ -6213,6 +6213,8 @@ def agency_admin():
         conn = get_db()
         with conn.cursor() as cur:
             repaired_by_key = 0
+            direct_rows = 0
+            key_rows = 0
             # 1) 세션키(message) 기준: 가장 정확한 보조 복구
             if agency_session_keys:
                 like_cond = " OR ".join(["message LIKE %s"] * len(agency_session_keys))
@@ -6224,37 +6226,61 @@ def agency_admin():
                 """
                 cur.execute(q_fix_key, (agency_id, *tuple(f"%{k}%" for k in agency_session_keys)))
                 repaired_by_key = int(cur.rowcount or 0)
-            # 기본: agency_id 정확 매칭
-            # 보조: agency_id 누락 행 중 세션키(message) 일치 건만 표시
-            sql_parts = [
+            try:
+                _append_hq_log(
+                    "WEB",
+                    f"agency_tx_debug_step1_keys agency_id={agency_id} key_count={len(agency_session_keys)} keys={agency_session_keys[:5]}",
+                )
+            except Exception:
+                pass
+            # 2) 기본: agency_id 정확 매칭
+            cur.execute(
                 """
                 SELECT t.*
                 FROM transactions t
                 WHERE t.agency_id = %s
+                ORDER BY t.created_at DESC
+                LIMIT 500
                 """,
-            ]
-            params: list = [agency_id]
+                (agency_id,),
+            )
+            base_rows = cur.fetchall() or []
+            direct_rows = len(base_rows)
+            by_id: dict[str, dict] = {
+                str(r.get("id") or ""): r for r in base_rows if str(r.get("id") or "")
+            }
+            # 3) 보조: agency_id 누락 행 중 세션키(message) 일치 건 추가
             if agency_session_keys:
                 like_cond = " OR ".join(["t.message LIKE %s"] * len(agency_session_keys))
-                sql_parts.append(
-                    f"""
-                    UNION
+                q_key_rows = f"""
                     SELECT t.*
                     FROM transactions t
                     WHERE (t.agency_id IS NULL OR TRIM(t.agency_id) = '')
                       AND ({like_cond})
-                    """
+                    ORDER BY t.created_at DESC
+                    LIMIT 500
+                """
+                cur.execute(q_key_rows, tuple(f"%{k}%" for k in agency_session_keys))
+                extra_rows = cur.fetchall() or []
+                key_rows = len(extra_rows)
+                for r in extra_rows:
+                    rid = str(r.get("id") or "")
+                    if not rid:
+                        continue
+                    if rid not in by_id:
+                        by_id[rid] = r
+            agency_transactions = sorted(
+                by_id.values(),
+                key=lambda r: str(r.get("created_at") or ""),
+                reverse=True,
+            )[:500]
+            try:
+                _append_hq_log(
+                    "WEB",
+                    f"agency_tx_debug_step2_rows agency_id={agency_id} direct_rows={direct_rows} key_rows={key_rows} merged_rows={len(agency_transactions)}",
                 )
-                params.extend([f"%{k}%" for k in agency_session_keys])
-            query = f"""
-                SELECT * FROM (
-                    {' '.join(sql_parts)}
-                ) x
-                ORDER BY created_at DESC
-                LIMIT 500
-            """
-            cur.execute(query, tuple(params))
-            agency_transactions = cur.fetchall() or []
+            except Exception:
+                pass
         conn.commit()
         conn.close()
         try:
@@ -6262,7 +6288,7 @@ def agency_admin():
                 "WEB",
                 f"agency_tx_load agency_id={agency_id} "
                 f"rows={len(agency_transactions)} "
-                f"repair_key={repaired_by_key}",
+                f"repair_key={repaired_by_key} direct_rows={direct_rows} key_rows={key_rows}",
             )
         except Exception:
             pass
@@ -6274,6 +6300,20 @@ def agency_admin():
     completed_settlement_map = _build_agency_completed_settlement_map(
         agency_completed_sessions, agency_transactions
     )
+    try:
+        settled_done = sum(
+            1 for v in completed_settlement_map.values() if str(v or "").strip() == "정산완료"
+        )
+        settled_pending = sum(
+            1 for v in completed_settlement_map.values() if str(v or "").strip() == "미정산"
+        )
+        _append_hq_log(
+            "WEB",
+            f"agency_settlement_debug agency_id={agency_id} completed_sessions={len(agency_completed_sessions)} "
+            f"tx_rows={len(agency_transactions)} map_done={settled_done} map_pending={settled_pending}",
+        )
+    except Exception:
+        pass
     for h in agency_completed_sessions:
         sid = str(h.get("id") or "").strip()
         h["settlement_status_ui"] = completed_settlement_map.get(sid, "-")

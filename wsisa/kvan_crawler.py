@@ -447,28 +447,6 @@ def _sanitize_agency_id_for_fk(
     return None
 
 
-def _resolve_agency_id_by_mid_unique(cur, mid: str) -> Optional[str]:
-    m = (mid or "").strip()
-    if not m:
-        return None
-    try:
-        cur.execute(
-            """
-            SELECT id FROM agencies
-            WHERE TRIM(COALESCE(kvan_mid, '')) = %s
-            """,
-            (m,),
-        )
-        rows = cur.fetchall() or []
-        ids = [str(r.get("id") or "").strip() for r in rows if str(r.get("id") or "").strip()]
-        ids = list(dict.fromkeys(ids))
-        if len(ids) == 1:
-            return ids[0]
-    except Exception:
-        pass
-    return None
-
-
 def _resolve_agency_id_by_kvan_key_db(cur, session_key: str) -> Optional[str]:
     key = (session_key or "").strip()
     if not key:
@@ -495,49 +473,6 @@ def _resolve_agency_id_by_kvan_key_db(cur, session_key: str) -> Optional[str]:
         ids = list(dict.fromkeys(ids))
         if len(ids) == 1:
             return ids[0]
-    except Exception:
-        pass
-    return None
-
-
-def _resolve_agency_id_from_admin_state_amount_date(
-    amount: int,
-    reg_date: str,
-) -> Optional[str]:
-    """
-    세션 KEY/승인번호 매핑이 모두 실패했을 때의 엄격한 보조 매핑.
-    admin_state(sessions+history)에서 금액/날짜가 맞는 agency_id 후보가
-    '단 하나'일 때만 채택한다.
-    """
-    try:
-        target_amt = int(amount or 0)
-    except Exception:
-        target_amt = 0
-    if target_amt <= 0:
-        return None
-    try:
-        st = _load_admin_state()
-        buckets = (st.get("sessions") or []) + (st.get("history") or [])
-        cands: set[str] = set()
-        for s in buckets:
-            if not isinstance(s, dict):
-                continue
-            aid = str(s.get("agency_id") or "").strip()
-            if not aid:
-                continue
-            try:
-                s_amt = int(str(s.get("amount") or "0").replace(",", "").strip() or "0")
-            except Exception:
-                s_amt = 0
-            if s_amt != target_amt:
-                continue
-            if reg_date:
-                s_dt = _parse_session_datetime(s.get("finished_at") or s.get("created_at"))
-                if s_dt is not None and s_dt.strftime("%Y-%m-%d") != reg_date:
-                    continue
-            cands.add(aid)
-        if len(cands) == 1:
-            return next(iter(cands))
     except Exception:
         pass
     return None
@@ -1894,6 +1829,12 @@ class KVStore:
 
                         raw_tx = (kr.get("raw_text") or "").strip()
                         key_agency, kkey = _resolve_agency_id_for_kvan_tx_row(raw_tx, cur)
+                        _trace(
+                            "sync_key_probe_raw",
+                            approval=approval_raw,
+                            extracted_key=kkey or "",
+                            key_agency=(key_agency or ""),
+                        )
                         if kkey:
                             resolved_agency_id = _sanitize_agency_id_for_fk(
                                 key_agency,
@@ -1907,6 +1848,12 @@ class KVStore:
                                 f"[KVAN-TX-SYNC][crawler] approval={approval_raw or approval} key={kkey} "
                                 f"agency_id={(resolved_agency_id or '')!r}"
                             )
+                        _trace(
+                            "sync_key_probe_after_raw",
+                            approval=approval_raw,
+                            source=agency_source,
+                            resolved_agency_id=resolved_agency_id or "",
+                        )
                         _trace(
                             "sync_row_mapping",
                             approval=approval,
@@ -1945,6 +1892,33 @@ class KVStore:
                         if tx:
                             tx_id = tx["id"]
                             existing_agency_id = str(tx.get("agency_id") or "").strip()
+                            tx_msg = str(tx.get("message") or "")
+                            msg_sid = _extract_session_id_from_tx_message(tx_msg)
+                            msg_key_agency = None
+                            if not resolved_agency_id and msg_sid:
+                                msg_key_agency = _get_agency_id_for_session(msg_sid)
+                                if not msg_key_agency:
+                                    try:
+                                        msg_key_agency = _resolve_agency_id_by_kvan_key_db(cur, msg_sid)
+                                    except Exception:
+                                        msg_key_agency = None
+                                resolved_agency_id = _sanitize_agency_id_for_fk(
+                                    msg_key_agency,
+                                    valid_agency_ids,
+                                    stage="map_from_existing_message_key",
+                                    hint=approval_raw or approval,
+                                )
+                                if resolved_agency_id:
+                                    agency_source = "map_from_existing_message_key"
+                            _trace(
+                                "sync_key_probe_existing_tx_message",
+                                approval=approval_raw,
+                                tx_id=tx_id,
+                                message_sid=msg_sid or "",
+                                message_agency=(msg_key_agency or ""),
+                                source=agency_source,
+                                resolved_agency_id=resolved_agency_id or "",
+                            )
                             final_agency_id = resolved_agency_id
                             # 기존 agency_id가 있으면 기본적으로 보존한다.
                             # 단, KEY 기반으로 강하게 확정된 경우에만 교정 허용.
@@ -2032,6 +2006,15 @@ class KVStore:
                                         path="approval_or_key_match",
                                     )
                             updated += 1
+                            continue
+
+                        if not (approval_raw or kkey):
+                            _trace(
+                                "sync_skip_insert_missing_key_and_approval",
+                                amount=amt,
+                                mid=mid,
+                                reg_date=reg_date,
+                            )
                             continue
 
                         new_tx_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")[-18:]
